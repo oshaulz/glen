@@ -66,9 +66,8 @@ proc writeSnapshot*(dir, collection: string; docs: Table[string, Value]) =
     if fileExists(finalPath):
       removeFile(finalPath)
     moveFile(tmpPath, finalPath)
-  when defined(windows):
-    # best-effort directory flush
-    flushDir(dir)
+  # best-effort directory flush (no-op on non-Windows for now)
+  flushDir(dir)
 
 ## Load a snapshot into memory. Returns an empty table if none exists.
 proc loadSnapshot*(dir, collection: string): Table[string, Value] =

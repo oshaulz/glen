@@ -15,4 +15,7 @@ exampledb/
 .env
 .env.*
 docs/
+# Compiled Nim test executables (sources live under tests/*.nim)
+tests/test_*
+!tests/*.nim
 

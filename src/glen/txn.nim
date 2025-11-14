@@ -23,16 +23,16 @@ type
 
   Txn* = ref object
     state*: TxnState
-    readVersions*: Table[string, uint64]   # key -> version observed
+    readVersions*: Table[(string, string), uint64]   # (collection, docId) -> version observed
     writes*: Table[(string, string), TxnWrite]       # (collection, docId) -> write op
 
 proc newTxn*(): Txn =
-  Txn(state: tsActive, readVersions: initTable[string, uint64](), writes: initTable[(string, string), TxnWrite]())
+  Txn(state: tsActive, readVersions: initTable[(string, string), uint64](), writes: initTable[(string, string), TxnWrite]())
 
 proc assertActive(t: Txn) =
   if t.state != tsActive: raise newException(ValueError, "Transaction not active")
 
-proc keyFor(collection, docId: string): string = collection & ":" & docId
+proc keyFor(collection, docId: string): (string, string) = (collection, docId)
 
 proc recordRead*(t: Txn; id: Id) =
   assertActive(t)
