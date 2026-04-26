@@ -4,6 +4,7 @@ import std/[os, tables, locks, strutils, streams, hashes, algorithm, parseutils,
 import glen/types, glen/wal, glen/storage, glen/cache, glen/subscription, glen/txn
 import glen/rwlock
 import glen/index
+import glen/geo
 import glen/config
 import glen/util
 type
@@ -28,6 +29,7 @@ type
     docs:             Table[string, Value]
     versions:         Table[string, uint64]
     indexes:          IndexesByName
+    geoIndexes:       GeoIndexesByName
     replMetaHlc:      Table[string, Hlc]
     replMetaChangeId: Table[string, string]
 
@@ -61,6 +63,7 @@ proc newCollectionStore(): CollectionStore =
     docs:             initTable[string, Value](),
     versions:         initTable[string, uint64](),
     indexes:          initTable[string, Index](),
+    geoIndexes:       initTable[string, GeoIndex](),
     replMetaHlc:      initTable[string, Hlc](),
     replMetaChangeId: initTable[string, string]()
   )
@@ -161,11 +164,15 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
       cs.versions[rec.docId] = rec.version
       for _, idx in cs.indexes:
         idx.indexDoc(rec.docId, rec.value)
+      for _, gix in cs.geoIndexes:
+        gix.indexDoc(rec.docId, rec.value)
     else:
       if rec.docId in cs.docs:
         let oldDoc = cs.docs[rec.docId]
         for _, idx in cs.indexes:
           idx.unindexDoc(rec.docId, oldDoc)
+        for _, gix in cs.geoIndexes:
+          gix.unindexDoc(rec.docId, oldDoc)
         cs.docs.del(rec.docId)
       if rec.docId in cs.versions:
         cs.versions.del(rec.docId)
@@ -554,6 +561,8 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
   db.cache.put(collection & ":" & docId, stored)
   for _, idx in cs.indexes:
     idx.reindexDoc(docId, oldDoc, stored)
+  for _, gix in cs.geoIndexes:
+    gix.reindexDoc(docId, oldDoc, stored)
   notifications.add((Id(collection: collection, docId: docId, version: newVer), stored))
   fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, stored))
   db.releaseStripeWrite(collection)
@@ -589,6 +598,8 @@ proc delete*(db: GlenDB; collection, docId: string) =
     let oldDoc = cs.docs[docId]
     for _, idx in cs.indexes:
       idx.unindexDoc(docId, oldDoc)
+    for _, gix in cs.geoIndexes:
+      gix.unindexDoc(docId, oldDoc)
     cs.docs.del(docId)
     if docId in cs.versions: cs.versions.del(docId)
     db.cache.del(collection & ":" & docId)
@@ -660,6 +671,8 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
         let oldDoc = cs.docs[docId]
         for _, idx in cs.indexes:
           idx.unindexDoc(docId, oldDoc)
+        for _, gix in cs.geoIndexes:
+          gix.unindexDoc(docId, oldDoc)
         cs.docs.del(docId)
         if docId in cs.versions: cs.versions.del(docId)
         db.cache.del(collection & ":" & docId)
@@ -688,6 +701,8 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       db.cache.put(collection & ":" & docId, w.value)
       for _, idx in cs.indexes:
         idx.reindexDoc(docId, oldDoc, w.value)
+      for _, gix in cs.geoIndexes:
+        gix.reindexDoc(docId, oldDoc, w.value)
       notifications.add((Id(collection: collection, docId: docId, version: newVer), w.value))
       fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, w.value))
   if walRecs.len > 0:
@@ -789,6 +804,8 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
     db.cache.put(collection & ":" & entry.docId, entry.stored)
     for _, idx in cs.indexes:
       idx.reindexDoc(entry.docId, entry.oldDoc, entry.stored)
+    for _, gix in cs.geoIndexes:
+      gix.reindexDoc(entry.docId, entry.oldDoc, entry.stored)
     let idObj = Id(collection: collection, docId: entry.docId, version: entry.version)
     notifications.add((idObj, entry.stored))
     fieldNotifications.add((idObj, entry.oldDoc, entry.stored))
@@ -839,6 +856,8 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
   for entry in pending:
     for _, idx in cs.indexes:
       idx.unindexDoc(entry.docId, entry.oldDoc)
+    for _, gix in cs.geoIndexes:
+      gix.unindexDoc(entry.docId, entry.oldDoc)
     cs.docs.del(entry.docId)
     if entry.docId in cs.versions: cs.versions.del(entry.docId)
     db.cache.del(collection & ":" & entry.docId)
@@ -884,6 +903,84 @@ proc dropIndex*(db: GlenDB; collection: string; name: string) =
   defer: db.releaseStripeWrite(collection)
   if name in cs.indexes:
     cs.indexes.del(name)
+
+## Create a geospatial (R-tree) index on two numeric fields treated as (lon, lat).
+## Bulk-loaded with STR for tight MBRs; updated incrementally on every put/delete.
+## Documents missing either field, or with non-numeric values there, are skipped.
+proc createGeoIndex*(db: GlenDB; collection: string; name: string; lonField, latField: string) =
+  let cs = db.getOrCreateCollection(collection)
+  db.acquireStripeWrite(collection)
+  defer: db.releaseStripeWrite(collection)
+  let gix = newGeoIndex(name, lonField, latField)
+  gix.bulkBuild(cs.docs)
+  cs.geoIndexes[name] = gix
+
+## Drop a geospatial index by name.
+proc dropGeoIndex*(db: GlenDB; collection: string; name: string) =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil: return
+  db.acquireStripeWrite(collection)
+  defer: db.releaseStripeWrite(collection)
+  if name in cs.geoIndexes:
+    cs.geoIndexes.del(name)
+
+## Find docs whose indexed point falls inside the given bounding box.
+proc findInBBox*(db: GlenDB; collection, indexName: string;
+                 minLon, minLat, maxLon, maxLat: float64;
+                 limit = 0): seq[(string, Value)] =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil: return @[]
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
+  if indexName notin cs.geoIndexes: return @[]
+  let gix = cs.geoIndexes[indexName]
+  let q = bbox(minLon, minLat, maxLon, maxLat)
+  result = @[]
+  for id in gix.tree.searchBBox(q, limit):
+    if id in cs.docs:
+      result.add((id, cs.docs[id].clone()))
+
+## K-nearest neighbours by Euclidean distance (treats coords as planar).
+## Results are sorted ascending by distance; second tuple element is the distance.
+proc findNearest*(db: GlenDB; collection, indexName: string;
+                  lon, lat: float64; k: int): seq[(string, float64, Value)] =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil: return @[]
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
+  if indexName notin cs.geoIndexes: return @[]
+  let gix = cs.geoIndexes[indexName]
+  result = @[]
+  for (id, dist) in gix.tree.nearest(lon, lat, k):
+    if id in cs.docs:
+      result.add((id, dist, cs.docs[id].clone()))
+
+## Find docs within `radiusMeters` of (lon, lat) using haversine distance.
+## Uses an R-tree bbox prefilter, then exact haversine post-filter and sort.
+proc findWithinRadius*(db: GlenDB; collection, indexName: string;
+                       lon, lat: float64; radiusMeters: float64;
+                       limit = 0): seq[(string, float64, Value)] =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil: return @[]
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
+  if indexName notin cs.geoIndexes: return @[]
+  let gix = cs.geoIndexes[indexName]
+  let bb = radiusBBox(lon, lat, radiusMeters)
+  var candidates: seq[(string, float64)] = @[]
+  for id in gix.tree.searchBBox(bb, 0):
+    if id notin cs.docs: continue
+    let doc = cs.docs[id]
+    let (ok, plon, plat) = gix.extractPoint(doc)
+    if not ok: continue
+    let d = haversineMeters(lon, lat, plon, plat)
+    if d <= radiusMeters:
+      candidates.add((id, d))
+  candidates.sort(proc (a, b: (string, float64)): int = cmp(a[1], b[1]))
+  result = @[]
+  for (id, d) in candidates:
+    result.add((id, d, cs.docs[id].clone()))
+    if limit > 0 and result.len >= limit: break
 
 ## Query documents by equality on an indexed field. Optional limit.
 proc findBy*(db: GlenDB; collection: string; indexName: string; keyValue: Value; limit = 0): seq[(string, Value)] =
@@ -1084,6 +1181,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
       if not act.oldDoc.isNil:
         for _, idx in cs.indexes:
           idx.unindexDoc(docId, act.oldDoc)
+        for _, gix in cs.geoIndexes:
+          gix.unindexDoc(docId, act.oldDoc)
       if docId in cs.docs: cs.docs.del(docId)
       if docId in cs.versions: cs.versions.del(docId)
       db.cache.del(coll & ":" & docId)
@@ -1098,6 +1197,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
       db.cache.put(coll & ":" & docId, stored)
       for _, idx in cs.indexes:
         idx.reindexDoc(docId, act.oldDoc, stored)
+      for _, gix in cs.geoIndexes:
+        gix.reindexDoc(docId, act.oldDoc, stored)
       notifications.add((Id(collection: coll, docId: docId, version: ch.version), stored))
       fieldNotifications.add((Id(collection: coll, docId: docId, version: ch.version), act.oldDoc, stored))
     cs.replMetaHlc[docId] = pendingHlc[key]
