@@ -105,6 +105,7 @@ import std/[os, locks, strutils, tables, algorithm]
 import glen/geo
 import glen/geomesh
 import glen/bitpack
+import glen/chunkcache
 
 const
   TileFileMagic    = "GLENTTS1"
@@ -143,6 +144,10 @@ type
     # Active (unflushed) frames. Flat row-major channel-interleaved per frame.
     activeTs:    seq[int64]
     activeData:  seq[seq[float64]]   # one entry per active frame
+    # Decoded-chunk LRU. Repeated readPointHistory / readFrameRange / readFrame
+    # walk the same chunks; caching their decoded form turns a chunk decode
+    # (potentially MB of bit-packed data) into a table hit.
+    decodedCache: ChunkCache[int, (seq[int64], seq[seq[float64]])]
 
   TileStack* = ref object
     dir*:       string
@@ -348,11 +353,18 @@ proc decodeTileChunk(payload: seq[byte];
 
 # --------- tile file open / scan ---------
 
-proc openTileFile(path: string): TileFile =
+const DefaultTileChunkCacheSize* = 16
+  ## Per-tile decoded-chunk LRU capacity. Each cached chunk holds
+  ## `chunkSize × tileSize² × channels` floats, so a 64×64×1×128 chunk is ~4 MB
+  ## decoded — 16 slots is ~64 MB worst-case per actively-queried tile.
+
+proc openTileFile(path: string;
+                  cacheSize = DefaultTileChunkCacheSize): TileFile =
   ## Open or create a tile file. Scans existing chunk headers, tolerates
   ## torn tail (truncates back to last verified chunk).
   result = TileFile(path: path, chunks: @[],
-                    activeTs: @[], activeData: @[])
+                    activeTs: @[], activeData: @[],
+                    decodedCache: newChunkCache[int, (seq[int64], seq[seq[float64]])](cacheSize))
   let isNew = not fileExists(path)
   if isNew:
     let parent = parentDir(path)
@@ -533,8 +545,8 @@ proc appendFrame*(s: TileStack; tsMillis: int64; mesh: GeoMesh) =
       if tf.activeTs.len >= cs:
         flushTile(s, tr, tc, tf)
 
-proc readChunkFrames(tf: TileFile; idx: int;
-                     tileCells, channels: int): (seq[int64], seq[seq[float64]]) =
+proc readChunkFramesUncached(tf: TileFile; idx: int;
+                             tileCells, channels: int): (seq[int64], seq[seq[float64]]) =
   ## Decode a chunk fully — both timestamps and per-frame cell data.
   let m = tf.chunks[idx]
   tf.file.setFilePos(m.fileOffset)
@@ -554,6 +566,15 @@ proc readChunkFrames(tf: TileFile; idx: int;
     raise newException(IOError, "tilestack: chunk CRC mismatch")
   decodeTileChunk(payload, payload.len * 8, m.frameCount,
                   tileCells, channels, m.startTs)
+
+proc readChunkFrames(tf: TileFile; idx: int;
+                     tileCells, channels: int): (seq[int64], seq[seq[float64]]) =
+  ## LRU-cached variant. Same return as readChunkFramesUncached, just cheaper
+  ## on repeat access.
+  let (hit, cached) = tf.decodedCache.get(idx)
+  if hit: return cached
+  result = readChunkFramesUncached(tf, idx, tileCells, channels)
+  tf.decodedCache.put(idx, result)
 
 proc readFrame*(s: TileStack; tsMillis: int64): (bool, GeoMesh) =
   ## Reconstruct the frame whose timestamp == tsMillis (exact match). Returns

@@ -36,6 +36,7 @@
 
 import std/[os, locks]
 import glen/bitpack
+import glen/chunkcache
 
 const
   Magic        = "GLENGTS1"
@@ -189,6 +190,10 @@ type
     totalSamples: int
     fsyncOnFlush: bool
     lock: Lock
+    # Decoded-chunk LRU. Repeated `range` / `latest` queries hit the same
+    # chunks; caching their decoded form turns a chunk decode (≈1 ms) into a
+    # table hit (≈100 ns).
+    decodedCache: ChunkCache[int, seq[(int64, float64)]]
 
 proc writeFileHeader(s: Series) =
   s.file.setFilePos(0)
@@ -248,11 +253,20 @@ proc scanBlocks(s: Series) =
   # Truncate trailing torn data
   s.file.setFilePos(lastGoodEnd)
 
-proc openSeries*(path: string; blockSize = DefaultBlockSize; fsyncOnFlush = false): Series =
+const DefaultDecodedChunkCacheSize* = 64
+  ## Decoded-chunk LRU capacity (in chunks). Each chunk holds up to `blockSize`
+  ## samples; with the default 4096 that's ~256k samples × 16 bytes = 4 MB
+  ## working set. Bump on read-heavy workloads; cut on memory-tight ones.
+
+proc openSeries*(path: string; blockSize = DefaultBlockSize;
+                 fsyncOnFlush = false;
+                 decodedChunkCacheSize = DefaultDecodedChunkCacheSize): Series =
   ## Open or create a series file. `blockSize` only controls the active
   ## block's auto-flush threshold; existing blocks keep their stored sizes.
+  ## `decodedChunkCacheSize` bounds the per-Series decoded-chunk LRU.
   result = Series(path: path, blockSize: blockSize, fsyncOnFlush: fsyncOnFlush,
-                  blockIndex: @[], active: @[], totalSamples: 0)
+                  blockIndex: @[], active: @[], totalSamples: 0,
+                  decodedCache: newChunkCache[int, seq[(int64, float64)]](decodedChunkCacheSize))
   initLock(result.lock)
   let isNew = not fileExists(path)
   if isNew:
@@ -366,16 +380,24 @@ proc readBlockAt(s: Series; meta: BlockMeta): Block =
         minVal: minV, maxVal: maxV,
         payload: payload, payloadBitLen: payload.len * 8)
 
+proc decodedChunk(s: Series; chunkIdx: int): seq[(int64, float64)] =
+  ## Returns the decoded samples for blockIndex[chunkIdx], using the LRU.
+  let (hit, cached) = s.decodedCache.get(chunkIdx)
+  if hit: return cached
+  let blk = s.readBlockAt(s.blockIndex[chunkIdx])
+  result = decodeBlock(blk)
+  s.decodedCache.put(chunkIdx, result)
+
 proc range*(s: Series; fromMs, toMs: int64): seq[(int64, float64)] =
   ## Inclusive [fromMs, toMs] range scan.
   result = @[]
   if fromMs > toMs: return
   acquire(s.lock)
   defer: release(s.lock)
-  for meta in s.blockIndex:
+  for ci in 0 ..< s.blockIndex.len:
+    let meta = s.blockIndex[ci]
     if meta.endTs < fromMs or meta.startTs > toMs: continue
-    let blk = s.readBlockAt(meta)
-    for (ts, v) in decodeBlock(blk):
+    for (ts, v) in s.decodedChunk(ci):
       if ts >= fromMs and ts <= toMs:
         result.add((ts, v))
   for (ts, v) in s.active:
@@ -397,8 +419,7 @@ proc latest*(s: Series; n: int): seq[(int64, float64)] =
   if collected.len < n and s.blockIndex.len > 0:
     var i = s.blockIndex.high
     while i >= 0 and collected.len < n:
-      let blk = s.readBlockAt(s.blockIndex[i])
-      let samples = decodeBlock(blk)
+      let samples = s.decodedChunk(i)
       let need = n - collected.len
       if samples.len <= need:
         # whole block fits
@@ -453,6 +474,8 @@ proc dropBlocksBefore*(s: Series; cutoffMs: int64) =
     s.file.setFilePos(s.file.getFileSize())
     s.blockIndex = newIndex
     s.totalSamples = totalSamples
+    # Block indices shift after a retention rewrite; cached chunks are stale.
+    s.decodedCache.clear()
 
 # --------- iterator-style helpers ---------
 
