@@ -9,7 +9,7 @@ nimble install https://github.com/oshaulz/glen
 or in a `.nimble`:
 
 ```nim
-requires "glen >= 0.5.0"
+requires "https://github.com/oshaulz/glen >= 0.5.0"
 ```
 
 Pure Nim, no external runtime deps. Glen requires Nim ≥ 1.6.

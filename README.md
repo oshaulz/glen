@@ -37,7 +37,7 @@ nimble install https://github.com/oshaulz/glen
 or in a `.nimble` file:
 
 ```nim
-requires "glen >= 0.5.0"
+requires "https://github.com/oshaulz/glen >= 0.5.0"
 ```
 
 ## Documentation

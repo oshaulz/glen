@@ -1,7 +1,7 @@
 # Glen document database nimble spec
 version       = "0.5.0"
-author        = "Glen"
-description   = "Glen: A wickedly fast embedded document database with subscriptions and transactions"
+author        = "Owen Shaule"
+description   = "An embedded document database with built-in spatial, time-series, and numeric primitives."
 license       = "MIT"
 srcDir        = "src"
 
