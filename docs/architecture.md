@@ -12,7 +12,7 @@ graph TB
 
   subgraph "Per-collection state"
     CS[CollectionStore]
-    CS --> Docs[docs : Table&lt;docId, Value&gt;]
+    CS --> Docs[docs Table by docId]
     CS --> Vers[versions]
     CS --> Eq[indexes]
     CS --> Geo[geoIndexes]

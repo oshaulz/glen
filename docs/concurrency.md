@@ -17,7 +17,7 @@ graph TB
   DB --> Stripes
   DB --> ReplLock
 
-  Struct -.protects.- Coll[collections : Table&lt;name → CollectionStore&gt;]
+  Struct -.protects.- Coll[collections Table - name to CollectionStore]
   Stripes -.protects.- CSData[per-collection state]
   ReplLock -.protects.- ReplLog[replication seq + HLC + log]
 ```
@@ -39,18 +39,27 @@ its read lock.
 
 ```mermaid
 sequenceDiagram
-  Caller->>db: put("users", "u1", v)
-  db->>structLock: acquireRead
-  db->>structLock: collections lookup → cs
-  db->>structLock: releaseRead
-  db->>stripe[users]: acquireWrite
-  db->>replLock: acquire
-  Note right of replLock: assign seq + HLC<br/>append to repl log
-  db->>replLock: release
-  db->>WAL: append (write-ahead)
-  db->>cs: cs.docs[..] = v; reindex
-  db->>stripe[users]: releaseWrite
-  db->>subs: notify (no lock held)
+  participant Caller
+  participant DB
+  participant Struct as structLock
+  participant Stripe as stripe lock
+  participant Repl as replLock
+  participant WAL
+  participant CS as CollectionStore
+  participant Subs as subscribers
+
+  Caller->>DB: put coll, id, v
+  DB->>Struct: acquireRead
+  DB->>Struct: collections lookup
+  DB->>Struct: releaseRead
+  DB->>Stripe: acquireWrite
+  DB->>Repl: acquire
+  Note right of Repl: assign seq + HLC<br/>append to repl log
+  DB->>Repl: release
+  DB->>WAL: append write-ahead
+  DB->>CS: update docs and reindex
+  DB->>Stripe: releaseWrite
+  DB->>Subs: notify outside locks
 ```
 
 Multi-collection operations (`commit` over a transaction touching N
