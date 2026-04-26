@@ -28,7 +28,9 @@ const testFiles = @[
   "tests/test_soak_index.nim",
   "tests/test_multimaster.nim",
   "tests/test_bench.nim",
-  "tests/test_validators.nim"
+  "tests/test_validators.nim",
+  "tests/test_geo.nim",
+  "tests/test_timeseries.nim"
 ]
 
 task test, "Run test suite":
