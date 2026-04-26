@@ -247,19 +247,17 @@ let db = newGlenDBFromEnv("./mydb")    # reads all of the above
 
 ### Concurrency notes
 
-Glen is safe to share across threads with two caveats:
+A single `GlenDB` is safe to share across threads. Concurrent writes to
+different collections, concurrent first-writes to brand-new collections,
+and concurrent `createIndex`/`put` on disjoint collections are all fine —
+Glen wraps per-collection state in a ref behind a struct-rwlock.
 
-1. **Materialise collections before going wide.** Striped RW-locks protect each
-   collection's *contents*; the outer collection-table itself is not
-   synchronised. Call `db.ensureCollection("foo")` once per collection, on a
-   single thread, before fanning out concurrent writers. New-collection
-   creation racing with concurrent ops is undefined behaviour.
-
-2. **Compile multi-threaded callers with `--mm:atomicArc -d:useMalloc`.** ORC's
-   default refcounter and cycle collector are not thread-safe; Value refs
-   shared across threads will eventually crash in `unregisterCycle` at
-   shutdown. Glen's value graph is acyclic, so atomicArc has no downside.
-   Single-threaded callers can keep `--mm:orc` (the default).
+The one build-time requirement: **compile multi-threaded callers with
+`--mm:atomicArc -d:useMalloc`.** ORC's default refcounter and cycle
+collector are not thread-safe across cross-thread Value refs and will
+crash in `unregisterCycle` at shutdown. Glen's value graph is acyclic, so
+atomicArc has no functional downside. Single-threaded callers can keep
+`--mm:orc` (the default).
 
 ---
 
@@ -270,25 +268,25 @@ Apple M5, `-d:release`, ORC + `-O3`.
 **Single-threaded** (`nimble bench_release`):
 
 ```
-BENCH puts:           20000 ops in   75 ms =>   266666 ops/s
-BENCH gets:           20000 ops in    4 ms =>  5000000 ops/s
-BENCH gets(borrowed): 20000 ops in    4 ms =>  5000000 ops/s
-BENCH getMany:        20000 docs in   1 ms =>   200000 batches/s
-BENCH txn commits:     1000 ops in    3 ms =>   333333 ops/s
+BENCH puts:               270k ops/s
+BENCH gets (cloned):      1.67M ops/s
+BENCH gets (borrowed):    20M ops/s
+BENCH getMany:            28k batches/s  ×100 docs ≈ 2.8M doc reads/s
+BENCH txn commits:        333k ops/s
 ```
+
+The borrowed-read path skips the defensive `clone()` and is appropriate for
+read-only hot loops. Use it where you can.
 
 **Multi-threaded contention** (`nimble bench_concurrent`, atomicArc + `-d:useMalloc`):
 
 ```
-disjoint-write-only   4w/0r  ×50k ops/thread =>  214k ops/s   (low stripe contention)
-disjoint-mixed-rw     4w/4r  ×50k             =>  430k ops/s
-shared-write-only     4w/0r  ×50k             =>  175k ops/s   (max stripe contention)
-shared-mixed-rw       4w/4r  ×50k             =>  372k ops/s
-read-heavy-shared     1w/8r  ×50k             =>  1.96M ops/s
+disjoint-write-only   4w/0r ×50k =>  214k ops/s   (low stripe contention)
+disjoint-mixed-rw     4w/4r ×50k =>  426k ops/s
+shared-write-only     4w/0r ×50k =>  174k ops/s   (max stripe contention)
+shared-mixed-rw       4w/4r ×50k =>  406k ops/s
+read-heavy-shared     1w/8r ×50k =>  2.1M ops/s
 ```
-
-The single-thread cached-read number (5M ops/s) is the upper bound; under
-contention with eight readers and one writer Glen still serves ~2M ops/s.
 
 ---
 

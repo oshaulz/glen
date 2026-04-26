@@ -59,15 +59,8 @@ proc runScenario(name: string; db: glendb.GlenDB;
   var threads = newSeq[Thread[Worker]](nWriters + nReaders)
   var workers = newSeq[Worker](nWriters + nReaders)
 
-  # Pre-create every collection touched by any thread. ensureCollection() is
-  # the documented serialisation point for outer-table mutations; without it
-  # concurrent first-writes to different collections race on the GlenDB
-  # ref's outer tables.
-  if sharedCollection:
-    db.ensureCollection("shared")
-  else:
-    for w in 0 ..< nWriters:
-      db.ensureCollection("writer" & $w)
+  # No pre-creation needed: the structLock + CollectionStore refactor makes
+  # concurrent first-writes safe.
 
   for w in 0 ..< nWriters:
     let coll =
