@@ -8,7 +8,7 @@ db.put("users", "u1", VObject())
 echo db.get("users", "u1")
 ```
 
-> **Status:** beta (0.4.1). On-disk formats are versioned and tested across reopen / replay / replication: WAL v2, snapshot **v2** (with v1 read-back compat), GRI/GPI v1, GTS/TTS v1. Expect minor API churn until 1.0.
+> **Status:** beta (0.4.3). On-disk formats are versioned and tested across reopen / replay / replication: WAL v2, snapshot **v2** (with v1 read-back compat), GRI/GPI v1, GTS/TTS v1. Expect minor API churn until 1.0.
 
 ---
 
@@ -584,14 +584,51 @@ small fraction of the dataset, edge devices with constrained memory. For a
 fully-loaded working set, eager mode (the default) is faster — no fault path,
 no mmap deref, no LRU bookkeeping.
 
-**Caveats** (current implementation):
-- Multi-doc transactions (`commit`) and replication-apply (`applyChanges`)
-  paths are best-effort in spillable mode: docs they touch get faulted in
-  and stick in cs.docs. Mostly fine but if you hit OOM with very large
-  in-flight txn batches, drop the batch size.
-- The doc index itself lives in RAM (~30–50 bytes/doc). A 100M-doc DB
-  carries a ~4 GB resident index even in spill mode. Paged indexes (B+ tree
-  on disk) would lift this ceiling and remain a future addition.
+**Bulk reads** (`getMany`, `getBorrowedMany`, `getAll`, `getBorrowedAll`,
+`findBy`, `rangeBy`, `findInBBox`, `findNearest`, `findWithinRadius`,
+`findPolygonsContaining`, `findPolygonsIntersecting`, `findPointsInPolygon`)
+all read snapshot-only docs straight from the mmap'd region without
+populating cs.docs — your hot working set is preserved across large scans.
+Index builds (`createIndex`, `createGeoIndex`, `createPolygonIndex`) and
+manifest-driven rebuild on reopen do the same.
+
+**Streaming iterators** for true bounded-memory bulk reads. Every read
+above has a `*Stream` companion that yields one (id, value) at a time
+instead of materialising the full result. Combined with `hotDocCap`, this
+lets you scan a collection bigger than RAM with a memory floor of one Value:
+
+```nim
+let db = newGlenDB("./big.glen", spillableMode = true, hotDocCap = 64)
+
+# Walk a 10M-doc collection using ~64 docs of RAM at any moment.
+for (id, doc) in db.getAllStream("events"):
+  process(id, doc)
+  # 'doc' goes out of scope each iteration; nothing pins it.
+
+# Same shape for indexed and spatial queries:
+for (id, doc) in db.findByStream("events", "byKind", VString("error"), limit = 0): ...
+for (id, doc) in db.rangeByStream("events", "byTs", VInt(t0), VInt(t1)): ...
+for (id, m, doc) in db.findWithinRadiusStream("places", "byLoc", lon, lat, 5_000.0): ...
+for (id, doc) in db.findPointsInPolygonStream("places", "byLoc", polygon): ...
+```
+
+Streaming iterators capture only the matching ID set under a brief lock
+(roughly 30 B per ID), then yield one Value at a time, releasing and
+re-acquiring the stripe lock per yield so concurrent writers can proceed.
+Mid-iteration deletes are tolerated (the doc is silently skipped). Borrowed
+variants (`getBorrowedAllStream`, `getBorrowedManyStream`) yield refs without
+cloning for read-only hot loops.
+
+**In-flight memory guardrail.** Multi-doc operations (`commit`, `applyChanges`,
+`putMany`, `deleteMany`) check `maxDirtyDocs` *before* applying any writes;
+exceeding the cap returns `csInvalid` (commit) or raises `ValueError`
+(others) with a message asking you to compact or chunk. With `maxDirtyDocs = 0`
+(default) there's no cap.
+
+**Remaining limitation:** the doc index itself lives in RAM (~30–50 bytes/doc).
+A 100M-doc DB carries a ~4 GB resident index even in spill mode. Paged
+indexes (B+ tree on disk) would lift this ceiling and remain a future
+addition.
 
 ---
 

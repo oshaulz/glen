@@ -1,5 +1,5 @@
 # Glen document database nimble spec
-version       = "0.4.1"
+version       = "0.4.3"
 author        = "Glen"
 description   = "Glen: A wickedly fast embedded document database with subscriptions and transactions"
 license       = "MIT"
@@ -36,7 +36,8 @@ const testFiles = @[
   "tests/test_linalg.nim",
   "tests/test_geomesh.nim",
   "tests/test_tilestack.nim",
-  "tests/test_spillable.nim"
+  "tests/test_spillable.nim",
+  "tests/test_streaming.nim"
 ]
 
 task test, "Run test suite":

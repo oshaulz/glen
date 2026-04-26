@@ -43,6 +43,7 @@ type
     dirty:            HashSet[string]
     deleted:          HashSet[string]
     hotDocCap:        int   # 0 = unbounded
+    maxDirtyDocs:     int   # 0 = unbounded; otherwise cap on cs.dirty.len
 
   IndexKind = enum ikEq, ikGeo, ikPoly
 
@@ -172,7 +173,8 @@ proc newCollectionStore(): CollectionStore =
     snapshot:         nil,
     dirty:            initHashSet[string](),
     deleted:          initHashSet[string](),
-    hotDocCap:        0
+    hotDocCap:        0,
+    maxDirtyDocs:     0
   )
 
 # ---- Spillable mode helpers ----
@@ -203,6 +205,16 @@ proc lookupDoc(cs: CollectionStore; docId: string): Value =
     if cs.hotDocCap > 0 and cs.docs.len > cs.hotDocCap:
       evictColdDoc(cs)
 
+proc lookupDocBypass(cs: CollectionStore; docId: string): Value =
+  ## Read variant that does NOT populate cs.docs. For bulk paths (getAll,
+  ## index rebuild) where caching every doc would defeat the point of spill
+  ## mode and trash the hot working set.
+  if cs.isNil: return nil
+  if docId in cs.deleted: return nil
+  if docId in cs.docs: return cs.docs[docId]
+  if cs.snapshot.isNil: return nil
+  loadDocFromMmap(cs.snapshot, docId)
+
 proc hasDoc(cs: CollectionStore; docId: string): bool =
   if cs.isNil: return false
   if docId in cs.deleted: return false
@@ -227,6 +239,27 @@ iterator allDocIds(cs: CollectionStore): string =
   for id in cs.docs.keys:
     if cs.snapshot.isNil or id notin cs.snapshot.index:
       yield id   # in-memory doc that didn't exist in the snapshot
+
+proc materializeAllDocs(cs: CollectionStore): Table[string, Value] =
+  ## Build a complete docId → Value map combining in-memory dirty docs with
+  ## any snapshot-only docs (faulted via the bypass read so the hot table is
+  ## not perturbed). Used by compact() and snapshotAll().
+  result = initTable[string, Value]()
+  for id in allDocIds(cs):
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil:
+      result[id] = v
+
+proc checkDirtyBudget(cs: CollectionStore; addCount: int) =
+  ## Raise ValueError if accepting `addCount` more dirty docs would push
+  ## past the configured cap. No-op when maxDirtyDocs == 0 (unbounded).
+  if cs.maxDirtyDocs <= 0: return
+  if cs.dirty.len + addCount > cs.maxDirtyDocs:
+    raise newException(ValueError,
+      "Glen spill: would exceed maxDirtyDocs (" & $cs.dirty.len &
+      " currently dirty + " & $addCount & " incoming > cap " &
+      $cs.maxDirtyDocs & "). Call db.compact() to flush dirty entries to a " &
+      "fresh snapshot, or chunk the operation into smaller batches.")
 
 # Generate a stable, unique-ish node id and persist it to disk when needed.
 proc bytesToHex(bytes: openArray[byte]): string =
@@ -258,14 +291,20 @@ proc newGlenDB*(dir: string;
                 walFlushEveryBytes = 8*1024*1024;
                 lockStripesCount = 32;
                 spillableMode = false;
-                hotDocCap = 0): GlenDB =
+                hotDocCap = 0;
+                maxDirtyDocs = 0): GlenDB =
   ## `spillableMode = true` opens any existing snapshot v2 file via mmap and
   ## defers loading docs until they're touched. Combined with `hotDocCap > 0`,
   ## cold non-dirty docs are evicted from RAM under pressure and faulted back
   ## from the mmap'd snapshot on next access. Use this when your dataset is
   ## bigger than RAM or when you only need to query a small fraction of it.
-  ## Mutations: writes still go to memory (and the WAL); they "stick" and
-  ## can't be evicted until the next compact() persists them.
+  ##
+  ## Mutations: writes still go to memory (and the WAL) and are pinned there
+  ## as "dirty" — they can't be evicted until the next compact() folds them
+  ## into a fresh snapshot. `maxDirtyDocs > 0` caps the per-collection dirty
+  ## set; multi-doc operations (commit, applyChanges, putMany, deleteMany)
+  ## that would exceed the cap raise ValueError with a clear message asking
+  ## you to compact or chunk.
   result = GlenDB(
     dir: dir,
     wal: openWriteAheadLog(dir, syncMode = walSync, flushEveryBytes = walFlushEveryBytes),
@@ -312,6 +351,7 @@ proc newGlenDB*(dir: string;
       let name = splitFile(path).name
       let cs = newCollectionStore()
       cs.hotDocCap = hotDocCap
+      cs.maxDirtyDocs = maxDirtyDocs
       if spillableMode:
         let mm = openSnapshotMmap(dir, name)
         if not mm.isNil and mm.isV2:
@@ -430,20 +470,28 @@ proc newGlenDB*(dir: string;
     if key in loadedFromDump: continue
     if entry.collection notin result.collections: continue
     let cs = result.collections[entry.collection]
+    # Materialise the full doc set (snapshot + in-memory) into a transient
+    # Table so eq/geo/polygon index builders see EVERY doc, including
+    # snapshot-only ones in spill mode. Bypass-read so we don't fault them
+    # all into cs.docs.
+    var allDocs = initTable[string, Value]()
+    for id in allDocIds(cs):
+      let v = lookupDocBypass(cs, id)
+      if not v.isNil: allDocs[id] = v
     case entry.kind
     of ikEq:
       let idx = newIndex(entry.name, entry.spec)
-      for id, v in cs.docs: idx.indexDoc(id, v)
+      for id, v in allDocs: idx.indexDoc(id, v)
       cs.indexes[entry.name] = idx
     of ikGeo:
       let parts = entry.spec.split(':')
       if parts.len != 2: continue
       let gix = newGeoIndex(entry.name, parts[0], parts[1])
-      gix.bulkBuild(cs.docs)
+      gix.bulkBuild(allDocs)
       cs.geoIndexes[entry.name] = gix
     of ikPoly:
       let pix = newPolygonIndex(entry.name, entry.spec)
-      pix.bulkBuild(cs.docs)
+      pix.bulkBuild(allDocs)
       cs.polygonIndexes[entry.name] = pix
 
 # ---- Replication peers state and log GC ----
@@ -728,9 +776,11 @@ proc get*(db: GlenDB; collection, docId: string; t: Txn): Value =
 
 ## Batch get by ids. Returns pairs of (docId, Value) for those found.
 ## Uses the cache when available and acquires the DB read lock once per call.
+## In spillable mode, snapshot-only docs are decoded straight from the mmap'd
+## region without populating cs.docs (so a giant getMany doesn't trash the
+## hot working set).
 proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(string, Value)] =
   result = @[]
-  # First consult cache for fast hits
   var missing: seq[string] = @[]
   for id in docIds:
     let key = collection & ":" & id
@@ -744,8 +794,8 @@ proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(s
   if cs.isNil: return
   db.acquireStripeRead(collection)
   for id in missing:
-    if id in cs.docs:
-      let v = cs.docs[id]
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil:
       db.cache.put(collection & ":" & id, v)
       result.add((id, v.clone()))
   db.releaseStripeRead(collection)
@@ -766,8 +816,8 @@ proc getBorrowedMany*(db: GlenDB; collection: string; docIds: openArray[string])
   if cs.isNil: return
   db.acquireStripeRead(collection)
   for id in missing:
-    if id in cs.docs:
-      let v = cs.docs[id]
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil:
       db.cache.put(collection & ":" & id, v)
       result.add((id, v))
   db.releaseStripeRead(collection)
@@ -782,14 +832,18 @@ proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]; t: Txn)
   return pairs
 
 ## Get all documents in a collection. Returns pairs of (docId, Value).
+## In spillable mode, walks both the in-memory and snapshot-only docs without
+## faulting the snapshot ones into cs.docs.
 proc getAll*(db: GlenDB; collection: string): seq[(string, Value)] =
   result = @[]
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return
   db.acquireStripeRead(collection)
-  for id, v in cs.docs:
-    db.cache.put(collection & ":" & id, v)
-    result.add((id, v.clone()))
+  for id in allDocIds(cs):
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil:
+      db.cache.put(collection & ":" & id, v)
+      result.add((id, v.clone()))
   db.releaseStripeRead(collection)
 
 ## Borrowed getAll: returns refs without cloning. Caller must not mutate.
@@ -798,9 +852,11 @@ proc getBorrowedAll*(db: GlenDB; collection: string): seq[(string, Value)] =
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return
   db.acquireStripeRead(collection)
-  for id, v in cs.docs:
-    db.cache.put(collection & ":" & id, v)
-    result.add((id, v))
+  for id in allDocIds(cs):
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil:
+      db.cache.put(collection & ":" & id, v)
+      result.add((id, v))
   db.releaseStripeRead(collection)
 
 ## Transaction-aware getAll. Records read versions for all returned docs.
@@ -913,6 +969,22 @@ proc currentVersion*(db: GlenDB; collection, docId: string): uint64 =
 proc commit*(db: GlenDB; t: Txn): CommitResult =
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
+  # Pre-flight: per-collection dirty budget check (spillable mode only).
+  # Returns csInvalid (not csOk) on overflow so the caller sees a clear
+  # message; the txn isn't applied at all.
+  var perColl = initTable[string, int]()
+  for key, _ in t.writes:
+    perColl[key[0]] = perColl.getOrDefault(key[0], 0) + 1
+  for c, count in perColl:
+    let cs = db.tryGetCollection(c)
+    if not cs.isNil and cs.maxDirtyDocs > 0 and
+       cs.dirty.len + count > cs.maxDirtyDocs:
+      t.state = tsRolledBack
+      return CommitResult(status: csInvalid,
+        message: "spill: would exceed maxDirtyDocs in collection " & c &
+          " (" & $cs.dirty.len & " currently dirty + " & $count &
+          " incoming > cap " & $cs.maxDirtyDocs &
+          "). Compact() or chunk the txn.")
   # Acquire all needed collection stripes in sorted order. We must include
   # stripes for read-only keys too, otherwise a concurrent writer to a
   # collection we read from (but did not write) can change the version
@@ -941,7 +1013,8 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
     let docId = key[1]
     if w.kind == twDelete:
       let cs = db.tryGetCollection(collection)
-      if not cs.isNil and docId in cs.docs:
+      let oldDoc = if cs.isNil: nil else: lookupDoc(cs, docId)
+      if not cs.isNil and not oldDoc.isNil:
         let newVer = currentVersionFromStore(cs, docId) + 1
         # replication metadata under replLock
         acquire(db.replLock)
@@ -955,14 +1028,14 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
         release(db.replLock)
         # write-ahead
         walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: newVer, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
-        let oldDoc = cs.docs[docId]
         for _, idx in cs.indexes:
           idx.unindexDoc(docId, oldDoc)
         for _, gix in cs.geoIndexes:
           gix.unindexDoc(docId, oldDoc)
         for _, pix in cs.polygonIndexes:
           pix.unindexDoc(docId, oldDoc)
-        cs.docs.del(docId)
+        if docId in cs.docs: cs.docs.del(docId)
+        markDeleted(cs, docId)
         if docId in cs.versions: cs.versions.del(docId)
         db.cache.del(collection & ":" & docId)
         notifications.add((Id(collection: collection, docId: docId, version: newVer), VNull()))
@@ -982,10 +1055,9 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       release(db.replLock)
       # write-ahead
       walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: w.value, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
-      var oldDoc: Value = nil
-      if docId in cs.docs:
-        oldDoc = cs.docs[docId]
+      let oldDoc = lookupDoc(cs, docId)   # spill-aware: faults if needed
       cs.docs[docId] = w.value
+      markDirty(cs, docId)
       cs.versions[docId] = newVer
       db.cache.put(collection & ":" & docId, w.value)
       for _, idx in cs.indexes:
@@ -1062,6 +1134,7 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   let cs = db.getOrCreateCollection(collection)
+  checkDirtyBudget(cs, items.len)
   db.acquireStripeWrite(collection)
   var walRecs: seq[WalRecord] = @[]
   var pending: seq[PendingPut] = @[]
@@ -1075,8 +1148,7 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
     let chHlc = db.nextLocalHlc()
     let chChangeId = $seqNo & ":" & db.nodeId
     walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
-    var oldDoc: Value = nil
-    if docId in cs.docs: oldDoc = cs.docs[docId]
+    let oldDoc = lookupDoc(cs, docId)   # spill-aware
     pending.add(PendingPut(docId: docId, stored: stored, oldDoc: oldDoc, version: newVer, seqNo: seqNo, hlc: chHlc, changeId: chChangeId))
   if walRecs.len > 0:
     db.wal.appendMany(walRecs)
@@ -1091,6 +1163,7 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
   release(db.replLock)
   for entry in pending:
     cs.docs[entry.docId] = entry.stored
+    markDirty(cs, entry.docId)
     cs.versions[entry.docId] = entry.version
     db.cache.put(collection & ":" & entry.docId, entry.stored)
     for _, idx in cs.indexes:
@@ -1122,19 +1195,20 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return
+  checkDirtyBudget(cs, docIds.len)
   db.acquireStripeWrite(collection)
   var walRecs: seq[WalRecord] = @[]
   var pending: seq[PendingDelete] = @[]
   acquire(db.replLock)
   for docId in docIds:
-    if docId in cs.docs:
+    let oldDoc = lookupDoc(cs, docId)   # spill-aware
+    if not oldDoc.isNil:
       let ver = currentVersionFromStore(cs, docId) + 1
       inc db.replSeq
       let seqNo = db.replSeq
       let chHlc = db.nextLocalHlc()
       let chChangeId = $seqNo & ":" & db.nodeId
       walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
-      let oldDoc = cs.docs[docId]
       pending.add(PendingDelete(docId: docId, oldDoc: oldDoc, version: ver, seqNo: seqNo, hlc: chHlc, changeId: chChangeId))
   if walRecs.len > 0:
     db.wal.appendMany(walRecs)
@@ -1153,7 +1227,8 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
       gix.unindexDoc(entry.docId, entry.oldDoc)
     for _, pix in cs.polygonIndexes:
       pix.unindexDoc(entry.docId, entry.oldDoc)
-    cs.docs.del(entry.docId)
+    if entry.docId in cs.docs: cs.docs.del(entry.docId)
+    markDeleted(cs, entry.docId)
     if entry.docId in cs.versions: cs.versions.del(entry.docId)
     db.cache.del(collection & ":" & entry.docId)
     let idObj = Id(collection: collection, docId: entry.docId, version: entry.version)
@@ -1178,7 +1253,8 @@ proc snapshotAll*(db: GlenDB) =
     pairs.add((name, cs))
   releaseRead(db.structLock)
   for (name, cs) in pairs:
-    writeSnapshot(db.dir, name, cs.docs)
+    let docs = if cs.snapshot.isNil: cs.docs else: materializeAllDocs(cs)
+    writeSnapshotV2(db.dir, name, docs)
 
 ## Create an equality index on a field path (e.g., "name" or "profile.age").
 ## Persisted in the manifest; auto-rebuilt on reopen.
@@ -1186,8 +1262,11 @@ proc createIndex*(db: GlenDB; collection: string; name: string; fieldPath: strin
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
   let idx = newIndex(name, fieldPath)
-  for id, v in cs.docs:
-    idx.indexDoc(id, v)
+  # Walk every doc, including snapshot-only ones in spill mode, without
+  # populating the hot table.
+  for id in allDocIds(cs):
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil: idx.indexDoc(id, v)
   cs.indexes[name] = idx
   db.releaseStripeWrite(collection)
   db.addManifestEntry(IndexManifestEntry(
@@ -1212,7 +1291,13 @@ proc createGeoIndex*(db: GlenDB; collection: string; name: string; lonField, lat
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
   let gix = newGeoIndex(name, lonField, latField)
-  gix.bulkBuild(cs.docs)
+  # In spill mode, materialise the full doc set (snapshot + in-memory) so
+  # bulkBuild sees every doc, then discard. Bypass the hot cache.
+  var allDocs = initTable[string, Value]()
+  for id in allDocIds(cs):
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil: allDocs[id] = v
+  gix.bulkBuild(allDocs)
   cs.geoIndexes[name] = gix
   db.releaseStripeWrite(collection)
   db.addManifestEntry(IndexManifestEntry(
@@ -1243,8 +1328,8 @@ proc findInBBox*(db: GlenDB; collection, indexName: string;
   let q = bbox(minLon, minLat, maxLon, maxLat)
   result = @[]
   for id in gix.tree.searchBBox(q, limit):
-    if id in cs.docs:
-      result.add((id, cs.docs[id].clone()))
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil: result.add((id, v.clone()))
 
 ## K-nearest neighbours by Euclidean distance (treats coords as planar).
 ## Results are sorted ascending by distance; second tuple element is the distance.
@@ -1265,8 +1350,8 @@ proc findNearest*(db: GlenDB; collection, indexName: string;
     if metric == gmGeographic: gix.tree.nearestGeo(lon, lat, k)
     else: gix.tree.nearest(lon, lat, k)
   for (id, dist) in pairs:
-    if id in cs.docs:
-      result.add((id, dist, cs.docs[id].clone()))
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil: result.add((id, dist, v.clone()))
 
 ## Find docs within `radiusMeters` of (lon, lat) using haversine distance.
 ## Uses an R-tree bbox prefilter, then exact haversine post-filter and sort.
@@ -1281,18 +1366,22 @@ proc findWithinRadius*(db: GlenDB; collection, indexName: string;
   let gix = cs.geoIndexes[indexName]
   let bb = radiusBBox(lon, lat, radiusMeters)
   var candidates: seq[(string, float64)] = @[]
+  # Materialise candidate docs once: bypass-load any snapshot-only ones so
+  # the haversine post-filter and the result clone don't have to read twice.
+  var docByCandidate = initTable[string, Value]()
   for id in gix.tree.searchBBox(bb, 0):
-    if id notin cs.docs: continue
-    let doc = cs.docs[id]
+    let doc = lookupDocBypass(cs, id)
+    if doc.isNil: continue
     let (ok, plon, plat) = gix.extractPoint(doc)
     if not ok: continue
     let d = haversineMeters(lon, lat, plon, plat)
     if d <= radiusMeters:
       candidates.add((id, d))
+      docByCandidate[id] = doc
   candidates.sort(proc (a, b: (string, float64)): int = cmp(a[1], b[1]))
   result = @[]
   for (id, d) in candidates:
-    result.add((id, d, cs.docs[id].clone()))
+    result.add((id, d, docByCandidate[id].clone()))
     if limit > 0 and result.len >= limit: break
 
 # ---- Polygon indexes ----
@@ -1305,7 +1394,11 @@ proc createPolygonIndex*(db: GlenDB; collection: string; name: string;
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
   let pix = newPolygonIndex(name, polygonField)
-  pix.bulkBuild(cs.docs)
+  var allDocs = initTable[string, Value]()
+  for id in allDocIds(cs):
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil: allDocs[id] = v
+  pix.bulkBuild(allDocs)
   cs.polygonIndexes[name] = pix
   db.releaseStripeWrite(collection)
   db.addManifestEntry(IndexManifestEntry(
@@ -1334,8 +1427,8 @@ proc findPolygonsContaining*(db: GlenDB; collection, indexName: string;
   let pix = cs.polygonIndexes[indexName]
   result = @[]
   for id in pix.polygonsContainingPoint(x, y, limit):
-    if id in cs.docs:
-      result.add((id, cs.docs[id].clone()))
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil: result.add((id, v.clone()))
 
 ## Polygons whose MBR intersects a query bounding box. This is a fast prefilter
 ## (O(log n + k)); the result is a superset of the geometric-intersection set.
@@ -1351,8 +1444,8 @@ proc findPolygonsIntersecting*(db: GlenDB; collection, indexName: string;
   let q = bbox(minX, minY, maxX, maxY)
   result = @[]
   for id in pix.polygonsIntersectingBBox(q, limit):
-    if id in cs.docs:
-      result.add((id, cs.docs[id].clone()))
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil: result.add((id, v.clone()))
 
 ## Query a *point* (geo) index using a polygon: returns all indexed points
 ## that lie inside `polygon`. Bbox prefilter + ray-cast.
@@ -1368,8 +1461,8 @@ proc findPointsInPolygon*(db: GlenDB; collection, geoIndexName: string;
   let bb = polygonBBox(polygon)
   result = @[]
   for id in gix.tree.searchBBox(bb, 0):
-    if id notin cs.docs: continue
-    let doc = cs.docs[id]
+    let doc = lookupDocBypass(cs, id)
+    if doc.isNil: continue
     let (ok, x, y) = gix.extractPoint(doc)
     if not ok: continue
     if pointInPolygon(polygon, x, y):
@@ -1386,8 +1479,8 @@ proc findBy*(db: GlenDB; collection: string; indexName: string; keyValue: Value;
   let idx = cs.indexes[indexName]
   result = @[]
   for id in idx.findEq(keyValue, limit):
-    if id in cs.docs:
-      result.add((id, cs.docs[id].clone()))
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil: result.add((id, v.clone()))
 
 ## Range query on a single-field index, with order and limit.
 proc rangeBy*(db: GlenDB; collection: string; indexName: string; minVal, maxVal: Value; inclusiveMin = true; inclusiveMax = true; limit = 0; asc = true): seq[(string, Value)] =
@@ -1399,21 +1492,12 @@ proc rangeBy*(db: GlenDB; collection: string; indexName: string; minVal, maxVal:
   let idx = cs.indexes[indexName]
   result = @[]
   for id in idx.findRange(minVal, maxVal, inclusiveMin, inclusiveMax, limit, asc):
-    if id in cs.docs:
-      result.add((id, cs.docs[id].clone()))
+    let v = lookupDocBypass(cs, id)
+    if not v.isNil: result.add((id, v.clone()))
 
 # Compaction: snapshot all collections and truncate WAL
 ## Snapshot all collections and truncate the WAL so that recovery can start
 ## from the snapshots and a fresh log.
-proc materializeAllDocs(cs: CollectionStore): Table[string, Value] =
-  ## Build a complete docId → Value map combining in-memory dirty docs with
-  ## any snapshot-only docs (faulted from mmap). Used by compact().
-  result = initTable[string, Value]()
-  for id in allDocIds(cs):
-    let v = lookupDoc(cs, id)
-    if not v.isNil:
-      result[id] = v
-
 proc compact*(db: GlenDB) =
   db.acquireAllStripesWrite()
   defer: db.releaseAllStripesWrite()
@@ -1486,6 +1570,255 @@ proc newGlenDBFromEnv*(dir: string): GlenDB =
     walFlushEveryBytes = cfg.walFlushEveryBytes
   )
 
+# -------- Streaming iterators --------
+#
+# Each iterator captures its target ID set under a short stripe-read lock,
+# releases the lock, then yields one doc at a time — re-acquiring the lock
+# briefly on each yield to bypass-load the value. This means:
+#   * Caller's RAM footprint is one Value at a time (plus ~30 B per ID
+#     in the upfront snapshot, which is unavoidable without on-disk paging).
+#   * Writers can proceed between yields. A doc deleted mid-iteration is
+#     simply skipped.
+#   * In spillable mode, snapshot-only docs are decoded straight from the
+#     mmap'd region without populating cs.docs — true bounded-memory streaming.
+#
+# Borrowed variants yield the underlying Value ref without cloning; callers
+# must not mutate. Use them in tight read-only loops.
+
+proc snapshotAllIds(db: GlenDB; cs: CollectionStore; collection: string): seq[string] =
+  ## Capture the live doc-id set under a brief stripe read lock.
+  result = @[]
+  db.acquireStripeRead(collection)
+  for id in allDocIds(cs): result.add(id)
+  db.releaseStripeRead(collection)
+
+proc fetchOneBypass(db: GlenDB; cs: CollectionStore;
+                    collection, docId: string): Value =
+  ## Bypass-load a doc under a stripe read lock that only covers this fetch.
+  ## Returns nil if the doc was deleted between the ID snapshot and now.
+  db.acquireStripeRead(collection)
+  result = lookupDocBypass(cs, docId)
+  db.releaseStripeRead(collection)
+
+iterator getAllStream*(db: GlenDB; collection: string): (string, Value) =
+  ## Stream every visible doc as (id, clone). Bounded memory in spill mode.
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let ids = db.snapshotAllIds(cs, collection)
+    for id in ids:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v.clone())
+
+iterator getBorrowedAllStream*(db: GlenDB; collection: string): (string, Value) =
+  ## Same as getAllStream but yields raw refs. Caller must not mutate.
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let ids = db.snapshotAllIds(cs, collection)
+    for id in ids:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v)
+
+iterator getManyStream*(db: GlenDB; collection: string;
+                        docIds: openArray[string]): (string, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    for id in docIds:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v.clone())
+
+iterator getBorrowedManyStream*(db: GlenDB; collection: string;
+                                docIds: openArray[string]): (string, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    for id in docIds:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v)
+
+proc snapshotEqMatch(db: GlenDB; cs: CollectionStore; collection, indexName: string;
+                     keyValue: Value; limit: int): seq[string] =
+  result = @[]
+  db.acquireStripeRead(collection)
+  if indexName in cs.indexes:
+    result = cs.indexes[indexName].findEq(keyValue, limit)
+  db.releaseStripeRead(collection)
+
+iterator findByStream*(db: GlenDB; collection, indexName: string;
+                       keyValue: Value; limit = 0): (string, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let ids = db.snapshotEqMatch(cs, collection, indexName, keyValue, limit)
+    for id in ids:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v.clone())
+
+proc snapshotRangeMatch(db: GlenDB; cs: CollectionStore; collection, indexName: string;
+                        minVal, maxVal: Value;
+                        inclusiveMin, inclusiveMax: bool;
+                        limit: int; asc: bool): seq[string] =
+  result = @[]
+  db.acquireStripeRead(collection)
+  if indexName in cs.indexes:
+    result = cs.indexes[indexName].findRange(minVal, maxVal,
+                                             inclusiveMin, inclusiveMax,
+                                             limit, asc)
+  db.releaseStripeRead(collection)
+
+iterator rangeByStream*(db: GlenDB; collection, indexName: string;
+                        minVal, maxVal: Value;
+                        inclusiveMin = true; inclusiveMax = true;
+                        limit = 0; asc = true): (string, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let ids = db.snapshotRangeMatch(cs, collection, indexName,
+                                    minVal, maxVal,
+                                    inclusiveMin, inclusiveMax,
+                                    limit, asc)
+    for id in ids:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v.clone())
+
+proc snapshotBBoxMatch(db: GlenDB; cs: CollectionStore; collection, indexName: string;
+                       q: BBox; limit: int): seq[string] =
+  result = @[]
+  db.acquireStripeRead(collection)
+  if indexName in cs.geoIndexes:
+    result = cs.geoIndexes[indexName].tree.searchBBox(q, limit)
+  db.releaseStripeRead(collection)
+
+iterator findInBBoxStream*(db: GlenDB; collection, indexName: string;
+                           minLon, minLat, maxLon, maxLat: float64;
+                           limit = 0): (string, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let ids = db.snapshotBBoxMatch(cs, collection, indexName,
+                                   bbox(minLon, minLat, maxLon, maxLat), limit)
+    for id in ids:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v.clone())
+
+proc snapshotNearestPairs(db: GlenDB; cs: CollectionStore; collection, indexName: string;
+                          lon, lat: float64; k: int;
+                          metric: GeoMetric): seq[(string, float64)] =
+  result = @[]
+  db.acquireStripeRead(collection)
+  if indexName in cs.geoIndexes:
+    let gix = cs.geoIndexes[indexName]
+    result =
+      if metric == gmGeographic: gix.tree.nearestGeo(lon, lat, k)
+      else: gix.tree.nearest(lon, lat, k)
+  db.releaseStripeRead(collection)
+
+iterator findNearestStream*(db: GlenDB; collection, indexName: string;
+                            lon, lat: float64; k: int;
+                            metric = gmPlanar): (string, float64, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let pairs = db.snapshotNearestPairs(cs, collection, indexName,
+                                        lon, lat, k, metric)
+    for (id, dist) in pairs:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, dist, v.clone())
+
+proc snapshotRadiusPairs(db: GlenDB; cs: CollectionStore; collection, indexName: string;
+                         lon, lat, radiusMeters: float64;
+                         limit: int): seq[(string, float64)] =
+  result = @[]
+  db.acquireStripeRead(collection)
+  if indexName in cs.geoIndexes:
+    let gix = cs.geoIndexes[indexName]
+    let bb = radiusBBox(lon, lat, radiusMeters)
+    var candidates: seq[(string, float64)] = @[]
+    for id in gix.tree.searchBBox(bb, 0):
+      let doc = lookupDocBypass(cs, id)
+      if doc.isNil: continue
+      let (ok, plon, plat) = gix.extractPoint(doc)
+      if not ok: continue
+      let d = haversineMeters(lon, lat, plon, plat)
+      if d <= radiusMeters: candidates.add((id, d))
+    candidates.sort(proc (a, b: (string, float64)): int = cmp(a[1], b[1]))
+    if limit > 0 and candidates.len > limit:
+      candidates = candidates[0 ..< limit]
+    result = candidates
+  db.releaseStripeRead(collection)
+
+iterator findWithinRadiusStream*(db: GlenDB; collection, indexName: string;
+                                 lon, lat: float64; radiusMeters: float64;
+                                 limit = 0): (string, float64, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let pairs = db.snapshotRadiusPairs(cs, collection, indexName,
+                                       lon, lat, radiusMeters, limit)
+    for (id, d) in pairs:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, d, v.clone())
+
+proc snapshotPolyContainsIds(db: GlenDB; cs: CollectionStore;
+                             collection, indexName: string;
+                             x, y: float64; limit: int): seq[string] =
+  result = @[]
+  db.acquireStripeRead(collection)
+  if indexName in cs.polygonIndexes:
+    result = cs.polygonIndexes[indexName].polygonsContainingPoint(x, y, limit)
+  db.releaseStripeRead(collection)
+
+iterator findPolygonsContainingStream*(db: GlenDB; collection, indexName: string;
+                                       x, y: float64; limit = 0): (string, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let ids = db.snapshotPolyContainsIds(cs, collection, indexName, x, y, limit)
+    for id in ids:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v.clone())
+
+proc snapshotPolyIntersectIds(db: GlenDB; cs: CollectionStore;
+                              collection, indexName: string;
+                              q: BBox; limit: int): seq[string] =
+  result = @[]
+  db.acquireStripeRead(collection)
+  if indexName in cs.polygonIndexes:
+    result = cs.polygonIndexes[indexName].polygonsIntersectingBBox(q, limit)
+  db.releaseStripeRead(collection)
+
+iterator findPolygonsIntersectingStream*(db: GlenDB; collection, indexName: string;
+                                         minX, minY, maxX, maxY: float64;
+                                         limit = 0): (string, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let ids = db.snapshotPolyIntersectIds(cs, collection, indexName,
+                                          bbox(minX, minY, maxX, maxY), limit)
+    for id in ids:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v.clone())
+
+proc snapshotPointsInPolygonIds(db: GlenDB; cs: CollectionStore;
+                                collection, geoIndexName: string;
+                                polygon: Polygon; limit: int): seq[string] =
+  result = @[]
+  db.acquireStripeRead(collection)
+  if geoIndexName in cs.geoIndexes:
+    let gix = cs.geoIndexes[geoIndexName]
+    let bb = polygonBBox(polygon)
+    for id in gix.tree.searchBBox(bb, 0):
+      let doc = lookupDocBypass(cs, id)
+      if doc.isNil: continue
+      let (ok, x, y) = gix.extractPoint(doc)
+      if not ok: continue
+      if pointInPolygon(polygon, x, y):
+        result.add(id)
+        if limit > 0 and result.len >= limit: break
+  db.releaseStripeRead(collection)
+
+iterator findPointsInPolygonStream*(db: GlenDB; collection, geoIndexName: string;
+                                    polygon: Polygon;
+                                    limit = 0): (string, Value) =
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil:
+    let ids = db.snapshotPointsInPolygonIds(cs, collection, geoIndexName,
+                                            polygon, limit)
+    for id in ids:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, v.clone())
+
 # -------- Replication (multi-master) API --------
 
 type ReplExportCursor* = uint64
@@ -1537,7 +1870,18 @@ proc exportChanges*(db: GlenDB; since: ReplExportCursor; includeCollections: seq
 
 proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
   ## Apply a batch of changes from a remote node. Idempotent via changeId; resolves conflicts using HLC (LWW semantics).
+  ## Raises ValueError in spillable mode if the batch would push any
+  ## collection's dirty set past its maxDirtyDocs cap.
   if changes.len == 0: return
+  # Pre-flight per-collection dirty budget check
+  block:
+    var perColl = initTable[string, int]()
+    for ch in changes:
+      perColl[ch.collection] = perColl.getOrDefault(ch.collection, 0) + 1
+    for c, count in perColl:
+      let cs = db.tryGetCollection(c)
+      if not cs.isNil:
+        checkDirtyBudget(cs, count)
   type PendingApply = object
     change: ReplChange
     seqNo: uint64
@@ -1565,10 +1909,12 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
     let docId = ch.docId
     let cs = csByColl[coll]
     let key = (coll, docId)
+    # In spill mode, the "current" doc may live only in the snapshot; the
+    # bypass read decodes from the mmap'd region without faulting it into
+    # cs.docs (we'll write the new value imminently anyway).
     let curDoc =
       if key in pendingDocs: pendingDocs[key]
-      elif docId in cs.docs: cs.docs[docId]
-      else: nil
+      else: lookupDocBypass(cs, docId)
     var curHlc: Hlc
     var hasHlc = false
     if key in pendingHlc:
@@ -1615,6 +1961,7 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
         for _, pix in cs.polygonIndexes:
           pix.unindexDoc(docId, act.oldDoc)
       if docId in cs.docs: cs.docs.del(docId)
+      markDeleted(cs, docId)
       if docId in cs.versions: cs.versions.del(docId)
       db.cache.del(coll & ":" & docId)
       notifications.add((Id(collection: coll, docId: docId, version: ch.version), VNull()))
@@ -1624,6 +1971,7 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
       if stored.isNil:
         stored = VNull()
       cs.docs[docId] = stored
+      markDirty(cs, docId)
       cs.versions[docId] = ch.version
       db.cache.put(coll & ":" & docId, stored)
       for _, idx in cs.indexes:

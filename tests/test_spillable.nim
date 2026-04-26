@@ -1,5 +1,5 @@
-import std/[os, unittest, tables, sets]
-import glen/db, glen/types, glen/storage
+import std/[os, unittest, tables, sets, strutils]
+import glen/db, glen/types, glen/txn, glen/storage
 
 # A few smoke tests for snapshot v2 + spillable mode. The eager-mode test
 # suites all auto-upgrade to v2 once the user calls compact() and so exercise
@@ -166,3 +166,157 @@ suite "spillable mode: lazy load":
     check db2.get("things", "fresh").s == "brand new"
     check db2.get("things", "t0").isNil
     db2.close()
+
+suite "spillable: bulk reads see snapshot-only docs":
+  test "getMany returns docs even if not yet faulted":
+    let dir = getTempDir() / "glen_spill_getmany"
+    removeDir(dir)
+    block:
+      let db = newGlenDB(dir)
+      for i in 0 ..< 100:
+        var v = VObject(); v["n"] = VInt(i.int64)
+        db.put("things", "t" & $i, v)
+      db.compact()
+      db.close()
+    let db = newGlenDB(dir, spillableMode = true)
+    var ids: seq[string] = @[]
+    for i in 0 ..< 100: ids.add("t" & $i)
+    let pairs = db.getMany("things", ids)
+    check pairs.len == 100   # not 0
+    var foundCount = 0
+    for (_, v) in pairs:
+      check not v.isNil; inc foundCount
+    check foundCount == 100
+    db.close()
+
+  test "getAll returns snapshot + in-memory docs":
+    let dir = getTempDir() / "glen_spill_getall"
+    removeDir(dir)
+    block:
+      let db = newGlenDB(dir)
+      for i in 0 ..< 50:
+        db.put("things", "t" & $i, VInt(i.int64))
+      db.compact()
+      db.close()
+    let db = newGlenDB(dir, spillableMode = true)
+    db.put("things", "z-fresh", VString("new"))   # in-memory
+    db.delete("things", "t10")                    # tombstone snapshot doc
+    let all = db.getAll("things")
+    # 50 snapshot - 1 deleted + 1 fresh = 50
+    check all.len == 50
+    var foundFresh = false
+    var foundT10   = false
+    for (id, _) in all:
+      if id == "z-fresh": foundFresh = true
+      if id == "t10":     foundT10 = true
+    check foundFresh
+    check not foundT10
+    db.close()
+
+  test "createIndex sees snapshot-only docs":
+    let dir = getTempDir() / "glen_spill_index"
+    removeDir(dir)
+    block:
+      let db = newGlenDB(dir)
+      for i in 0 ..< 30:
+        var v = VObject()
+        v["category"] = VString(if i mod 2 == 0: "even" else: "odd")
+        v["n"] = VInt(i.int64)
+        db.put("things", "t" & $i, v)
+      db.compact()
+      db.close()
+    let db = newGlenDB(dir, spillableMode = true)
+    db.createIndex("things", "byCategory", "category")
+    let evens = db.findBy("things", "byCategory", VString("even"))
+    check evens.len == 15
+    let odds = db.findBy("things", "byCategory", VString("odd"))
+    check odds.len == 15
+    db.close()
+
+  test "createGeoIndex sees snapshot-only docs":
+    let dir = getTempDir() / "glen_spill_geoidx"
+    removeDir(dir)
+    block:
+      let db = newGlenDB(dir)
+      for i in 0 ..< 30:
+        var v = VObject()
+        v["lon"] = VFloat(float64(i))
+        v["lat"] = VFloat(0.0)
+        db.put("places", "p" & $i, v)
+      db.compact()
+      db.close()
+    let db = newGlenDB(dir, spillableMode = true)
+    db.createGeoIndex("places", "byLoc", "lon", "lat")
+    let res = db.findInBBox("places", "byLoc", 4.5, -1.0, 14.5, 1.0)
+    check res.len == 10   # p5..p14
+    db.close()
+
+suite "spillable: dirty budget guardrail":
+  test "putMany above maxDirtyDocs raises ValueError":
+    let dir = getTempDir() / "glen_spill_budget_putmany"
+    removeDir(dir)
+    block:
+      let db = newGlenDB(dir)
+      db.put("things", "seed", VInt(0))
+      db.compact()
+      db.close()
+    let db = newGlenDB(dir, spillableMode = true, maxDirtyDocs = 5)
+    var batch: seq[(string, Value)] = @[]
+    for i in 0 ..< 10:
+      batch.add(("k" & $i, VInt(i.int64)))
+    expect(ValueError):
+      db.putMany("things", batch)
+    db.close()
+
+  test "deleteMany above maxDirtyDocs raises ValueError":
+    let dir = getTempDir() / "glen_spill_budget_deletemany"
+    removeDir(dir)
+    block:
+      let db = newGlenDB(dir)
+      for i in 0 ..< 20:
+        db.put("things", "k" & $i, VInt(i.int64))
+      db.compact()
+      db.close()
+    let db = newGlenDB(dir, spillableMode = true, maxDirtyDocs = 5)
+    var ids: seq[string] = @[]
+    for i in 0 ..< 10: ids.add("k" & $i)
+    expect(ValueError):
+      db.deleteMany("things", ids)
+    db.close()
+
+  test "commit above maxDirtyDocs returns csInvalid (not csOk)":
+    let dir = getTempDir() / "glen_spill_budget_commit"
+    removeDir(dir)
+    block:
+      let db = newGlenDB(dir)
+      db.put("things", "seed", VInt(0))
+      db.compact()
+      db.close()
+    let db = newGlenDB(dir, spillableMode = true, maxDirtyDocs = 3)
+    let t = db.beginTxn()
+    for i in 0 ..< 10:
+      t.stagePut(Id(collection: "things", docId: "k" & $i), VInt(i.int64))
+    let r = db.commit(t)
+    check r.status == csInvalid
+    check r.message.contains("maxDirtyDocs")
+    db.close()
+
+  test "compact() lets the budget recover":
+    let dir = getTempDir() / "glen_spill_budget_recover"
+    removeDir(dir)
+    block:
+      let db = newGlenDB(dir)
+      db.put("things", "seed", VInt(0))
+      db.compact()
+      db.close()
+    let db = newGlenDB(dir, spillableMode = true, maxDirtyDocs = 5)
+    var batch: seq[(string, Value)] = @[]
+    for i in 0 ..< 5:
+      batch.add(("a" & $i, VInt(i.int64)))
+    db.putMany("things", batch)         # 5 dirty, at the cap
+    db.compact()                         # flush; dirty resets
+    var batch2: seq[(string, Value)] = @[]
+    for i in 0 ..< 5:
+      batch2.add(("b" & $i, VInt(i.int64)))
+    db.putMany("things", batch2)        # OK now
+    db.close()
