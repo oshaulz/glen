@@ -245,11 +245,29 @@ let db = newGlenDBFromEnv("./mydb")    # reads all of the above
 - **Cache shards** (`cacheShards`): set ≥ number of writer threads to minimise per-shard contention.
 - **Cache capacity**: Glen estimates value byte-size and evicts LRU-style; size it at 1–2× your hot working set.
 
+### Concurrency notes
+
+Glen is safe to share across threads with two caveats:
+
+1. **Materialise collections before going wide.** Striped RW-locks protect each
+   collection's *contents*; the outer collection-table itself is not
+   synchronised. Call `db.ensureCollection("foo")` once per collection, on a
+   single thread, before fanning out concurrent writers. New-collection
+   creation racing with concurrent ops is undefined behaviour.
+
+2. **Compile multi-threaded callers with `--mm:atomicArc -d:useMalloc`.** ORC's
+   default refcounter and cycle collector are not thread-safe; Value refs
+   shared across threads will eventually crash in `unregisterCycle` at
+   shutdown. Glen's value graph is acyclic, so atomicArc has no downside.
+   Single-threaded callers can keep `--mm:orc` (the default).
+
 ---
 
 ## Performance
 
-Single thread, Apple M5, ORC + `-O3`:
+Apple M5, `-d:release`, ORC + `-O3`.
+
+**Single-threaded** (`nimble bench_release`):
 
 ```
 BENCH puts:           20000 ops in   75 ms =>   266666 ops/s
@@ -259,13 +277,53 @@ BENCH getMany:        20000 docs in   1 ms =>   200000 batches/s
 BENCH txn commits:     1000 ops in    3 ms =>   333333 ops/s
 ```
 
-Reproduce:
+**Multi-threaded contention** (`nimble bench_concurrent`, atomicArc + `-d:useMalloc`):
 
 ```
-nimble bench_release
+disjoint-write-only   4w/0r  ×50k ops/thread =>  214k ops/s   (low stripe contention)
+disjoint-mixed-rw     4w/4r  ×50k             =>  430k ops/s
+shared-write-only     4w/0r  ×50k             =>  175k ops/s   (max stripe contention)
+shared-mixed-rw       4w/4r  ×50k             =>  372k ops/s
+read-heavy-shared     1w/8r  ×50k             =>  1.96M ops/s
 ```
+
+The single-thread cached-read number (5M ops/s) is the upper bound; under
+contention with eight readers and one writer Glen still serves ~2M ops/s.
 
 ---
+
+## Worked example: local-first todos
+
+`examples/todo_sync.nim` is a small CLI that uses Glen's replication API to
+sync todos across two processes via a shared mailbox directory. Build it
+once, run it twice:
+
+```bash
+nim c -d:release --path:src examples/todo_sync.nim
+
+# terminal 1
+./examples/todo_sync --db ./node-a add "buy milk"
+./examples/todo_sync --db ./node-a add "ship glen 0.3"
+./examples/todo_sync --db ./node-a push ./mailbox
+
+# terminal 2
+./examples/todo_sync --db ./node-b pull ./mailbox
+./examples/todo_sync --db ./node-b list             # sees both todos
+./examples/todo_sync --db ./node-b complete <id>
+./examples/todo_sync --db ./node-b push ./mailbox
+
+# terminal 1 picks up the completion
+./examples/todo_sync --db ./node-a pull ./mailbox
+./examples/todo_sync --db ./node-a list
+```
+
+The mailbox is just a directory of `.batch` files containing
+codec-encoded change sets. `pull` is idempotent — running it twice
+applies nothing the second time, because every change carries a
+`changeId` that Glen recognises on apply.
+
+A second, smaller example with strict schema validation lives in
+`examples/crud_validated.nim`.
 
 ## Architecture, in one paragraph
 

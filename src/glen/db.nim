@@ -144,29 +144,30 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
             result.peersCursors[parts[0]] = uint64(n)
     except IOError:
       discard
-  # replay wal (also rebuild versions/indexes and in-memory replication log)
+  # replay wal (also rebuild versions/indexes and in-memory replication log).
+  # NOTE: must mutate result.collections[c] directly. `var coll = result.collections[c]`
+  # would copy the Table by value and silently drop every replayed write.
   for rec in replay(dir):
-    var coll: CollectionStore
     if rec.collection notin result.collections:
       result.collections[rec.collection] = initTable[string, Value]()
     if rec.collection notin result.versions:
       result.versions[rec.collection] = initTable[string, uint64]()
-    coll = result.collections[rec.collection]
     if rec.kind == wrPut:
-      coll[rec.docId] = rec.value
+      result.collections[rec.collection][rec.docId] = rec.value
       result.versions[rec.collection][rec.docId] = rec.version
       # reindex existing indexes for this collection
       if rec.collection in result.indexes:
         for _, idx in result.indexes[rec.collection]:
           idx.indexDoc(rec.docId, rec.value)
     else:
-      if rec.docId in coll:
-        let oldDoc = coll[rec.docId]
+      if rec.docId in result.collections[rec.collection]:
+        let oldDoc = result.collections[rec.collection][rec.docId]
         if rec.collection in result.indexes:
           for _, idx in result.indexes[rec.collection]:
             idx.unindexDoc(rec.docId, oldDoc)
-        coll.del(rec.docId)
-      if rec.docId in result.versions[rec.collection]: result.versions[rec.collection].del(rec.docId)
+        result.collections[rec.collection].del(rec.docId)
+      if rec.docId in result.versions[rec.collection]:
+        result.versions[rec.collection].del(rec.docId)
     # Rebuild in-memory repl log cursor from WAL (uses v2 metadata when present)
     inc result.replSeq
     var ch: ReplChange
@@ -268,6 +269,30 @@ proc gcReplLog*(db: GlenDB) =
     let cutc = firstAfter(seqs, cutoff)
     if cutc > 0:
       seqs = seqs[cutc .. ^1]
+
+# ---- Collection lifecycle ----
+proc ensureCollection*(db: GlenDB; collection: string) =
+  ## Idempotently materialise the per-collection slots in every outer table.
+  ##
+  ## Required before any concurrent access to a collection that does not yet
+  ## exist. Striped locks protect each collection's *contents*, but the outer
+  ## tables (db.collections, db.versions, db.replMetaHlc, db.replMetaChangeId,
+  ## db.replLogByCollection) are unsynchronised. Two threads first-writing to
+  ## different collections will race on those outer tables.
+  ##
+  ## Call this once per collection, single-threaded, before fanning out work.
+  acquire(db.replLock)
+  if collection notin db.collections:
+    db.collections[collection] = initTable[string, Value]()
+  if collection notin db.versions:
+    db.versions[collection] = initTable[string, uint64]()
+  if collection notin db.replMetaHlc:
+    db.replMetaHlc[collection] = initTable[string, Hlc]()
+  if collection notin db.replMetaChangeId:
+    db.replMetaChangeId[collection] = initTable[string, string]()
+  if collection notin db.replLogByCollection:
+    db.replLogByCollection[collection] = @[]
+  release(db.replLock)
 
 # ---- Stripe locking helpers ----
 proc stripeIndex(db: GlenDB; collection: string): int =
@@ -580,10 +605,15 @@ proc currentVersion*(db: GlenDB; collection, docId: string): uint64 =
 proc commit*(db: GlenDB; t: Txn): CommitResult =
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
-  # Acquire all needed collection stripes in sorted order
+  # Acquire all needed collection stripes in sorted order. We must include
+  # stripes for read-only keys too, otherwise a concurrent writer to a
+  # collection we read from (but did not write) can change the version
+  # between our recordRead and this validation, causing a missed conflict.
   var stripes: seq[int] = @[]
   for key, _ in t.writes:
     stripes.add(db.stripeIndex(key[0]))
+  for k, _ in t.readVersions:
+    stripes.add(db.stripeIndex(k[0]))
   db.acquireStripesWrite(stripes)
   if t.state != tsActive:
     db.releaseStripesWrite(stripes)
