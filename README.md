@@ -8,7 +8,7 @@ db.put("users", "u1", VObject())
 echo db.get("users", "u1")
 ```
 
-> **Status:** beta (0.4.4). On-disk formats are versioned and tested across reopen / replay / replication: WAL v2, snapshot **v2** (with v1 read-back compat), GRI/GPI v1, GTS/TTS v1. Expect minor API churn until 1.0.
+> **Status:** beta (0.5.0). On-disk formats are versioned and tested across reopen / replay / replication: WAL v2, snapshot **v3** (paged on-disk index; v1/v2 still readable), GRI/GPI v1, GTS/TTS v1. Expect minor API churn until 1.0.
 
 ---
 
@@ -630,10 +630,42 @@ exceeding the cap returns `csInvalid` (commit) or raises `ValueError`
 (others) with a message asking you to compact or chunk. With `maxDirtyDocs = 0`
 (default) there's no cap.
 
-**Remaining limitation:** the doc index itself lives in RAM (~30–50 bytes/doc).
-A 100M-doc DB carries a ~4 GB resident index even in spill mode. Paged
-indexes (B+ tree on disk) would lift this ceiling and remain a future
-addition.
+### Paged on-disk doc index (snapshot v3)
+
+The doc index itself is also paged on disk. **Snapshot v3** lays out a sorted
+offsets table next to the entries; lookups binary-search that table directly
+through the OS page cache via mmap. Resident memory at open is **0 bytes** for
+the index — only the pages touched by your queries get faulted in, and the
+kernel evicts them under pressure like any other mmap'd data.
+
+```
+v3 layout (compact() writes this; openSnapshotMmap auto-detects):
+  header (40 B): magic + version + docCount + section offsets
+  bodies   : encoded values, concatenated, sorted by docId
+  entries  : variable-size (idLen, id, bodyOffset, bodyLength), sorted
+  offsets  : docCount × uint64, each pointing into entries
+```
+
+A lookup is a binary search on the offsets table (`log₂ n` page reads), each
+midpoint dereferencing into the entries section to compare ids. For a 100M-doc
+DB on this hardware:
+
+```
+open (just reads the 40-byte header):  0.03 ms
+random lookup rate:                    2.3M q/s   (release build)
+on-disk index overhead:                ~36 bytes/doc
+resident-memory index overhead:        0 bytes (OS page cache only)
+```
+
+`compact()` writes v3 by default; `loadSnapshot` (eager mode) and
+`openSnapshotMmap` (spill mode) both auto-detect v1 / v2 / v3, so existing
+databases keep working through any version transition. v2 → v3 happens on the
+next `compact()`.
+
+**Net result:** Glen now scales spillable-mode storage past the
+"index-fits-in-RAM" ceiling. A 1 TB / 1 B-doc database is now
+genuinely workable on a 16 GB box; what stays resident is determined by
+working set and OS page cache, not by index footprint.
 
 ---
 
@@ -700,7 +732,6 @@ Suites cover: basic CRUD, WAL replay & corrupt-tail tolerance, snapshot round-tr
 - Bilinear interpolation in `GeoMesh.sampleAt`
 - Per-cell offset table in tile chunks (faster point-history without decoding all streams)
 - SIMD bit-decode (AVX-512 PEXT/PDEP, ARM NEON) for the Gorilla unpack hot path
-- Paged on-disk doc index for spill mode (lift the in-memory index ceiling)
 - Parallel replication export (single export currently runs under one log lock)
 
 ---

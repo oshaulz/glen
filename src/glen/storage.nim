@@ -20,7 +20,7 @@
 # The format auto-detects on load: v2 snapshots start with the 8-byte magic;
 # anything else is treated as v1.
 
-import std/[os, streams, tables, memfiles, syncio]
+import std/[os, streams, tables, memfiles, syncio, algorithm]
 when defined(windows):
   import std/winlean
 import glen/types, glen/codec
@@ -50,6 +50,11 @@ proc readVarUint(s: Stream): uint64 =
 const
   SnapshotV2Magic*   = "GLENSNP2"
   SnapshotV2Version* = 2'u32
+  SnapshotV3Magic*   = "GLENSNP3"
+  SnapshotV3Version* = 3'u32
+  # v3 header layout: magic(8) + version(4) + docCount(4) + bodiesStart(8) +
+  #                   entriesStart(8) + offsetsStart(8) = 40 bytes
+  SnapshotV3HeaderBytes = 40
 
 proc snapshotPath(dir, collection: string): string = dir / (collection & ".snap")
 
@@ -98,10 +103,44 @@ proc loadSnapshot*(dir, collection: string): Table[string, Value] =
   if not fileExists(path): return
   var f = syncio.open(path, fmRead)
   defer: f.close()
-  # Sniff magic for v2.
-  var magicBuf = newString(SnapshotV2Magic.len)
-  let nMagic = f.readBuffer(addr magicBuf[0], SnapshotV2Magic.len)
-  if nMagic == SnapshotV2Magic.len and magicBuf == SnapshotV2Magic:
+  # Sniff magic. v3 (paged on-disk index) and v2 (in-memory index) use the
+  # same first 7 chars "GLENSNP", differ in the 8th. v1 has no magic.
+  var magicBuf = newString(8)
+  let nMagic = f.readBuffer(addr magicBuf[0], 8)
+  if nMagic == 8 and magicBuf == SnapshotV3Magic:
+    # v3 path: header → walk every entry sequentially → decode body for each.
+    var ver: uint32
+    if f.readBuffer(addr ver, 4) != 4: raiseSnapshot("v3 truncated header")
+    if ver != SnapshotV3Version: raiseSnapshot("v3 unsupported version " & $ver)
+    var docCount: uint32
+    if f.readBuffer(addr docCount, 4) != 4: raiseSnapshot("v3 truncated header")
+    var bodiesStart, entriesStart, offsetsStart: uint64
+    if f.readBuffer(addr bodiesStart, 8) != 8: raiseSnapshot("v3 truncated header")
+    if f.readBuffer(addr entriesStart, 8) != 8: raiseSnapshot("v3 truncated header")
+    if f.readBuffer(addr offsetsStart, 8) != 8: raiseSnapshot("v3 truncated header")
+    let cfg = loadConfig()
+    f.setFilePos(int64(entriesStart))
+    for _ in 0 ..< int(docCount):
+      var idLen: uint32
+      if f.readBuffer(addr idLen, 4) != 4: raiseSnapshot("v3 truncated entry")
+      if int(idLen) > cfg.maxStringOrBytes: raiseSnapshot("v3 id too large")
+      var id = newString(int(idLen))
+      if int(idLen) > 0 and f.readBuffer(addr id[0], int(idLen)) != int(idLen):
+        raiseSnapshot("v3 truncated id")
+      var bodyOff: uint64
+      if f.readBuffer(addr bodyOff, 8) != 8: raiseSnapshot("v3 truncated bodyOffset")
+      var bodyLen: uint32
+      if f.readBuffer(addr bodyLen, 4) != 4: raiseSnapshot("v3 truncated bodyLen")
+      if int(bodyLen) > cfg.maxStringOrBytes: raiseSnapshot("v3 body too large")
+      let savedPos = f.getFilePos()
+      f.setFilePos(int64(bodyOff))
+      var enc = newString(int(bodyLen))
+      if int(bodyLen) > 0 and f.readBuffer(addr enc[0], int(bodyLen)) != int(bodyLen):
+        raiseSnapshot("v3 truncated body")
+      result[id] = decode(enc)
+      f.setFilePos(savedPos)
+    return
+  if nMagic == 8 and magicBuf == SnapshotV2Magic:
     # v2 path: read version + docCount, then index, then dereference into body.
     var ver: uint32
     if f.readBuffer(addr ver, 4) != 4: raiseSnapshot("v2 truncated header")
@@ -217,12 +256,24 @@ type
     bodyLength*: uint32
 
   SnapshotMmap* = ref object
-    ## A mmap'd snapshot file kept open for random body reads. The `index`
-    ## maps docId → location of the encoded body within the file.
-    path*:   string
-    file*:   MemFile
-    index*:  Table[string, SnapshotIndexEntry]
-    isV2*:   bool       # false if the snapshot is v1 — index will be empty
+    ## A mmap'd snapshot file kept open for random body reads.
+    ##
+    ## v2: the `index` Table is fully populated in RAM at open time.
+    ## v3: only `docCount` + `offsetsStart` are kept in RAM; the index lives
+    ##     on disk as a sorted offsets table mapped via the OS page cache.
+    ## v1: legacy; isV2/isV3 both false; callers should fall back to the
+    ##     eager `loadSnapshot` path.
+    path*:           string
+    file*:           MemFile
+    isV2*:           bool
+    isV3*:           bool
+    # v2 fields (only populated when isV2):
+    index*:          Table[string, SnapshotIndexEntry]
+    # v3 fields (only populated when isV3):
+    docCount*:       uint32
+    bodiesStart*:    uint64
+    entriesStart*:   uint64
+    offsetsStart*:   uint64
 
 proc openSnapshotMmap*(dir, collection: string): SnapshotMmap =
   ## Memory-map the snapshot file and read just the index (v2). On a v1 file,
@@ -235,14 +286,39 @@ proc openSnapshotMmap*(dir, collection: string): SnapshotMmap =
   result.file = memfiles.open(path, mode = fmRead)
   let raw = cast[ptr UncheckedArray[byte]](result.file.mem)
   let total = result.file.size
-  if total < SnapshotV2Magic.len + 8: return result
-  # Magic check
-  for i in 0 ..< SnapshotV2Magic.len:
-    if char(raw[i]) != SnapshotV2Magic[i]:
-      result.isV2 = false
-      return result
+  if total < 16: return result
+  # Sniff: v2 and v3 share "GLENSNP" prefix; differ in 8th char.
+  var prefixOk = true
+  for i in 0 ..< 7:
+    if char(raw[i]) != "GLENSNP"[i]:
+      prefixOk = false; break
+  if not prefixOk: return result   # v1 or unknown — caller falls back
+  let kindChar = char(raw[7])
+  if kindChar == '3':
+    # v3 path: read header into the SnapshotMmap fields; defer entry/offset
+    # access to lookup-time (paged via OS).
+    if total < SnapshotV3HeaderBytes:
+      raiseSnapshot("v3 mmap truncated header")
+    var off = 8
+    let ver = cast[ptr uint32](addr raw[off])[]; off += 4
+    if ver != SnapshotV3Version: raiseSnapshot("v3 unsupported version " & $ver)
+    let docCount = cast[ptr uint32](addr raw[off])[]; off += 4
+    let bodiesStart = cast[ptr uint64](addr raw[off])[]; off += 8
+    let entriesStart = cast[ptr uint64](addr raw[off])[]; off += 8
+    let offsetsStart = cast[ptr uint64](addr raw[off])[]; off += 8
+    if int(offsetsStart) + int(docCount) * 8 > total:
+      raiseSnapshot("v3 mmap offsets section out of bounds")
+    result.isV3 = true
+    result.docCount = docCount
+    result.bodiesStart = bodiesStart
+    result.entriesStart = entriesStart
+    result.offsetsStart = offsetsStart
+    return
+  if kindChar != '2':
+    # Unknown version letter — treat as v1 / unsupported; fall through.
+    return result
   result.isV2 = true
-  var off = SnapshotV2Magic.len
+  var off = 8
   let ver = cast[ptr uint32](addr raw[off])[]
   off += 4
   if ver != SnapshotV2Version:
@@ -270,20 +346,227 @@ proc openSnapshotMmap*(dir, collection: string): SnapshotMmap =
     result.index[id] = SnapshotIndexEntry(
       bodyOffset: bodyOffset, bodyLength: bodyLength)
 
+# ---- v3 raw-byte helpers (mmap dereferences) ----
+
+proc raw(s: SnapshotMmap): ptr UncheckedArray[byte] {.inline.} =
+  cast[ptr UncheckedArray[byte]](s.file.mem)
+
+proc readU32At(s: SnapshotMmap; off: int): uint32 {.inline.} =
+  let r = s.raw
+  result = (uint32(r[off])) or
+           (uint32(r[off + 1]) shl 8) or
+           (uint32(r[off + 2]) shl 16) or
+           (uint32(r[off + 3]) shl 24)
+
+proc readU64At(s: SnapshotMmap; off: int): uint64 {.inline.} =
+  let r = s.raw
+  result = (uint64(r[off]))      or
+           (uint64(r[off+1]) shl  8) or
+           (uint64(r[off+2]) shl 16) or
+           (uint64(r[off+3]) shl 24) or
+           (uint64(r[off+4]) shl 32) or
+           (uint64(r[off+5]) shl 40) or
+           (uint64(r[off+6]) shl 48) or
+           (uint64(r[off+7]) shl 56)
+
+proc compareEntryIdAt(s: SnapshotMmap; entryOff: uint64; key: string): int =
+  ## Compare the entry's id at `entryOff` with `key`. Returns -1/0/1 like cmp.
+  let idLen = readU32At(s, int(entryOff))
+  let r = s.raw
+  let n = min(int(idLen), key.len)
+  for i in 0 ..< n:
+    let a = char(r[int(entryOff) + 4 + i])
+    let b = key[i]
+    if a < b: return -1
+    if a > b: return 1
+  if int(idLen) < key.len: return -1
+  if int(idLen) > key.len: return 1
+  0
+
+proc readEntryAt(s: SnapshotMmap; entryOff: uint64): (string, uint64, uint32) =
+  let idLen = readU32At(s, int(entryOff))
+  var id = newString(int(idLen))
+  if idLen > 0:
+    let r = s.raw
+    copyMem(addr id[0], addr r[int(entryOff) + 4], int(idLen))
+  let bodyOff = readU64At(s, int(entryOff) + 4 + int(idLen))
+  let bodyLen = readU32At(s, int(entryOff) + 4 + int(idLen) + 8)
+  (id, bodyOff, bodyLen)
+
+proc lookupV3(s: SnapshotMmap; docId: string): (bool, uint64, uint32) =
+  ## Binary-search the v3 offsets table for `docId`. Returns
+  ## (found, bodyOffset, bodyLength). The offsets array and the entries it
+  ## points into are paged in by the OS as we touch them.
+  result = (false, 0'u64, 0'u32)
+  if not s.isV3 or s.docCount == 0: return
+  var lo = 0
+  var hi = int(s.docCount)
+  while lo < hi:
+    let mid = (lo + hi) shr 1
+    let entryOff = readU64At(s, int(s.offsetsStart) + mid * 8)
+    let cmpRes = compareEntryIdAt(s, entryOff, docId)
+    if cmpRes == 0:
+      let (_, bodyOff, bodyLen) = readEntryAt(s, entryOff)
+      return (true, bodyOff, bodyLen)
+    if cmpRes < 0:   # entry's id < query → search right half
+      lo = mid + 1
+    else:
+      hi = mid
+
 proc loadDocFromMmap*(s: SnapshotMmap; docId: string): Value =
   ## Returns nil if the doc isn't in the index. Otherwise decodes and returns
-  ## the Value by reading directly from the mapped region.
-  if s.isNil or not s.isV2: return nil
-  if docId notin s.index: return nil
-  let e = s.index[docId]
+  ## the Value by reading directly from the mapped region. Handles v2
+  ## (in-memory Table lookup) and v3 (binary search on disk-paged offsets).
+  if s.isNil: return nil
   let raw = cast[ptr UncheckedArray[byte]](s.file.mem)
-  if e.bodyOffset.int + e.bodyLength.int > s.file.size:
-    raiseSnapshot("v2 mmap body out of range")
-  var enc = newString(int(e.bodyLength))
-  if e.bodyLength > 0:
-    copyMem(addr enc[0], addr raw[int(e.bodyOffset)], int(e.bodyLength))
-  decode(enc)
+  if s.isV2:
+    if docId notin s.index: return nil
+    let e = s.index[docId]
+    if e.bodyOffset.int + e.bodyLength.int > s.file.size:
+      raiseSnapshot("v2 mmap body out of range")
+    var enc = newString(int(e.bodyLength))
+    if e.bodyLength > 0:
+      copyMem(addr enc[0], addr raw[int(e.bodyOffset)], int(e.bodyLength))
+    return decode(enc)
+  if s.isV3:
+    let (found, bodyOff, bodyLen) = lookupV3(s, docId)
+    if not found: return nil
+    if int(bodyOff) + int(bodyLen) > s.file.size:
+      raiseSnapshot("v3 mmap body out of range")
+    var enc = newString(int(bodyLen))
+    if bodyLen > 0:
+      copyMem(addr enc[0], addr raw[int(bodyOff)], int(bodyLen))
+    return decode(enc)
+  return nil
+
+proc containsId*(s: SnapshotMmap; docId: string): bool =
+  ## Existence check that works for both v2 and v3.
+  if s.isNil: return false
+  if s.isV2: return docId in s.index
+  if s.isV3:
+    let (found, _, _) = lookupV3(s, docId)
+    return found
+  false
+
+iterator iterIds*(s: SnapshotMmap): string =
+  ## Yields every docId in the snapshot. Order: insertion order for v2,
+  ## sorted (lexicographic) for v3.
+  if not s.isNil:
+    if s.isV2:
+      for id in s.index.keys: yield id
+    elif s.isV3:
+      for i in 0 ..< int(s.docCount):
+        let entryOff = readU64At(s, int(s.offsetsStart) + i * 8)
+        let (id, _, _) = readEntryAt(s, entryOff)
+        yield id
+
+proc snapshotDocCount*(s: SnapshotMmap): int =
+  ## Total docs in the mapped snapshot (works across v2/v3).
+  if s.isNil: return 0
+  if s.isV2: return s.index.len
+  if s.isV3: return int(s.docCount)
+  0
 
 proc closeSnapshotMmap*(s: SnapshotMmap) =
   if s.isNil: return
   close(s.file)
+
+# ---- Snapshot v3: paged on-disk index, mmap-backed binary search ----
+#
+# Layout:
+#   header (40 B):
+#     magic         "GLENSNP3" (8 B)
+#     version       uint32     (4 B, = 3)
+#     docCount      uint32     (4 B)
+#     bodiesStart   uint64     (8 B)  abs file offset
+#     entriesStart  uint64     (8 B)  abs file offset
+#     offsetsStart  uint64     (8 B)  abs file offset
+#   bodies section: encoded values, concatenated. Stored in docId-sorted order
+#                   so sequential iteration is also sequential I/O.
+#   entries section: variable-size records, sorted by docId:
+#     idLen      uint32
+#     id         [idLen bytes]
+#     bodyOffset uint64    (abs file offset of this doc's body)
+#     bodyLength uint32
+#   offsets section: docCount × uint64, each is the abs file offset of the
+#                    matching entry (also in docId-sorted order).
+#
+# Lookup: binary-search the offsets table; for each midpoint, deref to the
+# entry, read its idLen+id, compare to the queried docId. Found entries
+# yield (bodyOffset, bodyLength), which point into the bodies section.
+#
+# Memory footprint: only the file pages actually touched by lookups stay
+# resident (handled by the OS page cache via mmap). For random key lookups,
+# log₂(docCount) page faults per lookup; for iteration, a sequential scan
+# of the offsets and entries sections.
+
+proc writeSnapshotV3*(dir, collection: string; docs: Table[string, Value]) =
+  ## Write a v3 (paged) snapshot atomically: write to temp file then rename.
+  createDir(dir)
+  let finalPath = snapshotPath(dir, collection)
+  let tmpPath = finalPath & ".tmp"
+  # Sort entries by docId so bodies, entries, and offsets all align.
+  type Pair = tuple[id: string, enc: string]
+  var pairs = newSeqOfCap[Pair](docs.len)
+  for id, v in docs:
+    pairs.add((id, encode(v)))
+  pairs.sort(proc (a, b: Pair): int = cmp(a.id, b.id))
+
+  var f = syncio.open(tmpPath, fmReadWrite)
+  # Reserve header bytes (we'll patch them after writing all sections).
+  var hdrPad = newString(SnapshotV3HeaderBytes)
+  discard f.writeBuffer(addr hdrPad[0], SnapshotV3HeaderBytes)
+
+  # Bodies section: write each encoded value, capturing offsets.
+  let bodiesStart = uint64(f.getFilePos())
+  var bodyOffsets = newSeq[uint64](pairs.len)
+  var bodyLens = newSeq[uint32](pairs.len)
+  for i, p in pairs:
+    bodyOffsets[i] = uint64(f.getFilePos())
+    bodyLens[i] = uint32(p.enc.len)
+    if p.enc.len > 0:
+      discard f.writeBuffer(unsafeAddr p.enc[0], p.enc.len)
+
+  # Entries section: write each (idLen, id, bodyOffset, bodyLength).
+  let entriesStart = uint64(f.getFilePos())
+  var entryOffsets = newSeq[uint64](pairs.len)
+  for i, p in pairs:
+    entryOffsets[i] = uint64(f.getFilePos())
+    var idLen = uint32(p.id.len)
+    discard f.writeBuffer(addr idLen, 4)
+    if p.id.len > 0:
+      discard f.writeBuffer(unsafeAddr p.id[0], p.id.len)
+    var bo = bodyOffsets[i]
+    discard f.writeBuffer(addr bo, 8)
+    var bl = bodyLens[i]
+    discard f.writeBuffer(addr bl, 4)
+
+  # Offsets section: docCount × uint64.
+  let offsetsStart = uint64(f.getFilePos())
+  for off in entryOffsets:
+    var x = off
+    discard f.writeBuffer(addr x, 8)
+
+  # Patch the header.
+  f.setFilePos(0)
+  f.write(SnapshotV3Magic)
+  var ver = SnapshotV3Version
+  discard f.writeBuffer(addr ver, 4)
+  var dc = uint32(pairs.len)
+  discard f.writeBuffer(addr dc, 4)
+  var bs = bodiesStart
+  discard f.writeBuffer(addr bs, 8)
+  var es = entriesStart
+  discard f.writeBuffer(addr es, 8)
+  var os2 = offsetsStart
+  discard f.writeBuffer(addr os2, 8)
+  f.flushFile()
+  f.close()
+  when defined(windows):
+    if fileExists(finalPath): removeFile(finalPath)
+    moveFile(tmpPath, finalPath)
+  else:
+    moveFile(tmpPath, finalPath)
+  flushDir(dir)
+
+# (v3 raw read helpers were hoisted above lookupV3.)

@@ -189,7 +189,7 @@ proc evictColdDoc(cs: CollectionStore) =
   # Find a non-dirty doc that's also in the snapshot index (so we can re-fetch).
   var victim = ""
   for id in cs.docs.keys:
-    if id notin cs.dirty and id in cs.snapshot.index:
+    if id notin cs.dirty and containsId(cs.snapshot, id):
       victim = id; break
   if victim.len > 0:
     cs.docs.del(victim)
@@ -225,7 +225,7 @@ proc hasDoc(cs: CollectionStore; docId: string): bool {.inline.} =
   if cs.snapshot.isNil: return docId in cs.docs
   if docId in cs.deleted: return false
   if docId in cs.docs: return true
-  docId in cs.snapshot.index
+  containsId(cs.snapshot, docId)
 
 proc markDirty(cs: CollectionStore; docId: string) {.inline.} =
   cs.dirty.incl(docId)
@@ -233,17 +233,17 @@ proc markDirty(cs: CollectionStore; docId: string) {.inline.} =
 
 proc markDeleted(cs: CollectionStore; docId: string) {.inline.} =
   cs.dirty.excl(docId)
-  if not cs.snapshot.isNil and docId in cs.snapshot.index:
+  if not cs.snapshot.isNil and containsId(cs.snapshot, docId):
     cs.deleted.incl(docId)
 
 iterator allDocIds(cs: CollectionStore): string =
   ## Walks every visible (live) docId across both the snapshot and the in-memory
-  ## modifications. Order is unspecified; do not rely on it.
+  ## modifications. Order is unspecified for v2 / sorted for v3.
   if not cs.snapshot.isNil:
-    for id in cs.snapshot.index.keys:
+    for id in iterIds(cs.snapshot):
       if id notin cs.deleted: yield id
   for id in cs.docs.keys:
-    if cs.snapshot.isNil or id notin cs.snapshot.index:
+    if cs.snapshot.isNil or not containsId(cs.snapshot, id):
       yield id   # in-memory doc that didn't exist in the snapshot
 
 proc materializeAllDocs(cs: CollectionStore): Table[string, Value] =
@@ -360,12 +360,12 @@ proc newGlenDB*(dir: string;
       cs.maxDirtyDocs = maxDirtyDocs
       if spillableMode:
         let mm = openSnapshotMmap(dir, name)
-        if not mm.isNil and mm.isV2:
+        if not mm.isNil and (mm.isV2 or mm.isV3):
           cs.snapshot = mm
           # cs.docs starts empty; lookupDoc will fault from mm on demand.
         else:
           # v1 file or no snapshot — fall back to eager load. Spill won't kick
-          # in until the next compact() upgrades the snapshot to v2.
+          # in until the next compact() upgrades the snapshot to v2/v3.
           cs.docs = loadSnapshot(dir, name)
       else:
         cs.docs = loadSnapshot(dir, name)
@@ -698,7 +698,7 @@ proc faultInDocFromSnapshot(db: GlenDB; cs: CollectionStore;
   ## Returns nil if the doc isn't in the snapshot or has been deleted.
   if cs.snapshot.isNil: return nil
   if docId in cs.deleted: return nil
-  if docId notin cs.snapshot.index: return nil
+  if not containsId(cs.snapshot, docId): return nil
   db.acquireStripeWrite(collection)
   defer: db.releaseStripeWrite(collection)
   if docId in cs.docs: return cs.docs[docId]   # raced with another faulter
@@ -727,7 +727,7 @@ proc get*(db: GlenDB; collection, docId: string): Value {.inline.} =
     let cloned = v.clone()
     db.releaseStripeRead(collection)
     return cloned
-  let needFault = (not cs.snapshot.isNil) and docId in cs.snapshot.index
+  let needFault = (not cs.snapshot.isNil) and containsId(cs.snapshot, docId)
   db.releaseStripeRead(collection)
   if needFault:
     let v = db.faultInDocFromSnapshot(cs, collection, docId)
@@ -753,7 +753,7 @@ proc getBorrowed*(db: GlenDB; collection, docId: string): Value {.inline.} =
     db.cache.put(key, v)
     db.releaseStripeRead(collection)
     return v
-  let needFault = (not cs.snapshot.isNil) and docId in cs.snapshot.index
+  let needFault = (not cs.snapshot.isNil) and containsId(cs.snapshot, docId)
   db.releaseStripeRead(collection)
   if needFault:
     let v = db.faultInDocFromSnapshot(cs, collection, docId)
@@ -1260,7 +1260,7 @@ proc snapshotAll*(db: GlenDB) =
   releaseRead(db.structLock)
   for (name, cs) in pairs:
     let docs = if cs.snapshot.isNil: cs.docs else: materializeAllDocs(cs)
-    writeSnapshotV2(db.dir, name, docs)
+    writeSnapshotV3(db.dir, name, docs)
 
 ## Create an equality index on a field path (e.g., "name" or "profile.age").
 ## Persisted in the manifest; auto-rebuilt on reopen.
@@ -1528,7 +1528,7 @@ proc compact*(db: GlenDB) =
     # Always write v2 (the spillable-friendly indexed format). Eager-mode
     # readers handle v2 transparently.
     let docs = if cs.snapshot.isNil: cs.docs else: materializeAllDocs(cs)
-    writeSnapshotV2(db.dir, name, docs)
+    writeSnapshotV3(db.dir, name, docs)
     # Persist each spatial index alongside the snapshot. WAL is reset below,
     # so on next open these dumps reflect a state with an empty WAL — the
     # replay loop won't double-apply.
