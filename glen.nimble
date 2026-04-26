@@ -1,7 +1,7 @@
 # Glen document database nimble spec
-version       = "0.3.0"
-author        = "Glen"
-description   = "Glen: A wickedly fast embedded document database with subscriptions and transactions"
+version       = "0.5.0"
+author        = "Owen Shaule"
+description   = "An embedded document database with built-in spatial, time-series, and numeric primitives."
 license       = "MIT"
 srcDir        = "src"
 
@@ -28,7 +28,17 @@ const testFiles = @[
   "tests/test_soak_index.nim",
   "tests/test_multimaster.nim",
   "tests/test_bench.nim",
-  "tests/test_validators.nim"
+  "tests/test_validators.nim",
+  "tests/test_geo.nim",
+  "tests/test_timeseries.nim",
+  "tests/test_polygons.nim",
+  "tests/test_index_persist.nim",
+  "tests/test_linalg.nim",
+  "tests/test_geomesh.nim",
+  "tests/test_tilestack.nim",
+  "tests/test_spillable.nim",
+  "tests/test_streaming.nim",
+  "tests/test_snapshot_v3.nim"
 ]
 
 task test, "Run test suite":
@@ -41,6 +51,12 @@ task test_release, "Run test suite (release, ORC, O3)":
 
 task bench_release, "Run only benchmark (release, ORC, O3)":
   exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench.nim"
+
+task bench_geo, "Geospatial / R-tree benchmarks (release, ORC, O3)":
+  exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench_geo.nim"
+
+task bench_timeseries, "Time-series + tilestack benchmarks (release, ORC, O3)":
+  exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench_timeseries.nim"
 
 task bench_concurrent, "Run multi-threaded contention benchmark (release, atomicArc, O3)":
   # atomicArc gives thread-safe refcounting (Glen's Value graph is acyclic so

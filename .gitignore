@@ -25,8 +25,12 @@ Thumbs.db
 .env
 .env.*
 
-# Generated docs (nimble docs task)
-/docs/
+# Generated docs from `nimble docs` (HTML output drops into /docs/). Keep
+# our hand-written Markdown documentation tracked.
+/docs/*.html
+/docs/**/*.html
+/docs/theindex.html
+/docs/htmldocs/
 
 # Compiled Nim test binaries — keep *.nim sources, ignore executables.
 tests/test_*
