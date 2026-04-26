@@ -8,7 +8,7 @@ db.put("users", "u1", VObject())
 echo db.get("users", "u1")
 ```
 
-> **Status:** beta (0.2.0). The on-disk format is versioned (WAL v2, snapshot v1) and tested across reopen / replay / replication. Expect minor API churn until 1.0.
+> **Status:** beta (0.3.0). The on-disk format is versioned (WAL v2, snapshot v1) and tested across reopen / replay / replication. Expect minor API churn until 1.0.
 
 ---
 

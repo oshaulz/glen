@@ -1,5 +1,5 @@
 # Glen document database nimble spec
-version       = "0.1.0"
+version       = "0.3.0"
 author        = "Glen"
 description   = "Glen: A wickedly fast embedded document database with subscriptions and transactions"
 license       = "MIT"
