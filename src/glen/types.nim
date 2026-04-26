@@ -80,6 +80,7 @@ proc hash*(x: Id): Hash =
   result = !$result
 
 proc hash*(v: Value): Hash =
+  if v.isNil: return 0
   result = hash(ord(v.kind))
   case v.kind
   of vkNull: discard
@@ -87,9 +88,15 @@ proc hash*(v: Value): Hash =
   of vkInt: result = result !& hash(v.i)
   of vkFloat: result = result !& hash(cast[int64](v.f))
   of vkString: result = result !& hash(v.s)
-  of vkBytes: result = result !& hash(v.bytes.len)
-  of vkArray: result = result !& hash(v.arr.len)
-  of vkObject: result = result !& hash(v.obj.len)
+  of vkBytes: result = result !& hash(v.bytes)
+  of vkArray:
+    for it in v.arr: result = result !& hash(it)
+  of vkObject:
+    # Order-independent fold so structurally-equal objects hash the same.
+    var acc: Hash = 0
+    for k, vv in v.obj:
+      acc = acc xor (hash(k) !& hash(vv))
+    result = result !& acc
   of vkId: result = result !& hash(v.id)
   result = !$result
 

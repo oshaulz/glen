@@ -182,6 +182,21 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
     if ch.collection notin result.replLogByCollection:
       result.replLogByCollection[ch.collection] = @[]
     result.replLogByCollection[ch.collection].add((result.replSeq, ch))
+    # Restore per-doc replication metadata so HLC-based conflict resolution
+    # works correctly across restarts.
+    if ch.changeId.len > 0:
+      if ch.collection notin result.replMetaHlc:
+        result.replMetaHlc[ch.collection] = initTable[string, Hlc]()
+      if ch.collection notin result.replMetaChangeId:
+        result.replMetaChangeId[ch.collection] = initTable[string, string]()
+      result.replMetaHlc[ch.collection][ch.docId] = ch.hlc
+      result.replMetaChangeId[ch.collection][ch.docId] = ch.changeId
+      # Advance local HLC past the highest seen value.
+      if ch.hlc.wallMillis > result.localHlc.wallMillis:
+        result.localHlc.wallMillis = ch.hlc.wallMillis
+        result.localHlc.counter = ch.hlc.counter
+      elif ch.hlc.wallMillis == result.localHlc.wallMillis and ch.hlc.counter > result.localHlc.counter:
+        result.localHlc.counter = ch.hlc.counter
 
 # ---- Replication peers state and log GC ----
 const PeersStateFlushDebounceMs = 500
@@ -230,27 +245,29 @@ proc minPeerCursor(db: GlenDB): uint64 =
 proc gcReplLog*(db: GlenDB) =
   ## Trim in-memory replication log up to the minimum acknowledged cursor across peers.
   acquire(db.replLock)
+  defer: release(db.replLock)
+  if db.peersCursors.len == 0: return
   var cutoff: uint64 = high(uint64)
-  if db.peersCursors.len == 0:
-    cutoff = 0'u64
-  else:
-    for _, seq in db.peersCursors:
-      if seq < cutoff: cutoff = seq
-  if cutoff == 0'u64:
-    release(db.replLock)
-    return
-  var kept: seq[(uint64, ReplChange)] = @[]
-  for (seqNo, ch) in db.replLog:
-    if seqNo > cutoff: kept.add((seqNo, ch))
-  db.replLog = kept
-  # Trim per-collection logs as well
-  for coll in db.replLogByCollection.keys:
-    let seqs = db.replLogByCollection[coll]
-    var keptc: seq[(uint64, ReplChange)] = @[]
-    for (seqNo, ch) in seqs:
-      if seqNo > cutoff: keptc.add((seqNo, ch))
-    db.replLogByCollection[coll] = keptc
-  release(db.replLock)
+  for _, seq in db.peersCursors:
+    if seq < cutoff: cutoff = seq
+  if cutoff == 0'u64: return
+  # seqNo is appended monotonically under db.replLock, so binary search the
+  # first index whose seqNo > cutoff and slice off the prefix.
+  proc firstAfter(s: seq[(uint64, ReplChange)]; cutoff: uint64): int =
+    var lo = 0
+    var hi = s.len
+    while lo < hi:
+      let mid = (lo + hi) shr 1
+      if s[mid][0] <= cutoff: lo = mid + 1
+      else: hi = mid
+    lo
+  let cut = firstAfter(db.replLog, cutoff)
+  if cut > 0:
+    db.replLog = db.replLog[cut .. ^1]
+  for coll, seqs in db.replLogByCollection.mpairs:
+    let cutc = firstAfter(seqs, cutoff)
+    if cutc > 0:
+      seqs = seqs[cutc .. ^1]
 
 # ---- Stripe locking helpers ----
 proc stripeIndex(db: GlenDB; collection: string): int =
@@ -644,12 +661,16 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, w.value))
   if walRecs.len > 0:
     db.wal.appendMany(walRecs)
-  # record replication changes (with precomputed seq)
-  for entry in replEntries:
-    db.replLog.add(entry)
-    let coll = entry[1].collection
-    if coll notin db.replLogByCollection: db.replLogByCollection[coll] = @[]
-    db.replLogByCollection[coll].add(entry)
+  # record replication changes (with precomputed seq) under replLock to avoid
+  # racing with concurrent put/delete/applyChanges on disjoint stripes.
+  if replEntries.len > 0:
+    acquire(db.replLock)
+    for entry in replEntries:
+      db.replLog.add(entry)
+      let coll = entry[1].collection
+      if coll notin db.replLogByCollection: db.replLogByCollection[coll] = @[]
+      db.replLogByCollection[coll].add(entry)
+    release(db.replLock)
   t.state = tsCommitted
   db.releaseStripesWrite(stripes)
   for it in notifications:

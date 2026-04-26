@@ -58,13 +58,12 @@ proc writeSnapshot*(dir, collection: string; docs: Table[string, Value]) =
   f.close()
   # atomic replace
   when defined(windows):
-    # Windows moveFile already replaces; proceed
+    # Nim's moveFile raises if dest exists on Windows; remove first.
     if fileExists(finalPath): removeFile(finalPath)
     moveFile(tmpPath, finalPath)
   else:
-    # On POSIX, prefer atomic rename over remove+move
-    if fileExists(finalPath):
-      removeFile(finalPath)
+    # POSIX rename(2) is atomic and replaces an existing destination — do not
+    # remove first; that creates a window where readers see no snapshot.
     moveFile(tmpPath, finalPath)
   # best-effort directory flush (no-op on non-Windows for now)
   flushDir(dir)
