@@ -8,7 +8,7 @@ db.put("users", "u1", VObject())
 echo db.get("users", "u1")
 ```
 
-> **Status:** beta (0.4.0). The on-disk format is versioned (WAL v2, snapshot v1, GRI/GPI v1, GTS/TTS v1) and tested across reopen / replay / replication. Expect minor API churn until 1.0.
+> **Status:** beta (0.4.1). On-disk formats are versioned and tested across reopen / replay / replication: WAL v2, snapshot **v2** (with v1 read-back compat), GRI/GPI v1, GTS/TTS v1. Expect minor API churn until 1.0.
 
 ---
 
@@ -521,28 +521,77 @@ Gorilla scalar TSDB, 1M samples per series:
 
 | Value pattern | Append rate | Bits/sample on disk |
 |---|---|---|
-| Constant | **67M samples/s** | 2.11 |
+| Constant | **100M samples/s** | 2.11 |
 | Regular cadence | 19M samples/s | 14.13 |
-| Smooth (sin) | 4.6M samples/s | 59.60 |
-| Noisy | 4.6M samples/s | 59.28 |
+| Smooth (sin) | 4.4M samples/s | 59.60 |
+| Noisy | 4.5M samples/s | 59.28 |
 
 ```
-open (scan all chunk headers):   9 ms for 1M-sample file
-range (random window):           940 q/s         (avg 546 samples returned)
-latest n=100:                    15k q/s
-latest n=1000:                   1k q/s          (decodes ≈1 chunk per call)
+open (scan all chunk headers):  9 ms for 1M-sample file
+range (random window):          1.3k q/s        (avg 546 samples returned)
+latest n=100:                   901k q/s        ← 60× faster (decoded-chunk LRU)
+latest n=1000:                  115k q/s        ← 115× faster
 ```
 
 Tile time-stack (radar-shaped sparse field):
 
 | Geometry | Append | Compression | bits/cell | Point-history | readFrame |
 |---|---|---|---|---|---|
-| 200×200, 200 frames | 2941 frames/s | **24.9×** | 2.57 | 241 q/s | 82 q/s |
-| 512×512, 64 frames | 424 frames/s | 21.2× | 3.02 | 154 q/s | 19 q/s |
+| 200×200, 200 frames | 3125 frames/s | **24.9×** | 2.57 | **1166 q/s** | **362 q/s** |
+| 512×512, 64 frames | 432 frames/s | 21.2× | 3.02 | **844 q/s** | **94 q/s** |
 
-`readPointHistory` is the workload tile-stacking exists for — it touches one
-tile only. `readFrame` reassembles every tile and is the slow path by design;
-use frame-per-doc + GeoMesh for "show me the latest scan".
+The decoded-chunk LRU (`glen/chunkcache.nim`) drives the read-side wins —
+repeated `latest` / `readPointHistory` / `readFrame` calls reuse the same
+decoded chunks instead of re-running the bit-unpacking loop. Sized at 64
+chunks per series and 16 chunks per tile by default; tunable via the
+`decodedChunkCacheSize` constructor arg.
+
+---
+
+## Working-set spill (datasets bigger than RAM)
+
+Glen ships a **spillable mode** that opt-in lets you operate on databases
+larger than memory. When enabled, the on-disk snapshot is `mmap`'d and
+documents are faulted into RAM only on first access. Cold non-dirty docs are
+evicted under a configurable cap; the next read reads them straight back from
+the mapped region.
+
+```nim
+# Open a multi-GB database with at most ~10k hot docs in RAM.
+let db = newGlenDB("./big.glen",
+                   spillableMode = true,
+                   hotDocCap     = 10_000)
+
+let doc = db.get("events", "2026-04-26T12:34:56")     # faults from mmap
+db.put("events", "newKey", value)                      # stays hot until compact()
+db.delete("events", "old-key")                         # tombstoned, persisted on compact()
+db.compact()    # writes a fresh snapshot v2, swaps the mmap, clears tombstones
+db.close()
+```
+
+**Mechanics:**
+- Snapshot **v2** (`GLENSNP2`): header + per-doc index + body. The index lets
+  any doc be located in O(1) without scanning the file.
+- `compact()` always writes v2 going forward (eager and spill modes). The
+  reader auto-detects v1 vs v2; legacy v1 files load eagerly as before.
+- Mutations stay in memory and the WAL until the next `compact()`. Until
+  then they cannot be evicted (the eviction loop only drops non-dirty entries).
+- Tombstones (`cs.deleted`) make `get` return nil for snapshot-only docs
+  removed since the last compaction.
+
+**When this matters**: archives larger than RAM, query workloads that touch a
+small fraction of the dataset, edge devices with constrained memory. For a
+fully-loaded working set, eager mode (the default) is faster — no fault path,
+no mmap deref, no LRU bookkeeping.
+
+**Caveats** (current implementation):
+- Multi-doc transactions (`commit`) and replication-apply (`applyChanges`)
+  paths are best-effort in spillable mode: docs they touch get faulted in
+  and stick in cs.docs. Mostly fine but if you hit OOM with very large
+  in-flight txn batches, drop the batch size.
+- The doc index itself lives in RAM (~30–50 bytes/doc). A 100M-doc DB
+  carries a ~4 GB resident index even in spill mode. Paged indexes (B+ tree
+  on disk) would lift this ceiling and remain a future addition.
 
 ---
 
@@ -608,6 +657,9 @@ Suites cover: basic CRUD, WAL replay & corrupt-tail tolerance, snapshot round-tr
 - Vector index (HNSW or IVF) for nearest-neighbour queries on stored embeddings
 - Bilinear interpolation in `GeoMesh.sampleAt`
 - Per-cell offset table in tile chunks (faster point-history without decoding all streams)
+- SIMD bit-decode (AVX-512 PEXT/PDEP, ARM NEON) for the Gorilla unpack hot path
+- Paged on-disk doc index for spill mode (lift the in-memory index ceiling)
+- Parallel replication export (single export currently runs under one log lock)
 
 ---
 

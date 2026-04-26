@@ -1,6 +1,6 @@
 # Glen DB high-level API
 
-import std/[os, tables, locks, strutils, streams, hashes, algorithm, parseutils, random]
+import std/[os, tables, locks, strutils, streams, hashes, algorithm, parseutils, random, sets]
 import glen/types, glen/wal, glen/storage, glen/cache, glen/subscription, glen/txn
 import glen/rwlock
 import glen/index
@@ -33,6 +33,16 @@ type
     polygonIndexes:   PolygonIndexesByName
     replMetaHlc:      Table[string, Hlc]
     replMetaChangeId: Table[string, string]
+    # ---- Spillable mode (lazy / mmap'd snapshot) ----
+    # When `snapshot` is non-nil we mirror the on-disk layout: `docs` only
+    # holds the hot working set, the rest is faulted in on demand from the
+    # mmap'd snapshot. `dirty` tracks docs whose in-memory value differs from
+    # the snapshot (must not be evicted; must be written on next compact).
+    # `deleted` tracks tombstones for snapshot-only docs that were removed.
+    snapshot:         storage.SnapshotMmap
+    dirty:            HashSet[string]
+    deleted:          HashSet[string]
+    hotDocCap:        int   # 0 = unbounded
 
   IndexKind = enum ikEq, ikGeo, ikPoly
 
@@ -158,8 +168,65 @@ proc newCollectionStore(): CollectionStore =
     geoIndexes:       initTable[string, GeoIndex](),
     polygonIndexes:   initTable[string, PolygonIndex](),
     replMetaHlc:      initTable[string, Hlc](),
-    replMetaChangeId: initTable[string, string]()
+    replMetaChangeId: initTable[string, string](),
+    snapshot:         nil,
+    dirty:            initHashSet[string](),
+    deleted:          initHashSet[string](),
+    hotDocCap:        0
   )
+
+# ---- Spillable mode helpers ----
+#
+# `lookupDoc` is the read primitive replacing direct `cs.docs[id]` access. It
+# returns nil for missing/deleted docs; otherwise returns the value, faulting
+# from the mmap'd snapshot when needed and populating cs.docs as a write-through
+# cache. Eviction (if hotDocCap > 0) drops a non-dirty entry on overflow.
+proc evictColdDoc(cs: CollectionStore) =
+  if cs.hotDocCap <= 0 or cs.docs.len <= cs.hotDocCap: return
+  if cs.snapshot.isNil: return     # nowhere to evict to
+  # Find a non-dirty doc that's also in the snapshot index (so we can re-fetch).
+  var victim = ""
+  for id in cs.docs.keys:
+    if id notin cs.dirty and id in cs.snapshot.index:
+      victim = id; break
+  if victim.len > 0:
+    cs.docs.del(victim)
+
+proc lookupDoc(cs: CollectionStore; docId: string): Value =
+  if cs.isNil: return nil
+  if docId in cs.deleted: return nil
+  if docId in cs.docs: return cs.docs[docId]
+  if cs.snapshot.isNil: return nil
+  result = loadDocFromMmap(cs.snapshot, docId)
+  if not result.isNil:
+    cs.docs[docId] = result
+    if cs.hotDocCap > 0 and cs.docs.len > cs.hotDocCap:
+      evictColdDoc(cs)
+
+proc hasDoc(cs: CollectionStore; docId: string): bool =
+  if cs.isNil: return false
+  if docId in cs.deleted: return false
+  if docId in cs.docs: return true
+  not cs.snapshot.isNil and docId in cs.snapshot.index
+
+proc markDirty(cs: CollectionStore; docId: string) {.inline.} =
+  cs.dirty.incl(docId)
+  cs.deleted.excl(docId)
+
+proc markDeleted(cs: CollectionStore; docId: string) {.inline.} =
+  cs.dirty.excl(docId)
+  if not cs.snapshot.isNil and docId in cs.snapshot.index:
+    cs.deleted.incl(docId)
+
+iterator allDocIds(cs: CollectionStore): string =
+  ## Walks every visible (live) docId across both the snapshot and the in-memory
+  ## modifications. Order is unspecified; do not rely on it.
+  if not cs.snapshot.isNil:
+    for id in cs.snapshot.index.keys:
+      if id notin cs.deleted: yield id
+  for id in cs.docs.keys:
+    if cs.snapshot.isNil or id notin cs.snapshot.index:
+      yield id   # in-memory doc that didn't exist in the snapshot
 
 # Generate a stable, unique-ish node id and persist it to disk when needed.
 proc bytesToHex(bytes: openArray[byte]): string =
@@ -184,7 +251,21 @@ proc generateStableNodeId(): string =
 
 ## Create or open a Glen database at the given directory.
 ## Loads snapshots, replays the WAL, and initializes cache and subscriptions.
-proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; walSync: WalSyncMode = wsmInterval; walFlushEveryBytes = 8*1024*1024; lockStripesCount = 32): GlenDB =
+proc newGlenDB*(dir: string;
+                cacheCapacity = 64*1024*1024;
+                cacheShards = 16;
+                walSync: WalSyncMode = wsmInterval;
+                walFlushEveryBytes = 8*1024*1024;
+                lockStripesCount = 32;
+                spillableMode = false;
+                hotDocCap = 0): GlenDB =
+  ## `spillableMode = true` opens any existing snapshot v2 file via mmap and
+  ## defers loading docs until they're touched. Combined with `hotDocCap > 0`,
+  ## cold non-dirty docs are evicted from RAM under pressure and faulted back
+  ## from the mmap'd snapshot on next access. Use this when your dataset is
+  ## bigger than RAM or when you only need to query a small fraction of it.
+  ## Mutations: writes still go to memory (and the WAL); they "stick" and
+  ## can't be evicted until the next compact() persists them.
   result = GlenDB(
     dir: dir,
     wal: openWriteAheadLog(dir, syncMode = walSync, flushEveryBytes = walFlushEveryBytes),
@@ -224,12 +305,24 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
     writeFile(nodeIdPath, result.nodeId)
   # init local HLC
   result.localHlc = Hlc(wallMillis: nowMillis(), counter: 0'u32, nodeId: result.nodeId)
-  # load snapshots
+  # load snapshots — eager unless spillableMode is on, in which case we mmap
+  # the v2 snapshot's index and leave cs.docs empty (faulted in lazily).
   for kind, path in walkDir(dir):
     if kind == pcFile and path.endsWith(".snap"):
       let name = splitFile(path).name
       let cs = newCollectionStore()
-      cs.docs = loadSnapshot(dir, name)
+      cs.hotDocCap = hotDocCap
+      if spillableMode:
+        let mm = openSnapshotMmap(dir, name)
+        if not mm.isNil and mm.isV2:
+          cs.snapshot = mm
+          # cs.docs starts empty; lookupDoc will fault from mm on demand.
+        else:
+          # v1 file or no snapshot — fall back to eager load. Spill won't kick
+          # in until the next compact() upgrades the snapshot to v2.
+          cs.docs = loadSnapshot(dir, name)
+      else:
+        cs.docs = loadSnapshot(dir, name)
       result.collections[name] = cs
   # peers state path
   result.peersStatePath = dir / "peers.state"
@@ -284,6 +377,7 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
     let cs = result.collections[rec.collection]
     if rec.kind == wrPut:
       cs.docs[rec.docId] = rec.value
+      markDirty(cs, rec.docId)   # post-snapshot mutation; do not evict
       cs.versions[rec.docId] = rec.version
       for _, idx in cs.indexes:
         idx.indexDoc(rec.docId, rec.value)
@@ -292,15 +386,16 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
       for _, pix in cs.polygonIndexes:
         pix.indexDoc(rec.docId, rec.value)
     else:
-      if rec.docId in cs.docs:
-        let oldDoc = cs.docs[rec.docId]
+      let oldDoc = lookupDoc(cs, rec.docId)
+      if not oldDoc.isNil:
         for _, idx in cs.indexes:
           idx.unindexDoc(rec.docId, oldDoc)
         for _, gix in cs.geoIndexes:
           gix.unindexDoc(rec.docId, oldDoc)
         for _, pix in cs.polygonIndexes:
           pix.unindexDoc(rec.docId, oldDoc)
-        cs.docs.del(rec.docId)
+        if rec.docId in cs.docs: cs.docs.del(rec.docId)
+        markDeleted(cs, rec.docId)
       if rec.docId in cs.versions:
         cs.versions.del(rec.docId)
     # Rebuild in-memory repl log cursor from WAL (uses v2 metadata when present)
@@ -542,6 +637,25 @@ proc mergeRemoteHlc(db: GlenDB; remote: Hlc) =
 
 ## Get the current value of a document by collection and id.
 ## Returns nil if not found. Cached reads are served from the LRU cache.
+proc faultInDocFromSnapshot(db: GlenDB; cs: CollectionStore;
+                            collection, docId: string): Value =
+  ## Spillable-mode helper. Acquires the stripe write lock, double-checks the
+  ## hot table, then loads from the mmap'd snapshot and populates cs.docs.
+  ## Returns nil if the doc isn't in the snapshot or has been deleted.
+  if cs.snapshot.isNil: return nil
+  if docId in cs.deleted: return nil
+  if docId notin cs.snapshot.index: return nil
+  db.acquireStripeWrite(collection)
+  defer: db.releaseStripeWrite(collection)
+  if docId in cs.docs: return cs.docs[docId]   # raced with another faulter
+  if docId in cs.deleted: return nil
+  let v = loadDocFromMmap(cs.snapshot, docId)
+  if v.isNil: return nil
+  cs.docs[docId] = v
+  if cs.hotDocCap > 0 and cs.docs.len > cs.hotDocCap:
+    evictColdDoc(cs)
+  return v
+
 proc get*(db: GlenDB; collection, docId: string): Value {.inline.} =
   let key = collection & ":" & docId
   let cached = db.cache.get(key)
@@ -550,13 +664,23 @@ proc get*(db: GlenDB; collection, docId: string): Value {.inline.} =
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return nil
   db.acquireStripeRead(collection)
+  if docId in cs.deleted:
+    db.releaseStripeRead(collection)
+    return nil
   if docId in cs.docs:
     let v = cs.docs[docId]
     db.cache.put(key, v)
     let cloned = v.clone()
     db.releaseStripeRead(collection)
     return cloned
+  let needFault = (not cs.snapshot.isNil) and docId in cs.snapshot.index
   db.releaseStripeRead(collection)
+  if needFault:
+    let v = db.faultInDocFromSnapshot(cs, collection, docId)
+    if not v.isNil:
+      db.cache.put(key, v)
+      return v.clone()
+  return nil
 
 # Borrowed (non-cloned) read. Caller must not mutate returned Value.
 proc getBorrowed*(db: GlenDB; collection, docId: string): Value {.inline.} =
@@ -567,12 +691,22 @@ proc getBorrowed*(db: GlenDB; collection, docId: string): Value {.inline.} =
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return nil
   db.acquireStripeRead(collection)
+  if docId in cs.deleted:
+    db.releaseStripeRead(collection)
+    return nil
   if docId in cs.docs:
     let v = cs.docs[docId]
     db.cache.put(key, v)
     db.releaseStripeRead(collection)
     return v
+  let needFault = (not cs.snapshot.isNil) and docId in cs.snapshot.index
   db.releaseStripeRead(collection)
+  if needFault:
+    let v = db.faultInDocFromSnapshot(cs, collection, docId)
+    if not v.isNil:
+      db.cache.put(key, v)
+      return v
+  return nil
 
 # Internal: read the current version of (c, docId), 0 if missing. Caller must
 # already hold the appropriate stripe lock OR the txn-commit phase (which
@@ -702,9 +836,9 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
   db.wal.append(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
   cs.replMetaHlc[docId] = chHlc
   cs.replMetaChangeId[docId] = chChangeId
-  var oldDoc: Value = nil
-  if docId in cs.docs: oldDoc = cs.docs[docId]
+  let oldDoc = lookupDoc(cs, docId)   # faults from snapshot if needed
   cs.docs[docId] = stored
+  markDirty(cs, docId)
   cs.versions[docId] = newVer
   db.cache.put(collection & ":" & docId, stored)
   for _, idx in cs.indexes:
@@ -729,7 +863,8 @@ proc delete*(db: GlenDB; collection, docId: string) =
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return
   db.acquireStripeWrite(collection)
-  if docId in cs.docs:
+  let oldDoc = lookupDoc(cs, docId)   # may fault from snapshot
+  if not oldDoc.isNil:
     let ver = currentVersionFromStore(cs, docId) + 1
     # assign replication metadata (under replLock)
     acquire(db.replLock)
@@ -745,14 +880,14 @@ proc delete*(db: GlenDB; collection, docId: string) =
     db.wal.append(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
     cs.replMetaHlc[docId] = chHlc
     cs.replMetaChangeId[docId] = chChangeId
-    let oldDoc = cs.docs[docId]
     for _, idx in cs.indexes:
       idx.unindexDoc(docId, oldDoc)
     for _, gix in cs.geoIndexes:
       gix.unindexDoc(docId, oldDoc)
     for _, pix in cs.polygonIndexes:
       pix.unindexDoc(docId, oldDoc)
-    cs.docs.del(docId)
+    if docId in cs.docs: cs.docs.del(docId)
+    markDeleted(cs, docId)
     if docId in cs.versions: cs.versions.del(docId)
     db.cache.del(collection & ":" & docId)
     notifications.add((Id(collection: collection, docId: docId, version: ver), VNull()))
@@ -1270,6 +1405,15 @@ proc rangeBy*(db: GlenDB; collection: string; indexName: string; minVal, maxVal:
 # Compaction: snapshot all collections and truncate WAL
 ## Snapshot all collections and truncate the WAL so that recovery can start
 ## from the snapshots and a fresh log.
+proc materializeAllDocs(cs: CollectionStore): Table[string, Value] =
+  ## Build a complete docId → Value map combining in-memory dirty docs with
+  ## any snapshot-only docs (faulted from mmap). Used by compact().
+  result = initTable[string, Value]()
+  for id in allDocIds(cs):
+    let v = lookupDoc(cs, id)
+    if not v.isNil:
+      result[id] = v
+
 proc compact*(db: GlenDB) =
   db.acquireAllStripesWrite()
   defer: db.releaseAllStripesWrite()
@@ -1279,7 +1423,10 @@ proc compact*(db: GlenDB) =
     pairs.add((name, cs))
   releaseRead(db.structLock)
   for (name, cs) in pairs:
-    writeSnapshot(db.dir, name, cs.docs)
+    # Always write v2 (the spillable-friendly indexed format). Eager-mode
+    # readers handle v2 transparently.
+    let docs = if cs.snapshot.isNil: cs.docs else: materializeAllDocs(cs)
+    writeSnapshotV2(db.dir, name, docs)
     # Persist each spatial index alongside the snapshot. WAL is reset below,
     # so on next open these dumps reflect a state with an empty WAL — the
     # replay loop won't double-apply.
@@ -1287,17 +1434,33 @@ proc compact*(db: GlenDB) =
       dumpGeoIndex(gix, geoIndexFilePath(db.dir, name, idxName))
     for idxName, pix in cs.polygonIndexes:
       dumpPolygonIndex(pix, polygonIndexFilePath(db.dir, name, idxName))
+    # If this DB was opened in spillable mode, swap in the new snapshot's
+    # mmap and reset dirty/deleted state so future evictions can re-fetch
+    # from the new file.
+    if not cs.snapshot.isNil:
+      closeSnapshotMmap(cs.snapshot)
+      cs.snapshot = openSnapshotMmap(db.dir, name)
+      cs.dirty.clear()
+      cs.deleted.clear()
+      # Optionally clear the hot table to reclaim memory; a non-zero hotDocCap
+      # would do this organically on next access. We keep cs.docs as-is here.
   # Reset WAL after snapshot to start a new, empty log
   if db.wal != nil:
     db.wal.reset()
 
 # Close database resources
-## Close database resources (WAL file handles).
+## Close database resources (WAL file handles, snapshot mmaps).
 proc close*(db: GlenDB) =
   db.acquireAllStripesWrite()
   defer: db.releaseAllStripesWrite()
   if db.peersDirty:
     db.flushPeersState(force = true)
+  acquireRead(db.structLock)
+  for _, cs in db.collections:
+    if not cs.snapshot.isNil:
+      closeSnapshotMmap(cs.snapshot)
+      cs.snapshot = nil
+  releaseRead(db.structLock)
   if db.wal != nil:
     db.wal.close()
 
