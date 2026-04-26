@@ -1,6 +1,6 @@
 # Glen
 
-An embedded document database for Nim — durable, concurrent, and built for low-latency in-process workloads.
+An embedded document database for Nim with first-class spatial, temporal, and numeric primitives — durable, concurrent, and built for low-latency in-process workloads.
 
 ```nim
 let db = newGlenDB("./mydb")
@@ -8,11 +8,13 @@ db.put("users", "u1", VObject())
 echo db.get("users", "u1")
 ```
 
-> **Status:** beta (0.3.0). The on-disk format is versioned (WAL v2, snapshot v1) and tested across reopen / replay / replication. Expect minor API churn until 1.0.
+> **Status:** beta (0.4.0). The on-disk format is versioned (WAL v2, snapshot v1, GRI/GPI v1, GTS/TTS v1) and tested across reopen / replay / replication. Expect minor API churn until 1.0.
 
 ---
 
 ## What you get
+
+### Core
 
 | Capability | Details |
 |---|---|
@@ -21,11 +23,22 @@ echo db.get("users", "u1")
 | **Cache** | Sharded LRU with per-shard locks, byte-budgeted, hot-touch promotion |
 | **Concurrency** | Striped per-collection RW-locks; multi-collection transactions acquire stripes in sorted order to avoid deadlock |
 | **Transactions** | Optimistic, version-checked at commit; `csOk` / `csConflict` / `csInvalid` results |
-| **Indexes** | Single-field equality, composite equality, single-field range scans (CritBitTree backing, asc/desc, limit) |
+| **Indexes** | Equality (single + composite) and single-field range scans (CritBitTree backing, asc/desc, limit). **Persisted** in `indexes.manifest`; auto-rebuilt on reopen |
 | **Subscriptions** | Document-level, field-path, and field-delta callbacks; stream-encodable for IPC |
 | **Replication** | Multi-master, transport-agnostic; HLC last-write-wins; per-peer cursors persisted to `peers.state` |
 | **Validation** | Zod-style schema DSL — `zString().minLen(...)`, `zInt().gte(...)`, `zEnum(...)`, `zobject:` blocks |
 | **Codec** | Compact tagged binary, varuint + zigzag, configurable size limits |
+
+### Spatial, temporal, numeric
+
+| Capability | Details |
+|---|---|
+| **Geospatial index** | R-tree (Guttman linear split) with STR bulk-load. Bbox / KNN / radius queries. Both planar (Euclidean degrees) and geographic (haversine metres) metrics. Persisted to `.gri` |
+| **Polygon index** | R-tree of MBRs + exact ray-cast point-in-polygon. `findPolygonsContaining`, `findPointsInPolygon`. Persisted to `.gpi` |
+| **Time-series engine** | Gorilla-style chunked column store: delta-of-delta timestamps + XOR float encoding. ~1–3 bits/sample on smooth data, with min/max chunk metadata for range scans |
+| **Linear algebra** | `Vector` and row-major `Matrix` with `dot`/`norm`/`matmul`/`transpose`/`cosine`/etc. Stored inside any document as nested `VFloat` arrays |
+| **GeoMesh** | A 2-D raster of values (or per-cell vectors) tied to a geographic bbox. Sample at `(lon, lat)`. Compact `vkBytes` storage |
+| **Tile time-stacks** | Spatially-tiled, Gorilla-compressed `(time, row, col, channel)` rasters. Designed for radar reflectivity / weather / model probability fields. ~10–30× compression on sparse-but-smooth fields; one-cell deep histories without reading the rest |
 
 No external runtime dependencies. Pure Nim ≥ 1.6.
 
@@ -186,6 +199,169 @@ Conflict resolution uses a hybrid logical clock: `(wallMillis, counter, nodeId)`
 
 ---
 
+## Spatial, temporal, and numeric extensions
+
+### Geospatial: points, bboxes, KNN, radius
+
+```nim
+import glen/db, glen/types, glen/geo
+
+db.put("places", "sf",  placeDoc(-122.42, 37.77))
+db.put("places", "oak", placeDoc(-122.27, 37.80))
+db.put("places", "la",  placeDoc(-118.24, 34.05))
+
+# STR-bulk-loaded R-tree on two numeric fields.
+db.createGeoIndex("places", "byLoc", lonField = "lon", latField = "lat")
+
+# Bounding box
+for (id, doc) in db.findInBBox("places", "byLoc",
+                               minLon = -123.0, minLat = 37.0,
+                               maxLon = -122.0, maxLat = 38.0):
+  echo id
+
+# K-nearest, geographic metric (haversine metres)
+for (id, metres, doc) in db.findNearest("places", "byLoc",
+                                        lon = -122.42, lat = 37.77, k = 3,
+                                        metric = gmGeographic):
+  echo id, " @ ", metres, "m"
+
+# Radius (haversine post-filter)
+for (id, metres, _) in db.findWithinRadius("places", "byLoc",
+                                           -122.42, 37.77,
+                                           radiusMeters = 50_000.0):
+  echo id, " ", metres / 1000.0, "km"
+```
+
+The R-tree is **persisted** (manifest + binary `.gri` dump on `compact()`), so reopens skip the bulk-rebuild scan. WAL replay applies on top of the loaded tree, so post-compact mutations are reflected correctly.
+
+### Polygons: zone membership and "points in polygon"
+
+```nim
+# Polygons live as VArray of [lon, lat] pairs on a doc field.
+proc poly(verts: openArray[(float64, float64)]): Value = ...
+db.put("zones", "z1", VObject(...).withField("shape", poly([...])))
+db.createPolygonIndex("zones", "byShape", "shape")
+
+# Which zones contain (lon, lat)?
+for (id, _) in db.findPolygonsContaining("zones", "byShape",
+                                         x = -122.42, y = 37.77):
+  echo id
+
+# Which indexed points fall inside a polygon?
+let p = Polygon(vertices: @[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+for (id, _) in db.findPointsInPolygon("places", "byLoc", p):
+  echo id
+```
+
+R-tree pre-filter on bounding boxes + exact ray-cast point-in-polygon test. Persisted to `.gpi`.
+
+### Time-series: Gorilla-encoded scalar streams
+
+`glen/timeseries` is a separate engine, file-per-series, optimised for one workload: many `(timestamp, float64)` per second per series, near-monotonic timestamps, slowly-changing values (sensor data, metrics, prices).
+
+```nim
+import glen/timeseries
+
+let cpu = openSeries("./metrics/cpu.gts")
+cpu.append(nowMillis(), 0.42)
+cpu.append(nowMillis(), 0.51)
+
+for (ts, v) in cpu.range(fromMs, toMs): echo ts, " ", v
+for (ts, v) in cpu.latest(100): echo ts, " ", v
+
+cpu.dropBlocksBefore(cutoffMs)   # retention by full block
+cpu.close()
+```
+
+Delta-of-delta on timestamps + XOR on float values; chunks carry min/max metadata so range queries skip whole chunks via the in-memory block index. Typical ~1–3 bits/sample on smooth data. Torn-tail tolerated on reopen.
+
+### Linear algebra: `Vector` and `Matrix`
+
+```nim
+import glen/linalg
+
+let a = vec(1.0, 2.0, 3.0)
+let b = vec(4.0, 5.0, 6.0)
+echo a + b, dot(a, b), norm(a), cosine(a, b)
+
+let M = matFromRows(@[@[0.1, 0.2], @[0.3, 0.4]])
+let y = M * a[0..1]              # matrix-vector
+let WtW = transpose(M) * M       # matrix-matrix (cache-friendly ikj)
+
+# Embeddings live inside ordinary documents as nested VFloat arrays:
+var face = VObject()
+face["embedding"] = toValue(vec(0.1, 0.2, 0.3, 0.4))
+db.put("faces", "f1", face)
+let (ok, e) = readVector(db.get("faces", "f1")["embedding"])
+```
+
+No new `ValueKind`; round-trips through the existing codec, snapshot, and replication paths.
+
+### GeoMesh: a raster pinned to a bbox
+
+```nim
+import glen/geomesh
+
+var mesh = newGeoMesh(
+  bbox(-122.5, 37.5, -122.0, 38.0),
+  rows = 64, cols = 64, channels = 3,
+  labels = @["rain", "snow", "clear"])
+for r in 0 ..< mesh.rows:
+  for c in 0 ..< mesh.cols:
+    mesh.setCell(r, c, llmInferProbabilities(r, c))
+
+var doc = VObject()
+doc["model"]    = VString("rain-v3")
+doc["forecast"] = mesh.toValue()    # data packed as vkBytes
+db.put("predictions", "today-utc-12", doc)
+
+# later — sample at a point
+let stored = db.get("predictions", "today-utc-12")
+let (ok, m) = readGeoMesh(stored["forecast"])
+let probs = m.vectorAt(-122.42, 37.77)        # @[0.18, 0.0, 0.82]
+```
+
+`row 0 = top of bbox`, `col 0 = left`. Single-doc, atomic, replicates and subscribes like any other document. A 1000×1000×5 mesh is ~40 MB on disk via `vkBytes`.
+
+### Tile time-stacks: rasters that change over time
+
+```nim
+import glen/tilestack
+
+let stack = newTileStack("./radar/KMUX",
+  bbox       = bbox(-122.7, 36.7, -120.7, 38.7),
+  rows = 200, cols = 200, channels = 1,
+  tileSize = 64, chunkSize = 128,
+  labels = @["dbz"])
+
+# ingest one frame every 5 minutes
+stack.appendFrame(scanTimeMs, mesh)
+
+# show me the storm at 12:34 — reassembled from per-tile chunks
+let (ok, frame) = stack.readFrame(scanTimeMs)
+
+# what was reflectivity right over my house for the last hour?
+# decodes only the one tile that owns the cell
+let history = stack.readPointHistory(myLon, myLat,
+                                     fromMs = nowMs - 3_600_000,
+                                     toMs   = nowMs)
+```
+
+Each tile is an append-only file of Gorilla-encoded chunks (one chunk = `chunkSize` frames). Per-cell-per-channel streams are independent, so a chunk holds `tileSize² × channels` parallel XOR-encoded series sharing one timestamp stream. Compression: ~10–30× on radar-like sparse fields, ~2–3× on fully-varying smooth ones.
+
+**When to use which:**
+
+| Use case | Pick |
+|---|---|
+| Latest scan / animate last hour / alerting on new frame | **frame-per-doc** with a `GeoMesh` field + range index on `tsMillis` |
+| Long archive, point histories, disk cost matters | **TileStack** |
+| Single sensor stream | **Series** (`glen/timeseries`) |
+| Dense grid of model output, queried by location | **GeoMesh** in a doc, bbox stored as polygon for spatial lookup |
+
+Mix freely — frame-per-doc for the hot 24h, TileStack for the long tail.
+
+---
+
 ## Persistence model
 
 ```
@@ -195,15 +371,24 @@ mydb/
 ├── users.snap          ← per-collection snapshot
 ├── orders.snap
 ├── node.id             ← stable node identifier (auto-generated)
-└── peers.state         ← persisted per-peer replication cursors
+├── peers.state         ← persisted per-peer replication cursors
+├── indexes.manifest    ← persisted definitions of equality / geo / polygon indexes
+├── places.byLoc.gri    ← R-tree binary dump for a geo index (written by compact())
+└── zones.byShape.gpi   ← R-tree binary dump for a polygon index
 ```
+
+Plus, when used:
+- `<dir>/<series>.gts` — Gorilla time-series files (one per `Series`)
+- `<stackDir>/manifest.tsm` + `<stackDir>/tile_<r>_<c>.tts` — tile time-stack files
 
 **Recovery order on `newGlenDB`:**
 1. Load every `*.snap` into the in-memory tables.
-2. Replay every WAL segment in order, applying puts/deletes and rebuilding indexes.
-3. Restore replication metadata (HLC, changeId per doc) so LWW conflict resolution stays correct across restarts.
+2. Read `indexes.manifest`; for each spatial index, try to load its `.gri` / `.gpi` binary dump (skip on missing/CRC mismatch).
+3. Replay every WAL segment in order, applying puts/deletes and **incrementally** updating any installed indexes — so `.gri`-loaded trees pick up post-compact mutations correctly.
+4. For any manifest entry whose dump didn't load, bulk-build the index from the now-loaded docs.
+5. Restore replication metadata (HLC, changeId per doc) so LWW conflict resolution stays correct across restarts.
 
-**Compaction.** `db.compact()` writes a fresh snapshot for each collection and resets the WAL to segment 0. Snapshot writes are atomic — temp file + `rename(2)` (POSIX) or temp + remove + move (Windows).
+**Compaction.** `db.compact()` writes a fresh snapshot for each collection, dumps every spatial index as `.gri` / `.gpi`, and resets the WAL to segment 0. Snapshot writes are atomic — temp file + `rename(2)` (POSIX) or temp + remove + move (Windows).
 
 ### WAL sync policies
 
@@ -325,19 +510,20 @@ A second, smaller example with strict schema validation lives in
 
 ## Architecture, in one paragraph
 
-A `GlenDB` is a `ref` holding `collection -> docId -> Value` tables under striped RW-locks, a sharded LRU cache fronting reads, a `WriteAheadLog` that owns the on-disk segment files, a `SubscriptionManager` keyed by `collection:docId`, and `IndexesByName` per collection backed by `CritBitTree` for ordered keys. Every mutation: assign a replication change record under `replLock` (incrementing seq + advancing local HLC), append to the WAL (write-ahead, before in-memory state), apply to the table, update indexes and cache, and finally fan out subscriptions outside the locks. Transactions defer all of this until `commit`, which acquires every touched stripe in sorted order, validates recorded read versions against current versions, and applies the staged writes batched into a single `appendMany` WAL call.
+A `GlenDB` is a `ref` holding `collection -> docId -> Value` tables under striped RW-locks, a sharded LRU cache fronting reads, a `WriteAheadLog` that owns the on-disk segment files, a `SubscriptionManager` keyed by `collection:docId`, `IndexesByName` per collection backed by `CritBitTree` for ordered keys, and `GeoIndexesByName` / `PolygonIndexesByName` per collection backed by R-trees with STR bulk-load. Every mutation assigns a replication change record under `replLock` (incrementing seq + advancing local HLC), appends to the WAL (write-ahead, before in-memory state), applies to the table, updates the equality / geo / polygon indexes and cache, then fans out subscriptions outside the locks. Transactions defer all of this until `commit`, which acquires every touched stripe in sorted order, validates recorded read versions against current versions, and applies the staged writes batched into a single `appendMany` WAL call. The spatial / temporal / numeric extensions (`geo`, `timeseries`, `linalg`, `geomesh`, `tilestack`) are independent modules: the first three integrate with the document model (geo / polygon indexes register hooks; vectors and matrices ride along inside `Value`s as nested arrays), while `timeseries` and `tilestack` are standalone storage engines using their own files but sharing the bit-packing primitives in `glen/bitpack`.
 
 ---
 
 ## Testing
 
 ```
-nimble test            # debug, all 31 cases
+nimble test            # debug, full suite (currently 130 cases)
 nimble test_release    # ORC + -O3
-nimble bench_release   # benchmarks only
+nimble bench_release   # single-threaded benchmark
+nimble bench_concurrent  # multi-threaded contention benchmark (atomicArc)
 ```
 
-Suites cover: basic CRUD, WAL replay & corrupt-tail tolerance, snapshot round-trip, compaction, transactions, subscriptions (doc / field / field-delta / streaming), cache eviction, codec fuzzing, soak tests with periodic compaction-and-reopen, indexed soak under churn, multi-master export/apply with idempotency, LWW convergence, durability across reopen, filter include/exclude, and validator schemas.
+Suites cover: basic CRUD, WAL replay & corrupt-tail tolerance, snapshot round-trip, compaction, transactions, subscriptions (doc / field / field-delta / streaming), cache eviction, codec fuzzing, soak tests with periodic compaction-and-reopen, indexed soak under churn, multi-master export/apply with idempotency, LWW convergence, durability across reopen, filter include/exclude, validator schemas, R-tree bbox / KNN / radius queries, polygon point-in-polygon / find-points-in-polygon / projection metrics, index manifest persistence (auto-rebuild on reopen) and binary `.gri`/`.gpi` round-trip, Gorilla TSDB encoding round-trips and torn-tail recovery, retention via `dropBlocksBefore`, vector / matrix arithmetic and Value serialization, GeoMesh cell math and packed-bytes round-trip, tile time-stack encode/decode, point-history extraction, multi-tile reassembly, and compression sanity on radar-shaped fields.
 
 ---
 
@@ -346,8 +532,11 @@ Suites cover: basic CRUD, WAL replay & corrupt-tail tolerance, snapshot round-tr
 - Auto-compaction (size-based + time-based triggers)
 - Query layer: filters, projections, cursor pagination
 - Secondary derived indexes (computed fields)
-- Optional zstd page compression for snapshots
+- Optional zstd page compression for snapshots and tile chunks
 - Native async transport adapters for replication
+- Vector index (HNSW or IVF) for nearest-neighbour queries on stored embeddings
+- Bilinear interpolation in `GeoMesh.sampleAt`
+- Per-cell offset table in tile chunks (faster point-history without decoding all streams)
 
 ---
 

@@ -32,12 +32,24 @@ This guide explains how to write code, run tests, and operate effectively as an 
 
 - Run all tests:
   - `nimble test`
-- Tests are split by topic:
+- Tests are split by topic. Core:
   - `tests/test_db.nim` — basic ops and transaction paths
   - `tests/test_wal_snapshot.nim` — WAL replay and snapshot round-trip
-  - `tests/test_subscriptions.nim` — subscribe/unsubscribe and notifications
+  - `tests/test_subscriptions.nim` (+ field, stream variants) — subscribe/unsubscribe and notifications
   - `tests/test_cache.nim` — LRU eviction behavior
-  - `tests/test_codec.nim` — codec and snapshot fuzz
+  - `tests/test_codec.nim` (+ stream variant) — codec and snapshot fuzz
+  - `tests/test_soak.nim` / `test_soak_index.nim` — long-running mixed workloads
+  - `tests/test_multimaster.nim` — replication export/apply, LWW
+  - `tests/test_validators.nim` — Zod-style schema DSL
+  - `tests/test_bench.nim` / `test_bench_concurrent.nim` — micro-benchmarks
+- Spatial / temporal / numeric extensions:
+  - `tests/test_geo.nim` — R-tree primitives, geo index integration
+  - `tests/test_polygons.nim` — polygon helpers, polygon index, geographic projection
+  - `tests/test_index_persist.nim` — manifest-driven auto-rebuild + `.gri`/`.gpi` round-trip
+  - `tests/test_timeseries.nim` — Gorilla TSDB encoding round-trips, retention, torn-tail recovery
+  - `tests/test_linalg.nim` — Vector / Matrix arithmetic and Value (de)serialization
+  - `tests/test_geomesh.nim` — bbox-anchored raster cell math + packed storage
+  - `tests/test_tilestack.nim` — tile time-stack encode/decode, point history, persistence
 - Add new tests in a new file under `tests/` with clear suite names; update `glen.nimble` if adding new files.
 - Prefer deterministic tests; for fuzz tests, cap iterations and sizes.
 
@@ -110,11 +122,18 @@ db.unsubscribe(h)
 
 ## Module-specific guidance
 
-- `db.nim`: keep cache coherence and subscriber notifications aligned with writes; never bypass WAL.
+- `db.nim`: keep cache coherence and subscriber notifications aligned with writes; never bypass WAL. When adding new index types, register hooks at every mutation site (replay, `put`, `delete`, `commit`, `putMany`, `deleteMany`, `applyChanges`).
 - `wal.nim`: maintain checksum and length encoding; on replay, stop at corruption boundaries.
 - `storage.nim`: enforce size limits; consider atomic writes for future improvements.
 - `subscription.nim`: keep callbacks closure-based; ensure `unsubscribe` is safe and idempotent.
 - `txn.nim`: keep staged writes explicit; avoid overloading special values.
+- `index.nim`: equality / range. CritBitTree-backed; persisted via the `indexes.manifest`.
+- `geo.nim`: R-tree (geo + polygon), KNN, haversine helpers, `.gri` / `.gpi` binary dumps. STR for bulk-load, Guttman linear split for incremental insert.
+- `bitpack.nim`: shared bit-packing primitives (BitWriter / BitReader, zigzag, DoD, Gorilla XOR, FNV-1a32). DoD ranges are symmetric (zigzag-fits-in-N-bits): 7 bits → `[-64, 63]`, 9 → `[-256, 255]`, 12 → `[-2048, 2047]`. The XOR reuse path must use `high(uint64)` for the full-width mask, not `(1 shl 64) - 1`.
+- `timeseries.nim`: standalone Gorilla TSDB. One file per series. Active block in memory; flush at `blockSize` or on `flush()/close()`. CRC per chunk; torn tail tolerated.
+- `linalg.nim`: pure Nim arithmetic. Stored inside Values as nested `VFloat` arrays (no new ValueKind). Matrix is row-major flat for cache-friendly matmul (ikj loop, skip-on-zero).
+- `geomesh.nim`: raster-on-bbox. `data` field in serialised form is `vkBytes` (raw little-endian float64), not nested arrays — this is the size win.
+- `tilestack.nim`: tiled time-stacks for raster-over-time. Extends the timeseries idea to N parallel cell-channel streams sharing one timestamp stream per chunk. Each tile is independent on disk; mutations flow to one tile slice each.
 
 ## PR/commit guidance (if relevant)
 

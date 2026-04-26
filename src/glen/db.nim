@@ -30,8 +30,17 @@ type
     versions:         Table[string, uint64]
     indexes:          IndexesByName
     geoIndexes:       GeoIndexesByName
+    polygonIndexes:   PolygonIndexesByName
     replMetaHlc:      Table[string, Hlc]
     replMetaChangeId: Table[string, string]
+
+  IndexKind = enum ikEq, ikGeo, ikPoly
+
+  IndexManifestEntry = object
+    kind: IndexKind
+    collection: string
+    name: string
+    spec: string                  # eq: field expr; geo: "lon:lat"; poly: polygon field
 
   GlenDB* = ref object
     dir*: string
@@ -57,6 +66,89 @@ type
     peersStatePath: string
     peersDirty: bool
     peersLastWriteMs: int64
+    # Index manifest: persisted definitions of all indexes; rebuilt on open.
+    indexManifestPath: string
+    indexManifestLock: Lock
+
+# ---- Index manifest persistence ----
+#
+# Format (text, one entry per line):
+#   <kind>\t<collection>\t<name>\t<spec>
+#
+# kind ∈ "eq" | "geo" | "poly"
+#   eq:   spec is the field expression ("name" or "name,profile.age")
+#   geo:  spec is "<lonField>:<latField>"
+#   poly: spec is the polygon field name
+#
+# Field names containing tabs are not supported. Lines starting with '#' are
+# ignored. Atomic rewrites: write to a temp file then rename.
+
+const IndexManifestFile = "indexes.manifest"
+
+proc geoIndexFilePath(dir, collection, name: string): string {.inline.} =
+  dir / (collection & "." & name & ".gri")
+
+proc polygonIndexFilePath(dir, collection, name: string): string {.inline.} =
+  dir / (collection & "." & name & ".gpi")
+
+proc serializeManifestEntry(e: IndexManifestEntry): string =
+  let kindStr = case e.kind
+    of ikEq:   "eq"
+    of ikGeo:  "geo"
+    of ikPoly: "poly"
+  kindStr & "\t" & e.collection & "\t" & e.name & "\t" & e.spec
+
+proc parseManifestEntry(line: string): (bool, IndexManifestEntry) =
+  let parts = line.split('\t')
+  if parts.len != 4: return (false, IndexManifestEntry())
+  let kind = case parts[0]
+    of "eq":   ikEq
+    of "geo":  ikGeo
+    of "poly": ikPoly
+    else: return (false, IndexManifestEntry())
+  (true, IndexManifestEntry(kind: kind, collection: parts[1],
+                            name: parts[2], spec: parts[3]))
+
+proc loadIndexManifest(path: string): seq[IndexManifestEntry] =
+  result = @[]
+  if not fileExists(path): return
+  try:
+    for raw in readFile(path).split('\n'):
+      let line = raw.strip()
+      if line.len == 0 or line.startsWith("#"): continue
+      let (ok, e) = parseManifestEntry(line)
+      if ok: result.add(e)
+  except IOError: discard
+
+proc saveIndexManifestAtomic(path: string; entries: openArray[IndexManifestEntry]) =
+  var lines: seq[string] = @[]
+  for e in entries: lines.add(serializeManifestEntry(e))
+  let payload = lines.join("\n") & (if lines.len > 0: "\n" else: "")
+  let tmp = path & ".tmp"
+  writeFile(tmp, payload)
+  moveFile(tmp, path)
+
+proc addManifestEntry(db: GlenDB; e: IndexManifestEntry) =
+  acquire(db.indexManifestLock)
+  defer: release(db.indexManifestLock)
+  var entries = loadIndexManifest(db.indexManifestPath)
+  # Replace if same (kind, collection, name) already exists
+  var replaced = false
+  for i in 0 ..< entries.len:
+    if entries[i].kind == e.kind and entries[i].collection == e.collection and entries[i].name == e.name:
+      entries[i] = e; replaced = true; break
+  if not replaced: entries.add(e)
+  saveIndexManifestAtomic(db.indexManifestPath, entries)
+
+proc removeManifestEntry(db: GlenDB; kind: IndexKind; collection, name: string) =
+  acquire(db.indexManifestLock)
+  defer: release(db.indexManifestLock)
+  var entries = loadIndexManifest(db.indexManifestPath)
+  var kept: seq[IndexManifestEntry] = @[]
+  for e in entries:
+    if e.kind == kind and e.collection == collection and e.name == name: continue
+    kept.add(e)
+  saveIndexManifestAtomic(db.indexManifestPath, kept)
 
 proc newCollectionStore(): CollectionStore =
   CollectionStore(
@@ -64,6 +156,7 @@ proc newCollectionStore(): CollectionStore =
     versions:         initTable[string, uint64](),
     indexes:          initTable[string, Index](),
     geoIndexes:       initTable[string, GeoIndex](),
+    polygonIndexes:   initTable[string, PolygonIndex](),
     replMetaHlc:      initTable[string, Hlc](),
     replMetaChangeId: initTable[string, string]()
   )
@@ -103,10 +196,12 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
     replLogByCollection: initTable[string, seq[(uint64, ReplChange)]]()
   )
   initLock(result.replLock)
+  initLock(result.indexManifestLock)
   initRwLock(result.structLock)
   result.lockStripes.setLen(lockStripesCount)
   for i in 0 ..< lockStripesCount:
     initRwLock(result.lockStripes[i])
+  result.indexManifestPath = dir / IndexManifestFile
   # derive nodeId if provided
   let cfg = loadConfig()
   # Persisted/stable node id
@@ -154,6 +249,34 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
             result.peersCursors[parts[0]] = uint64(n)
     except IOError:
       discard
+  # Read the index manifest BEFORE replay so we can pre-load any persisted
+  # spatial indexes (.gri/.gpi) and let the WAL replay incrementally update
+  # them via the existing hooks. Index entries without a dump file (or with a
+  # corrupted one) get bulk-built post-replay from the loaded docs.
+  let manifestEntries = loadIndexManifest(result.indexManifestPath)
+  var loadedFromDump = initTable[string, bool]()
+  for entry in manifestEntries:
+    if entry.collection notin result.collections:
+      result.collections[entry.collection] = newCollectionStore()
+    let cs = result.collections[entry.collection]
+    let key = $ord(entry.kind) & "|" & entry.collection & "|" & entry.name
+    case entry.kind
+    of ikEq:
+      discard   # equality indexes don't have binary dumps; bulk-build below
+    of ikGeo:
+      let parts = entry.spec.split(':')
+      if parts.len != 2: continue
+      let gix = newGeoIndex(entry.name, parts[0], parts[1])
+      let path = geoIndexFilePath(result.dir, entry.collection, entry.name)
+      if tryLoadGeoIndex(gix, path):
+        cs.geoIndexes[entry.name] = gix
+        loadedFromDump[key] = true
+    of ikPoly:
+      let pix = newPolygonIndex(entry.name, entry.spec)
+      let path = polygonIndexFilePath(result.dir, entry.collection, entry.name)
+      if tryLoadPolygonIndex(pix, path):
+        cs.polygonIndexes[entry.name] = pix
+        loadedFromDump[key] = true
   # replay WAL (also rebuild versions/indexes and in-memory replication log).
   for rec in replay(dir):
     if rec.collection notin result.collections:
@@ -166,6 +289,8 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
         idx.indexDoc(rec.docId, rec.value)
       for _, gix in cs.geoIndexes:
         gix.indexDoc(rec.docId, rec.value)
+      for _, pix in cs.polygonIndexes:
+        pix.indexDoc(rec.docId, rec.value)
     else:
       if rec.docId in cs.docs:
         let oldDoc = cs.docs[rec.docId]
@@ -173,6 +298,8 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
           idx.unindexDoc(rec.docId, oldDoc)
         for _, gix in cs.geoIndexes:
           gix.unindexDoc(rec.docId, oldDoc)
+        for _, pix in cs.polygonIndexes:
+          pix.unindexDoc(rec.docId, oldDoc)
         cs.docs.del(rec.docId)
       if rec.docId in cs.versions:
         cs.versions.del(rec.docId)
@@ -202,6 +329,27 @@ proc newGlenDB*(dir: string; cacheCapacity = 64*1024*1024; cacheShards = 16; wal
         result.localHlc.counter = ch.hlc.counter
       elif ch.hlc.wallMillis == result.localHlc.wallMillis and ch.hlc.counter > result.localHlc.counter:
         result.localHlc.counter = ch.hlc.counter
+  # Build any indexes that didn't get pre-loaded from a dump file.
+  for entry in manifestEntries:
+    let key = $ord(entry.kind) & "|" & entry.collection & "|" & entry.name
+    if key in loadedFromDump: continue
+    if entry.collection notin result.collections: continue
+    let cs = result.collections[entry.collection]
+    case entry.kind
+    of ikEq:
+      let idx = newIndex(entry.name, entry.spec)
+      for id, v in cs.docs: idx.indexDoc(id, v)
+      cs.indexes[entry.name] = idx
+    of ikGeo:
+      let parts = entry.spec.split(':')
+      if parts.len != 2: continue
+      let gix = newGeoIndex(entry.name, parts[0], parts[1])
+      gix.bulkBuild(cs.docs)
+      cs.geoIndexes[entry.name] = gix
+    of ikPoly:
+      let pix = newPolygonIndex(entry.name, entry.spec)
+      pix.bulkBuild(cs.docs)
+      cs.polygonIndexes[entry.name] = pix
 
 # ---- Replication peers state and log GC ----
 const PeersStateFlushDebounceMs = 500
@@ -563,6 +711,8 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
     idx.reindexDoc(docId, oldDoc, stored)
   for _, gix in cs.geoIndexes:
     gix.reindexDoc(docId, oldDoc, stored)
+  for _, pix in cs.polygonIndexes:
+    pix.reindexDoc(docId, oldDoc, stored)
   notifications.add((Id(collection: collection, docId: docId, version: newVer), stored))
   fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, stored))
   db.releaseStripeWrite(collection)
@@ -600,6 +750,8 @@ proc delete*(db: GlenDB; collection, docId: string) =
       idx.unindexDoc(docId, oldDoc)
     for _, gix in cs.geoIndexes:
       gix.unindexDoc(docId, oldDoc)
+    for _, pix in cs.polygonIndexes:
+      pix.unindexDoc(docId, oldDoc)
     cs.docs.del(docId)
     if docId in cs.versions: cs.versions.del(docId)
     db.cache.del(collection & ":" & docId)
@@ -673,6 +825,8 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
           idx.unindexDoc(docId, oldDoc)
         for _, gix in cs.geoIndexes:
           gix.unindexDoc(docId, oldDoc)
+        for _, pix in cs.polygonIndexes:
+          pix.unindexDoc(docId, oldDoc)
         cs.docs.del(docId)
         if docId in cs.versions: cs.versions.del(docId)
         db.cache.del(collection & ":" & docId)
@@ -703,6 +857,8 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
         idx.reindexDoc(docId, oldDoc, w.value)
       for _, gix in cs.geoIndexes:
         gix.reindexDoc(docId, oldDoc, w.value)
+      for _, pix in cs.polygonIndexes:
+        pix.reindexDoc(docId, oldDoc, w.value)
       notifications.add((Id(collection: collection, docId: docId, version: newVer), w.value))
       fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, w.value))
   if walRecs.len > 0:
@@ -806,6 +962,8 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
       idx.reindexDoc(entry.docId, entry.oldDoc, entry.stored)
     for _, gix in cs.geoIndexes:
       gix.reindexDoc(entry.docId, entry.oldDoc, entry.stored)
+    for _, pix in cs.polygonIndexes:
+      pix.reindexDoc(entry.docId, entry.oldDoc, entry.stored)
     let idObj = Id(collection: collection, docId: entry.docId, version: entry.version)
     notifications.add((idObj, entry.stored))
     fieldNotifications.add((idObj, entry.oldDoc, entry.stored))
@@ -858,6 +1016,8 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
       idx.unindexDoc(entry.docId, entry.oldDoc)
     for _, gix in cs.geoIndexes:
       gix.unindexDoc(entry.docId, entry.oldDoc)
+    for _, pix in cs.polygonIndexes:
+      pix.unindexDoc(entry.docId, entry.oldDoc)
     cs.docs.del(entry.docId)
     if entry.docId in cs.versions: cs.versions.del(entry.docId)
     db.cache.del(collection & ":" & entry.docId)
@@ -886,43 +1046,54 @@ proc snapshotAll*(db: GlenDB) =
     writeSnapshot(db.dir, name, cs.docs)
 
 ## Create an equality index on a field path (e.g., "name" or "profile.age").
+## Persisted in the manifest; auto-rebuilt on reopen.
 proc createIndex*(db: GlenDB; collection: string; name: string; fieldPath: string) =
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
-  defer: db.releaseStripeWrite(collection)
   let idx = newIndex(name, fieldPath)
   for id, v in cs.docs:
     idx.indexDoc(id, v)
   cs.indexes[name] = idx
+  db.releaseStripeWrite(collection)
+  db.addManifestEntry(IndexManifestEntry(
+    kind: ikEq, collection: collection, name: name, spec: fieldPath))
 
 ## Drop an existing index by name.
 proc dropIndex*(db: GlenDB; collection: string; name: string) =
   let cs = db.tryGetCollection(collection)
-  if cs.isNil: return
+  if cs.isNil:
+    db.removeManifestEntry(ikEq, collection, name); return
   db.acquireStripeWrite(collection)
-  defer: db.releaseStripeWrite(collection)
   if name in cs.indexes:
     cs.indexes.del(name)
+  db.releaseStripeWrite(collection)
+  db.removeManifestEntry(ikEq, collection, name)
 
 ## Create a geospatial (R-tree) index on two numeric fields treated as (lon, lat).
 ## Bulk-loaded with STR for tight MBRs; updated incrementally on every put/delete.
 ## Documents missing either field, or with non-numeric values there, are skipped.
+## Persisted in the manifest; auto-rebuilt on reopen.
 proc createGeoIndex*(db: GlenDB; collection: string; name: string; lonField, latField: string) =
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
-  defer: db.releaseStripeWrite(collection)
   let gix = newGeoIndex(name, lonField, latField)
   gix.bulkBuild(cs.docs)
   cs.geoIndexes[name] = gix
+  db.releaseStripeWrite(collection)
+  db.addManifestEntry(IndexManifestEntry(
+    kind: ikGeo, collection: collection, name: name,
+    spec: lonField & ":" & latField))
 
 ## Drop a geospatial index by name.
 proc dropGeoIndex*(db: GlenDB; collection: string; name: string) =
   let cs = db.tryGetCollection(collection)
-  if cs.isNil: return
+  if cs.isNil:
+    db.removeManifestEntry(ikGeo, collection, name); return
   db.acquireStripeWrite(collection)
-  defer: db.releaseStripeWrite(collection)
   if name in cs.geoIndexes:
     cs.geoIndexes.del(name)
+  db.releaseStripeWrite(collection)
+  db.removeManifestEntry(ikGeo, collection, name)
 
 ## Find docs whose indexed point falls inside the given bounding box.
 proc findInBBox*(db: GlenDB; collection, indexName: string;
@@ -943,7 +1114,11 @@ proc findInBBox*(db: GlenDB; collection, indexName: string;
 ## K-nearest neighbours by Euclidean distance (treats coords as planar).
 ## Results are sorted ascending by distance; second tuple element is the distance.
 proc findNearest*(db: GlenDB; collection, indexName: string;
-                  lon, lat: float64; k: int): seq[(string, float64, Value)] =
+                  lon, lat: float64; k: int;
+                  metric = gmPlanar): seq[(string, float64, Value)] =
+  ## K-nearest neighbours. With `metric = gmPlanar` (default) distances are
+  ## Euclidean over raw coords (degrees). With `metric = gmGeographic`,
+  ## distances are haversine metres — coords are treated as (lon, lat) degrees.
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return @[]
   db.acquireStripeRead(collection)
@@ -951,7 +1126,10 @@ proc findNearest*(db: GlenDB; collection, indexName: string;
   if indexName notin cs.geoIndexes: return @[]
   let gix = cs.geoIndexes[indexName]
   result = @[]
-  for (id, dist) in gix.tree.nearest(lon, lat, k):
+  let pairs =
+    if metric == gmGeographic: gix.tree.nearestGeo(lon, lat, k)
+    else: gix.tree.nearest(lon, lat, k)
+  for (id, dist) in pairs:
     if id in cs.docs:
       result.add((id, dist, cs.docs[id].clone()))
 
@@ -981,6 +1159,87 @@ proc findWithinRadius*(db: GlenDB; collection, indexName: string;
   for (id, d) in candidates:
     result.add((id, d, cs.docs[id].clone()))
     if limit > 0 and result.len >= limit: break
+
+# ---- Polygon indexes ----
+
+## Create a polygon (R-tree of MBRs) index. The named field must hold a
+## polygon as `VArray([VArray([VFloat(x), VFloat(y)]), ...])`.
+## Persisted in the manifest; auto-rebuilt on reopen.
+proc createPolygonIndex*(db: GlenDB; collection: string; name: string;
+                         polygonField: string) =
+  let cs = db.getOrCreateCollection(collection)
+  db.acquireStripeWrite(collection)
+  let pix = newPolygonIndex(name, polygonField)
+  pix.bulkBuild(cs.docs)
+  cs.polygonIndexes[name] = pix
+  db.releaseStripeWrite(collection)
+  db.addManifestEntry(IndexManifestEntry(
+    kind: ikPoly, collection: collection, name: name, spec: polygonField))
+
+## Drop a polygon index by name.
+proc dropPolygonIndex*(db: GlenDB; collection: string; name: string) =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil:
+    db.removeManifestEntry(ikPoly, collection, name); return
+  db.acquireStripeWrite(collection)
+  if name in cs.polygonIndexes:
+    cs.polygonIndexes.del(name)
+  db.releaseStripeWrite(collection)
+  db.removeManifestEntry(ikPoly, collection, name)
+
+## Find every polygon in the index whose interior contains the point (x, y).
+## Uses an R-tree bbox prefilter, then exact ray-cast point-in-polygon test.
+proc findPolygonsContaining*(db: GlenDB; collection, indexName: string;
+                             x, y: float64; limit = 0): seq[(string, Value)] =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil: return @[]
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
+  if indexName notin cs.polygonIndexes: return @[]
+  let pix = cs.polygonIndexes[indexName]
+  result = @[]
+  for id in pix.polygonsContainingPoint(x, y, limit):
+    if id in cs.docs:
+      result.add((id, cs.docs[id].clone()))
+
+## Polygons whose MBR intersects a query bounding box. This is a fast prefilter
+## (O(log n + k)); the result is a superset of the geometric-intersection set.
+proc findPolygonsIntersecting*(db: GlenDB; collection, indexName: string;
+                               minX, minY, maxX, maxY: float64;
+                               limit = 0): seq[(string, Value)] =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil: return @[]
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
+  if indexName notin cs.polygonIndexes: return @[]
+  let pix = cs.polygonIndexes[indexName]
+  let q = bbox(minX, minY, maxX, maxY)
+  result = @[]
+  for id in pix.polygonsIntersectingBBox(q, limit):
+    if id in cs.docs:
+      result.add((id, cs.docs[id].clone()))
+
+## Query a *point* (geo) index using a polygon: returns all indexed points
+## that lie inside `polygon`. Bbox prefilter + ray-cast.
+proc findPointsInPolygon*(db: GlenDB; collection, geoIndexName: string;
+                          polygon: Polygon;
+                          limit = 0): seq[(string, Value)] =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil: return @[]
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
+  if geoIndexName notin cs.geoIndexes: return @[]
+  let gix = cs.geoIndexes[geoIndexName]
+  let bb = polygonBBox(polygon)
+  result = @[]
+  for id in gix.tree.searchBBox(bb, 0):
+    if id notin cs.docs: continue
+    let doc = cs.docs[id]
+    let (ok, x, y) = gix.extractPoint(doc)
+    if not ok: continue
+    if pointInPolygon(polygon, x, y):
+      result.add((id, doc.clone()))
+      if limit > 0 and result.len >= limit: return
 
 ## Query documents by equality on an indexed field. Optional limit.
 proc findBy*(db: GlenDB; collection: string; indexName: string; keyValue: Value; limit = 0): seq[(string, Value)] =
@@ -1021,6 +1280,13 @@ proc compact*(db: GlenDB) =
   releaseRead(db.structLock)
   for (name, cs) in pairs:
     writeSnapshot(db.dir, name, cs.docs)
+    # Persist each spatial index alongside the snapshot. WAL is reset below,
+    # so on next open these dumps reflect a state with an empty WAL — the
+    # replay loop won't double-apply.
+    for idxName, gix in cs.geoIndexes:
+      dumpGeoIndex(gix, geoIndexFilePath(db.dir, name, idxName))
+    for idxName, pix in cs.polygonIndexes:
+      dumpPolygonIndex(pix, polygonIndexFilePath(db.dir, name, idxName))
   # Reset WAL after snapshot to start a new, empty log
   if db.wal != nil:
     db.wal.reset()
@@ -1183,6 +1449,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
           idx.unindexDoc(docId, act.oldDoc)
         for _, gix in cs.geoIndexes:
           gix.unindexDoc(docId, act.oldDoc)
+        for _, pix in cs.polygonIndexes:
+          pix.unindexDoc(docId, act.oldDoc)
       if docId in cs.docs: cs.docs.del(docId)
       if docId in cs.versions: cs.versions.del(docId)
       db.cache.del(coll & ":" & docId)
@@ -1199,6 +1467,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
         idx.reindexDoc(docId, act.oldDoc, stored)
       for _, gix in cs.geoIndexes:
         gix.reindexDoc(docId, act.oldDoc, stored)
+      for _, pix in cs.polygonIndexes:
+        pix.reindexDoc(docId, act.oldDoc, stored)
       notifications.add((Id(collection: coll, docId: docId, version: ch.version), stored))
       fieldNotifications.add((Id(collection: coll, docId: docId, version: ch.version), act.oldDoc, stored))
     cs.replMetaHlc[docId] = pendingHlc[key]

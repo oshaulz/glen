@@ -1,7 +1,7 @@
 ## Glen: An Embedded Document Database for Nim
 
 ### TL;DR
-Glen is a fast, embedded, single-process document database for Nim. It stores data in-memory for speed, persists mutations via a write-ahead log (WAL), periodically takes snapshots per collection for fast recovery, offers optimistic transactions (OCC), field and document subscriptions, indexes for equality and simple ranges, and a sharded LRU cache. It is designed for local-first apps, edge/embedded services, tests, analytics dashboards, and single-node real-time workloads.
+Glen is a fast, embedded, single-process document database for Nim. It stores data in-memory for speed, persists mutations via a write-ahead log (WAL), periodically takes snapshots per collection for fast recovery, offers optimistic transactions (OCC), field and document subscriptions, indexes for equality and simple ranges, and a sharded LRU cache. On top of that base, Glen adds first-class spatial primitives (R-tree-backed geo and polygon indexes, with both planar and geographic — haversine — distance metrics), a Gorilla-style time-series engine, lightweight linear algebra, a bbox-anchored raster type (`GeoMesh`), and a tiled time-stack engine for compressed storage of rasters that evolve through time (radar / model output / probability fields). It is designed for local-first apps, edge/embedded services, tests, analytics dashboards, single-node real-time workloads, and increasingly geospatial/temporal systems with low-millisecond query budgets.
 
 ---
 
@@ -85,9 +85,51 @@ Non-goals (for now):
   - Ordered key maintenance is O(log n) for insert/update/delete. Deletes use `excl` on the critbit tree (no full rebuild).
   - Range scans are O(log n + m), where m is the number of results returned. Ascending scans iterate the critbit tree directly; descending scans materialize keys temporarily for reverse traversal.
 - Maintenance: On put/delete/commit, indexes update by (re)indexing affected docs.
+- **Persistence**: an `indexes.manifest` text file records every index definition. On reopen, the manifest drives index reconstruction: spatial indexes try a binary `.gri`/`.gpi` dump first (written at `compact()`); equality indexes and any spatial entry without a dump rebuild from the in-memory docs after WAL replay. Users no longer need to re-call `createIndex` after restart.
 
 ### 3.8 Codec
 - Value encode/decode used by WAL and snapshots. Supports all `Value` kinds.
+
+### 3.9 Geospatial indexes (R-tree)
+- Two index types: `GeoIndex` (point bboxes derived from two numeric fields) and `PolygonIndex` (polygon-shape bboxes plus the per-doc polygon for exact tests).
+- Backing data structure: a memory-resident R-tree with fanout 16 (default). Bulk-loaded with **STR** (Sort-Tile-Recursive) for tight MBRs on `createGeoIndex` over an existing collection; **Guttman linear split** for incremental insert/delete on subsequent mutations.
+- KNN traversal: best-first with a min-heap on bbox-to-point lower-bound (Hjaltason & Samet). Two metric modes:
+  - `gmPlanar` — squared Euclidean distance over raw coords (degrees); fast, fine for short ranges.
+  - `gmGeographic` — haversine-on-bbox lower bound (clamp query lon/lat into the bbox, then haversine to the clamped point). Result distances in metres.
+- Polygon containment: bbox prefilter via the R-tree, then exact ray-cast (Crossing Number) test. `findPointsInPolygon` reverses the direction — bbox-of-polygon query against a points geo index, then ray-cast over candidates.
+- Persistence: a per-index binary dump (`<collection>.<name>.gri` for points, `.gpi` for polygons) is written at `compact()`. Format: magic `GLENGRI1` + version + kind + entries `(idLen, id, bbox)` + (for polygons) per-id vertex lists + FNV-1a32 trailer. On reopen, the dump is loaded **before** WAL replay so the existing replay hooks update the loaded tree incrementally; bad CRC or missing dump silently falls back to bulk-rebuild from docs.
+
+### 3.10 Time-series engine (Gorilla)
+- Standalone module (`glen/timeseries`); not part of the document model. One `Series` = one append-only file, designed for many `(int64 ts, float64 value)` per second per series.
+- File layout: 16-byte header, then sequence of chunks. Each chunk: 40-byte header (`payloadBytes`, `count`, `startTs`, `endTs`, `minVal`, `maxVal`), bit-packed payload, FNV-1a32 trailer.
+- Encoding: timestamps via delta-of-delta with 1/9/12/16-bit prefix codes; values via XOR with leading/trailing meaningful-bit-block reuse (Gorilla). Result is ~1–3 bits/sample on smooth data, sub-1 bit on constant or perfectly-cadenced inputs.
+- Active block buffer: in-memory until it reaches `blockSize` samples or `flush()` is called. The append fast path is amortised O(1) (seq push); only one chunk encode per `blockSize` samples.
+- Reads: range scans iterate the in-memory block index, decoding only chunks whose `[startTs, endTs]` intersects the query. Latest-N walks chunks back-to-front. Active block is read directly without bit decoding.
+- Recovery: per-chunk CRC; torn tail (mid-flush crash) is silently truncated on reopen.
+- Retention: `dropBlocksBefore(cutoffMs)` rewrites the file streaming surviving blocks byte-for-byte (no re-encoding).
+
+### 3.11 Linear algebra
+- `Vector = seq[float64]` (idiomatic Nim). `Matrix` is row-major flat (`rows`, `cols`, `data: seq[float64]`) for cache-friendly `matmul` (ikj loop order, skip-on-zero).
+- Operations: `add`/`sub`/`scale`/`dot`/`norm`/`normalize`/`euclidean`/`cosine`/`hadamard` for vectors; `matmul`/`transpose`/`matvec`/`trace` for matrices; in-place variants for hot loops; `+`/`-`/`*` operator sugar.
+- Storage: helpers `toValue` / `readVector` / `readMatrix` round-trip through plain `VArray`-of-`VFloat`. No new `ValueKind` — vectors and matrices ride along inside ordinary documents and inherit codec, snapshot, replication, and subscription support for free.
+
+### 3.12 GeoMesh — bbox-anchored 2-D raster
+- One immutable raster pinned to a geographic `BBox` with `(rows, cols, channels)`. Cell ordering: `row 0` = top of bbox (max lat), `col 0` = left (min lon).
+- In-memory: `seq[float64]` flat row-major, channel-interleaved at `data[(row*cols + col)*channels + ch]`.
+- API: `cellAt(lon, lat) → (inBounds, row, col)`, `cellCenter(row, col) → (lon, lat)`, `valueAt`/`vectorAt` for point sampling, `setCell` for batch writes.
+- Storage: serialised as a `VObject` whose `data` field is `vkBytes` (raw little-endian float64). A 1000×1000×5 mesh is ~40 MB on disk vs hundreds of MB if stored as nested `VArray`s.
+
+### 3.13 Tile time-stack
+- Standalone module (`glen/tilestack`). Use case: a 2-D raster that evolves through time — radar reflectivity sweeps, weather model output, animated probability fields from an LLM, satellite image time series.
+- Storage: a directory containing a text `manifest.tsm` (bbox, dims, tile/chunk size, labels) plus one append-only `tile_<r>_<c>.tts` file per tile. Each tile file is a sequence of chunks identical in spirit to the time-series engine: 40-byte chunk header + bit-packed payload + FNV-1a32 trailer.
+- Chunk encoding: a single shared timestamp stream (DoD), then `tileSize² × channels` independent Gorilla streams (each cell-channel has its own `XorState` so streams can in principle be decoded independently — the current implementation decodes the whole chunk on access).
+- `appendFrame(tsMillis, mesh)` decomposes a full `GeoMesh` into per-tile slices and appends each to its tile's active buffer; tiles auto-flush once their buffer reaches `chunkSize`. Out-of-order timestamps force a chunk flush so each chunk stays monotonic.
+- `readFrame(tsMillis)` reassembles a full mesh by gathering each tile's data at that ts (active buffer or chunk decode); `readPointHistory(lon, lat, fromMs, toMs, channel)` decodes only the **single tile** that owns the cell — that's the workload tiling exists to make fast.
+- Compression: ~10–30× on radar-like sparse fields (most cells stable, a moving storm region varies slowly), ~2–3× on fully-varying smooth fields. Worst case is fully-random per-cell-per-frame, where Gorilla degenerates to nearly raw float storage; that workload is unsuitable for tile stacks.
+- Recovery: torn-chunk tail tolerated via per-chunk CRC, identical to the time-series engine.
+
+### 3.14 Shared bit-packing primitives
+- `glen/bitpack` factors out the encode/decode primitives reused by `timeseries` and `tilestack`: `BitWriter`/`BitReader` (MSB-first big-endian bit packing), `zigzag`/`unzigzag`, `encodeDoD`/`decodeDoD` with 0/9/12/16/36-bit prefix codes, `encodeXor`/`decodeXor` with `XorState`, and `fnv1a32`. The DoD prefix table corrects a subtle off-by-one (zigzag of `64` doesn't fit in 7 bits, so the 7-bit slot covers `[-64, 63]` not `[-63, 64]`); the XOR reuse path uses `high(uint64)` instead of `(1 shl 64) - 1` to avoid undefined behaviour when the prior fresh block had `leading == 0 && trailing == 0`.
 
 ---
 

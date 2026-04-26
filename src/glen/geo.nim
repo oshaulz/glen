@@ -10,10 +10,14 @@
 #     optimal KNN traversal (Hjaltason & Samet).
 #   * Fanout (M=16, m=6) is conservative; tweak after profiling.
 
-import std/[algorithm, math, tables, heapqueue]
+import std/[algorithm, math, tables, heapqueue, os]
 import glen/types
 
 type
+  GeoMetric* = enum
+    gmPlanar      ## Euclidean distance over raw coords (degrees, units, anything).
+    gmGeographic  ## Haversine distance in meters; coords interpreted as (lon, lat) degrees.
+
   BBox* = object
     minX*, minY*, maxX*, maxY*: float64
 
@@ -40,6 +44,17 @@ type
     lonField*: string
     latField*: string
     tree*: RTree
+
+  Polygon* = object
+    ## Simple polygon: ordered list of vertices, implicit closing edge.
+    ## No holes, no self-intersection enforcement (callers' responsibility).
+    vertices*: seq[(float64, float64)]
+
+  PolygonIndex* = ref object
+    name*: string
+    polygonField*: string
+    tree*: RTree
+    polygons*: Table[string, Polygon]    # docId -> polygon, for exact tests
 
 # --------- BBox ---------
 
@@ -510,6 +525,79 @@ proc nearestWithin*(t: RTree; x, y: float64; maxDist: float64; limit = 0): seq[(
         if d <= cutoff:
           pq.push(KnnItem(distSq: d, isLeaf: false, node: c))
 
+# --- Geographic KNN (haversine) ---
+#
+# bbox lower-bound for haversine: clamp the query point's lon/lat into the bbox
+# range and compute haversine to the clamped point. This is exact when the
+# nearest point on the bbox is a corner or edge intersection; conservative
+# (returns ≤ true min) otherwise — perfect for KNN pruning.
+# Antimeridian-spanning bboxes are NOT handled specially; treat the index as
+# operating on bboxes that don't cross 180°/-180°.
+
+proc haversineMinMeters*(b: BBox; lon, lat: float64): float64 =
+  ## Lower bound on haversine distance from (lon, lat) to nearest point of b.
+  ## Zero if (lon, lat) is inside b.
+  let clampedLon =
+    if lon < b.minX: b.minX
+    elif lon > b.maxX: b.maxX
+    else: lon
+  let clampedLat =
+    if lat < b.minY: b.minY
+    elif lat > b.maxY: b.maxY
+    else: lat
+  haversineMeters(lon, lat, clampedLon, clampedLat)
+
+proc nearestGeo*(t: RTree; lon, lat: float64; k: int): seq[(string, float64)] =
+  ## K-nearest by haversine distance (metres). The R-tree is assumed to index
+  ## points or bboxes in (lon, lat) degrees.
+  result = @[]
+  if t.size == 0 or k <= 0: return
+  var pq = initHeapQueue[KnnItem]()
+  pq.push(KnnItem(distSq: haversineMinMeters(t.root.bbox, lon, lat),
+                  isLeaf: false, node: t.root))
+  while pq.len > 0:
+    let it = pq.pop()
+    if it.isLeaf:
+      result.add((it.docId, it.distSq))
+      if result.len >= k: return
+      continue
+    let n = it.node
+    if n.isLeaf:
+      for e in n.entries:
+        let d = haversineMinMeters(e.bbox, lon, lat)
+        pq.push(KnnItem(distSq: d, isLeaf: true, docId: e.docId))
+    else:
+      for c in n.children:
+        let d = haversineMinMeters(c.bbox, lon, lat)
+        pq.push(KnnItem(distSq: d, isLeaf: false, node: c))
+
+proc nearestGeoWithin*(t: RTree; lon, lat: float64;
+                       maxMeters: float64; limit = 0): seq[(string, float64)] =
+  ## Best-first traversal stopping when bbox haversine lower-bound > maxMeters.
+  result = @[]
+  if t.size == 0 or maxMeters < 0: return
+  var pq = initHeapQueue[KnnItem]()
+  pq.push(KnnItem(distSq: haversineMinMeters(t.root.bbox, lon, lat),
+                  isLeaf: false, node: t.root))
+  while pq.len > 0:
+    let it = pq.pop()
+    if it.distSq > maxMeters: return
+    if it.isLeaf:
+      result.add((it.docId, it.distSq))
+      if limit > 0 and result.len >= limit: return
+      continue
+    let n = it.node
+    if n.isLeaf:
+      for e in n.entries:
+        let d = haversineMinMeters(e.bbox, lon, lat)
+        if d <= maxMeters:
+          pq.push(KnnItem(distSq: d, isLeaf: true, docId: e.docId))
+    else:
+      for c in n.children:
+        let d = haversineMinMeters(c.bbox, lon, lat)
+        if d <= maxMeters:
+          pq.push(KnnItem(distSq: d, isLeaf: false, node: c))
+
 # --------- STR bulk loader ---------
 #
 # Sort-Tile-Recursive: sort by x, partition into vertical "slices", sort each
@@ -635,3 +723,325 @@ proc bulkBuild*(idx: GeoIndex; docs: Table[string, Value]) =
   idx.tree.bulkLoad(pairs)
 
 type GeoIndexesByName* = Table[string, GeoIndex]
+
+# --------- Polygon helpers ---------
+
+proc polygonBBox*(p: Polygon): BBox =
+  ## MBR of a polygon. Empty BBox if no vertices.
+  if p.vertices.len == 0: return InfBBox
+  result = BBox(
+    minX: p.vertices[0][0], minY: p.vertices[0][1],
+    maxX: p.vertices[0][0], maxY: p.vertices[0][1])
+  for v in p.vertices:
+    if v[0] < result.minX: result.minX = v[0]
+    if v[0] > result.maxX: result.maxX = v[0]
+    if v[1] < result.minY: result.minY = v[1]
+    if v[1] > result.maxY: result.maxY = v[1]
+
+proc pointInPolygon*(p: Polygon; x, y: float64): bool =
+  ## Ray-casting (Crossing Number) test. Edge cases: a point exactly on an
+  ## edge may resolve either way — we don't define edge semantics rigorously.
+  let n = p.vertices.len
+  if n < 3: return false
+  var inside = false
+  var j = n - 1
+  for i in 0 ..< n:
+    let (xi, yi) = p.vertices[i]
+    let (xj, yj) = p.vertices[j]
+    if (yi > y) != (yj > y):
+      let xIntersect = (xj - xi) * (y - yi) / (yj - yi) + xi
+      if x < xIntersect:
+        inside = not inside
+    j = i
+  inside
+
+proc readPolygonFromValue*(v: Value): (bool, Polygon) =
+  ## Polygons are encoded as `VArray([VArray([VFloat(x), VFloat(y)]), ...])`.
+  ## Returns (false, _) on shape mismatch. Accepts vkInt for coords too.
+  if v.isNil or v.kind != vkArray: return (false, Polygon())
+  var p = Polygon(vertices: @[])
+  for vert in v.arr:
+    if vert.isNil or vert.kind != vkArray or vert.arr.len < 2:
+      return (false, Polygon())
+    let (okX, x) = readFloat(vert.arr[0])
+    let (okY, y) = readFloat(vert.arr[1])
+    if not okX or not okY: return (false, Polygon())
+    p.vertices.add((x, y))
+  if p.vertices.len < 3: return (false, Polygon())
+  (true, p)
+
+# --------- PolygonIndex ---------
+
+proc newPolygonIndex*(name, polygonField: string): PolygonIndex =
+  PolygonIndex(
+    name: name, polygonField: polygonField,
+    tree: newRTree(),
+    polygons: initTable[string, Polygon]())
+
+proc extractPolygon*(idx: PolygonIndex; doc: Value): (bool, Polygon) =
+  if doc.isNil or doc.kind != vkObject: return (false, Polygon())
+  readPolygonFromValue(doc[idx.polygonField])
+
+proc indexDoc*(idx: PolygonIndex; docId: string; doc: Value) =
+  let (ok, poly) = idx.extractPolygon(doc)
+  if not ok: return
+  if docId in idx.tree.docBBox:
+    discard idx.tree.remove(docId)
+    idx.polygons.del(docId)
+  idx.tree.insert(docId, polygonBBox(poly))
+  idx.polygons[docId] = poly
+
+proc unindexDoc*(idx: PolygonIndex; docId: string; doc: Value) =
+  discard idx.tree.remove(docId)
+  idx.polygons.del(docId)
+
+proc reindexDoc*(idx: PolygonIndex; docId: string; oldDoc, newDoc: Value) =
+  if not oldDoc.isNil:
+    discard idx.tree.remove(docId)
+    idx.polygons.del(docId)
+  if not newDoc.isNil:
+    let (ok, poly) = idx.extractPolygon(newDoc)
+    if ok:
+      idx.tree.insert(docId, polygonBBox(poly))
+      idx.polygons[docId] = poly
+
+proc bulkBuild*(idx: PolygonIndex; docs: Table[string, Value]) =
+  var pairs: seq[(string, BBox)] = @[]
+  idx.polygons = initTable[string, Polygon]()
+  for id, v in docs:
+    let (ok, poly) = idx.extractPolygon(v)
+    if ok:
+      pairs.add((id, polygonBBox(poly)))
+      idx.polygons[id] = poly
+  idx.tree.bulkLoad(pairs)
+
+# Public R-tree exact-test queries
+
+proc polygonsContainingPoint*(idx: PolygonIndex; x, y: float64;
+                              limit = 0): seq[string] =
+  ## Find every indexed polygon whose interior contains (x, y).
+  result = @[]
+  let q = point(x, y)
+  for id in idx.tree.searchBBox(q, 0):
+    if id in idx.polygons and pointInPolygon(idx.polygons[id], x, y):
+      result.add(id)
+      if limit > 0 and result.len >= limit: return
+
+proc polygonsIntersectingBBox*(idx: PolygonIndex; q: BBox;
+                               limit = 0): seq[string] =
+  ## Bbox-level intersection (cheap; not exact polygon-polygon intersection).
+  idx.tree.searchBBox(q, limit)
+
+type PolygonIndexesByName* = Table[string, PolygonIndex]
+
+# --------- binary persistence ---------
+#
+# We persist the (docId -> BBox) mapping plus, for polygon indexes, the
+# polygon vertex lists. The R-tree itself is rebuilt via bulkLoad — STR over
+# already-known entries is much faster than walking the tree for serialization
+# and produces tighter MBRs.
+#
+# Format:
+#   magic "GLENGRI1" (8 B)
+#   version          uint32 (currently 1)
+#   kind             uint32 (1 = geo points, 2 = polygons)
+#   entryCount       uint64
+#   For each entry:
+#     idLen          uint32
+#     id             <idLen> bytes
+#     minX, minY, maxX, maxY   4 × float64
+#   If kind == 2, then:
+#     polyCount      uint64
+#     For each polygon:
+#       idLen        uint32
+#       id           <idLen> bytes
+#       vertCount    uint32
+#       vertices     vertCount × (float64, float64)
+#   crc32            uint32  (FNV-1a over all bytes after the magic+version+kind header)
+
+const
+  GriMagic        = "GLENGRI1"
+  GriVersion      = 1'u32
+  GriKindGeo      = 1'u32
+  GriKindPolygon  = 2'u32
+
+proc griFnv1a32(buf: openArray[byte]): uint32 =
+  var h: uint32 = 0x811C9DC5'u32
+  for b in buf:
+    h = (h xor uint32(b)) * 0x01000193'u32
+  h
+
+proc writeBytes(s: var seq[byte]; data: openArray[byte]) =
+  let off = s.len
+  s.setLen(off + data.len)
+  for i, b in data: s[off + i] = b
+
+proc writeStr(s: var seq[byte]; v: string) =
+  if v.len == 0: return
+  let off = s.len
+  s.setLen(off + v.len)
+  for i, c in v: s[off + i] = byte(c)
+
+proc writeU32(s: var seq[byte]; v: uint32) =
+  let off = s.len
+  s.setLen(off + 4)
+  for i in 0 ..< 4:
+    s[off + i] = byte((v shr (i * 8)) and 0xFF'u32)
+
+proc writeU64(s: var seq[byte]; v: uint64) =
+  let off = s.len
+  s.setLen(off + 8)
+  for i in 0 ..< 8:
+    s[off + i] = byte((v shr (i * 8)) and 0xFF'u64)
+
+proc writeF64(s: var seq[byte]; v: float64) =
+  let bits = cast[uint64](v)
+  writeU64(s, bits)
+
+type ByteReader = object
+  buf: seq[byte]
+  off: int
+
+proc readBytes(r: var ByteReader; n: int): seq[byte] =
+  if r.off + n > r.buf.len:
+    raise newException(IOError, "short read")
+  result = r.buf[r.off ..< r.off + n]
+  r.off += n
+
+proc readU32(r: var ByteReader): uint32 =
+  if r.off + 4 > r.buf.len: raise newException(IOError, "short read u32")
+  result = 0
+  for i in 0 ..< 4:
+    result = result or (uint32(r.buf[r.off + i]) shl (i * 8))
+  r.off += 4
+
+proc readU64(r: var ByteReader): uint64 =
+  if r.off + 8 > r.buf.len: raise newException(IOError, "short read u64")
+  result = 0
+  for i in 0 ..< 8:
+    result = result or (uint64(r.buf[r.off + i]) shl (i * 8))
+  r.off += 8
+
+proc readF64(r: var ByteReader): float64 =
+  cast[float64](readU64(r))
+
+proc readStr(r: var ByteReader; n: int): string =
+  if r.off + n > r.buf.len: raise newException(IOError, "short read str")
+  result = newString(n)
+  for i in 0 ..< n:
+    result[i] = char(r.buf[r.off + i])
+  r.off += n
+
+proc dumpRTreeEntries(t: RTree): seq[(string, BBox)] =
+  result = @[]
+  for id, b in t.docBBox: result.add((id, b))
+
+proc dumpGeoIndex*(idx: GeoIndex; path: string) =
+  ## Atomically write the geo index to disk (entries-only; tree is rebuilt on load).
+  var body: seq[byte] = @[]
+  let entries = dumpRTreeEntries(idx.tree)
+  writeU64(body, uint64(entries.len))
+  for (id, b) in entries:
+    writeU32(body, uint32(id.len))
+    writeStr(body, id)
+    writeF64(body, b.minX); writeF64(body, b.minY)
+    writeF64(body, b.maxX); writeF64(body, b.maxY)
+  let crc = griFnv1a32(body)
+  var out2: seq[byte] = @[]
+  writeStr(out2, GriMagic)
+  writeU32(out2, GriVersion)
+  writeU32(out2, GriKindGeo)
+  for b in body: out2.add(b)
+  writeU32(out2, crc)
+  let tmp = path & ".tmp"
+  writeFile(tmp, cast[string](out2))
+  moveFile(tmp, path)
+
+proc dumpPolygonIndex*(idx: PolygonIndex; path: string) =
+  var body: seq[byte] = @[]
+  let entries = dumpRTreeEntries(idx.tree)
+  writeU64(body, uint64(entries.len))
+  for (id, b) in entries:
+    writeU32(body, uint32(id.len))
+    writeStr(body, id)
+    writeF64(body, b.minX); writeF64(body, b.minY)
+    writeF64(body, b.maxX); writeF64(body, b.maxY)
+  writeU64(body, uint64(idx.polygons.len))
+  for id, poly in idx.polygons:
+    writeU32(body, uint32(id.len))
+    writeStr(body, id)
+    writeU32(body, uint32(poly.vertices.len))
+    for (x, y) in poly.vertices:
+      writeF64(body, x); writeF64(body, y)
+  let crc = griFnv1a32(body)
+  var out2: seq[byte] = @[]
+  writeStr(out2, GriMagic)
+  writeU32(out2, GriVersion)
+  writeU32(out2, GriKindPolygon)
+  for b in body: out2.add(b)
+  writeU32(out2, crc)
+  let tmp = path & ".tmp"
+  writeFile(tmp, cast[string](out2))
+  moveFile(tmp, path)
+
+proc loadIndexFile(path: string; expectedKind: uint32): (bool, seq[(string, BBox)], Table[string, Polygon]) =
+  ## Reads the file and validates magic / version / kind / CRC.
+  ## Returns (ok, entries, polygons). polygons is empty for geo-point indexes.
+  if not fileExists(path):
+    return (false, @[], initTable[string, Polygon]())
+  let raw = cast[seq[byte]](readFile(path))
+  if raw.len < GriMagic.len + 4 + 4 + 4: return (false, @[], initTable[string, Polygon]())
+  var r = ByteReader(buf: raw, off: 0)
+  let magic = readStr(r, GriMagic.len)
+  if magic != GriMagic: return (false, @[], initTable[string, Polygon]())
+  let ver = readU32(r)
+  if ver != GriVersion: return (false, @[], initTable[string, Polygon]())
+  let kind = readU32(r)
+  if kind != expectedKind: return (false, @[], initTable[string, Polygon]())
+  let bodyStart = r.off
+  if raw.len < bodyStart + 4: return (false, @[], initTable[string, Polygon]())
+  let bodyEnd = raw.len - 4
+  let body = raw[bodyStart ..< bodyEnd]
+  let crcStored = (uint32(raw[bodyEnd])) or
+                  (uint32(raw[bodyEnd + 1]) shl 8) or
+                  (uint32(raw[bodyEnd + 2]) shl 16) or
+                  (uint32(raw[bodyEnd + 3]) shl 24)
+  if griFnv1a32(body) != crcStored:
+    return (false, @[], initTable[string, Polygon]())
+  var entries: seq[(string, BBox)] = @[]
+  var polys = initTable[string, Polygon]()
+  var br = ByteReader(buf: body, off: 0)
+  try:
+    let entryCount = int(readU64(br))
+    for _ in 0 ..< entryCount:
+      let idLen = int(readU32(br))
+      let id = readStr(br, idLen)
+      let b = BBox(minX: readF64(br), minY: readF64(br),
+                   maxX: readF64(br), maxY: readF64(br))
+      entries.add((id, b))
+    if kind == GriKindPolygon:
+      let polyCount = int(readU64(br))
+      for _ in 0 ..< polyCount:
+        let idLen = int(readU32(br))
+        let id = readStr(br, idLen)
+        let vc = int(readU32(br))
+        var p = Polygon(vertices: @[])
+        for _ in 0 ..< vc:
+          p.vertices.add((readF64(br), readF64(br)))
+        polys[id] = p
+  except IOError:
+    return (false, @[], initTable[string, Polygon]())
+  (true, entries, polys)
+
+proc tryLoadGeoIndex*(idx: GeoIndex; path: string): bool =
+  let (ok, entries, _) = loadIndexFile(path, GriKindGeo)
+  if not ok: return false
+  idx.tree.bulkLoad(entries)
+  true
+
+proc tryLoadPolygonIndex*(idx: PolygonIndex; path: string): bool =
+  let (ok, entries, polys) = loadIndexFile(path, GriKindPolygon)
+  if not ok: return false
+  idx.tree.bulkLoad(entries)
+  idx.polygons = polys
+  true
