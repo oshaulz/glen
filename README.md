@@ -448,22 +448,23 @@ atomicArc has no functional downside. Single-threaded callers can keep
 
 ## Performance
 
-Apple M5, `-d:release`, ORC + `-O3`.
+Apple M5, `-d:release`, ORC + `-O3`. Reproduce with the corresponding `nimble`
+task; numbers are best-of-a-few-runs for stability.
 
-**Single-threaded** (`nimble bench_release`):
+### Core CRUD (`nimble bench_release`)
 
 ```
-BENCH puts:               270k ops/s
-BENCH gets (cloned):      1.67M ops/s
-BENCH gets (borrowed):    20M ops/s
-BENCH getMany:            28k batches/s  ×100 docs ≈ 2.8M doc reads/s
-BENCH txn commits:        333k ops/s
+puts:                270k ops/s
+gets (cloned):       1.67M ops/s
+gets (borrowed):     20M ops/s
+getMany:             28k batches/s  ×100 docs ≈ 2.8M doc reads/s
+txn commits:         333k ops/s
 ```
 
 The borrowed-read path skips the defensive `clone()` and is appropriate for
 read-only hot loops. Use it where you can.
 
-**Multi-threaded contention** (`nimble bench_concurrent`, atomicArc + `-d:useMalloc`):
+### Multi-threaded contention (`nimble bench_concurrent`, atomicArc + `-d:useMalloc`)
 
 ```
 disjoint-write-only   4w/0r ×50k =>  214k ops/s   (low stripe contention)
@@ -472,6 +473,76 @@ shared-write-only     4w/0r ×50k =>  174k ops/s   (max stripe contention)
 shared-mixed-rw       4w/4r ×50k =>  406k ops/s
 read-heavy-shared     1w/8r ×50k =>  2.1M ops/s
 ```
+
+### Geospatial (`nimble bench_geo`)
+
+Raw R-tree (in-memory, no GlenDB):
+
+```
+bulkLoad (STR):    100k entries  =>  1.6M entries/s
+bulkLoad (STR):     1M entries   =>  2.3M entries/s
+insert (Guttman): 100k ops       =>  1.9M ops/s
+searchBBox (5°):   10k queries   =>  345k q/s   (100k pts, ~159 hits/query)
+searchBBox (5°):    1k queries   =>   30k q/s   (1M pts, ~1592 hits/query)
+nearest k=10:      10k queries   =>  123k q/s
+nearestGeo k=10:   10k queries   =>   93k q/s   (haversine bbox lower-bound)
+```
+
+GlenDB-integrated geo index (100k docs):
+
+```
+put (no index):                   255k docs/s
+createGeoIndex (STR bulk-build):  862k docs/s    (just builds the tree)
+put (with active geo index):      242k docs/s    (~5% overhead vs no index)
+findWithinRadius 100km:            69k q/s
+findNearest planar k=10:           63k q/s
+findNearest geographic k=10:       55k q/s
+```
+
+Polygons (50k docs, ~3°-square axis-aligned shapes):
+
+```
+put polygons:                     99k docs/s
+createPolygonIndex (STR):        943k docs/s
+findPolygonsContaining:           46k q/s        (R-tree prefilter + ray-cast)
+```
+
+Index persistence:
+
+```
+reopen with .gri present:        765 ms          (load + WAL replay)
+compact (snapshot + .gri dump):  182 ms
+reopen with corrupt .gri:        411 ms          (CRC fail → bulk-rebuild)
+```
+
+### Time-series (`nimble bench_timeseries`)
+
+Gorilla scalar TSDB, 1M samples per series:
+
+| Value pattern | Append rate | Bits/sample on disk |
+|---|---|---|
+| Constant | **67M samples/s** | 2.11 |
+| Regular cadence | 19M samples/s | 14.13 |
+| Smooth (sin) | 4.6M samples/s | 59.60 |
+| Noisy | 4.6M samples/s | 59.28 |
+
+```
+open (scan all chunk headers):   9 ms for 1M-sample file
+range (random window):           940 q/s         (avg 546 samples returned)
+latest n=100:                    15k q/s
+latest n=1000:                   1k q/s          (decodes ≈1 chunk per call)
+```
+
+Tile time-stack (radar-shaped sparse field):
+
+| Geometry | Append | Compression | bits/cell | Point-history | readFrame |
+|---|---|---|---|---|---|
+| 200×200, 200 frames | 2941 frames/s | **24.9×** | 2.57 | 241 q/s | 82 q/s |
+| 512×512, 64 frames | 424 frames/s | 21.2× | 3.02 | 154 q/s | 19 q/s |
+
+`readPointHistory` is the workload tile-stacking exists for — it touches one
+tile only. `readFrame` reassembles every tile and is the slow path by design;
+use frame-per-doc + GeoMesh for "show me the latest scan".
 
 ---
 

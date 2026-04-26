@@ -49,6 +49,12 @@ task test_release, "Run test suite (release, ORC, O3)":
 task bench_release, "Run only benchmark (release, ORC, O3)":
   exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench.nim"
 
+task bench_geo, "Geospatial / R-tree benchmarks (release, ORC, O3)":
+  exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench_geo.nim"
+
+task bench_timeseries, "Time-series + tilestack benchmarks (release, ORC, O3)":
+  exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench_timeseries.nim"
+
 task bench_concurrent, "Run multi-threaded contention benchmark (release, atomicArc, O3)":
   # atomicArc gives thread-safe refcounting (Glen's Value graph is acyclic so
   # we don't need ORC's cycle collector, which is not thread-safe).
