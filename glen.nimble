@@ -1,5 +1,5 @@
 # Glen document database nimble spec
-version       = "0.1.0"
+version       = "0.3.0"
 author        = "Glen"
 description   = "Glen: A wickedly fast embedded document database with subscriptions and transactions"
 license       = "MIT"
@@ -27,7 +27,8 @@ const testFiles = @[
   "tests/test_soak.nim",
   "tests/test_soak_index.nim",
   "tests/test_multimaster.nim",
-  "tests/test_bench.nim"
+  "tests/test_bench.nim",
+  "tests/test_validators.nim"
 ]
 
 task test, "Run test suite":
@@ -40,6 +41,12 @@ task test_release, "Run test suite (release, ORC, O3)":
 
 task bench_release, "Run only benchmark (release, ORC, O3)":
   exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench.nim"
+
+task bench_concurrent, "Run multi-threaded contention benchmark (release, atomicArc, O3)":
+  # atomicArc gives thread-safe refcounting (Glen's Value graph is acyclic so
+  # we don't need ORC's cycle collector, which is not thread-safe).
+  # -d:useMalloc avoids Nim's per-thread heap for cross-thread allocations.
+  exec "nim c -r -d:release -d:useMalloc --mm:atomicArc --passC:-O3 --threads:on --path:src tests/test_bench_concurrent.nim"
 
 task docs, "Generate API docs":
   exec "nim doc --project --outdir:docs --path:src src/glen/glen.nim"

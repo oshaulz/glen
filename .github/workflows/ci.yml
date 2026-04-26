@@ -2,26 +2,43 @@ name: CI
 
 on:
   push:
+    branches: [master, main, smartcheck]
   pull_request:
 
 jobs:
   test:
+    name: test (${{ matrix.os }} / Nim ${{ matrix.nim }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        nim: [1.6.14, 2.2.4]
+        os: [ubuntu-latest, macos-latest]
+        nim: ['2.0.10', '2.2.4']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nim
-        uses: jiro4989/setup-nim-action@v1
+        uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: ${{ matrix.nim }}
-      - name: Install deps
-        run: |
-          nimble -y refresh
-      - name: Run tests
-        run: |
-          nimble test_release -y
+      - name: Refresh nimble
+        run: nimble -y refresh
+      - name: Run release test suite
+        run: nimble test_release -y
 
+  bench-concurrent:
+    name: concurrent bench smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.4'
+      - name: Refresh nimble
+        run: nimble -y refresh
+      - name: Run concurrent benchmark (compiles + executes; numbers are informational)
+        run: nimble bench_concurrent -y

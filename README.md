@@ -1,361 +1,356 @@
 # Glen
 
-Glen is a wickedly fast embedded in-memory document database written in Nim. It offers:
-
-- Convex-like rich value types
-- Durable write-ahead log with per-record checksums and segment headers
-- Atomic snapshots (temp file + rename) and manual compaction with WAL truncation
-- Dynamic adaptive LRU caching layer
-- Sharded LRU cache with per-shard locks and tunable capacity/shards
-- Optimistic multi-document transactions (CommitResult status on commit)
-- Fine-grained subscriptions to specific documents (collection + id)
-- Compact binary codec with bounds checks
-- Indexing and queries:
-  - Equality indexes (single-field and composite keys)
-  - Range scans (single-field), orderBy (asc/desc), and limit
-  - Ordered keys backed by CritBitTree for O(log n) maintenance and efficient range scans
-
-> Status: Stable Beta (0.2.0) — Still a WIP
-
-## Roadmap
-
-1. Auto-compaction policy
-2. Advanced query & indexing (filters, projections, pagination/cursors)
-3. Secondary indexes
-4. Replication
-
-## License
-MIT
-
-## Quick start
+An embedded document database for Nim — durable, concurrent, and built for low-latency in-process workloads.
 
 ```nim
-import glen/types, glen/db
-
 let db = newGlenDB("./mydb")
 db.put("users", "u1", VObject())
 echo db.get("users", "u1")
-
-let t = db.beginTxn()
-t.stagePut(Id(collection: "users", docId: "u2", version: 0'u64), VString("Alice"))
-let res = db.commit(t)
-echo res.status
 ```
 
-## Examples
+> **Status:** beta (0.3.0). The on-disk format is versioned (WAL v2, snapshot v1) and tested across reopen / replay / replication. Expect minor API churn until 1.0.
+
+---
+
+## What you get
+
+| Capability | Details |
+|---|---|
+| **Storage** | Per-collection snapshots + segmented WAL with FNV-1a record checksums and `GLENWAL2` headers |
+| **Recovery** | Snapshots loaded first, then WAL replayed; corrupt segment tails are tolerated |
+| **Cache** | Sharded LRU with per-shard locks, byte-budgeted, hot-touch promotion |
+| **Concurrency** | Striped per-collection RW-locks; multi-collection transactions acquire stripes in sorted order to avoid deadlock |
+| **Transactions** | Optimistic, version-checked at commit; `csOk` / `csConflict` / `csInvalid` results |
+| **Indexes** | Single-field equality, composite equality, single-field range scans (CritBitTree backing, asc/desc, limit) |
+| **Subscriptions** | Document-level, field-path, and field-delta callbacks; stream-encodable for IPC |
+| **Replication** | Multi-master, transport-agnostic; HLC last-write-wins; per-peer cursors persisted to `peers.state` |
+| **Validation** | Zod-style schema DSL — `zString().minLen(...)`, `zInt().gte(...)`, `zEnum(...)`, `zobject:` blocks |
+| **Codec** | Compact tagged binary, varuint + zigzag, configurable size limits |
+
+No external runtime dependencies. Pure Nim ≥ 1.6.
+
+---
+
+## Install
+
+```
+nimble install https://github.com/oshaulz/glen
+```
+
+or, in your `.nimble`:
+
+```nim
+requires "glen >= 0.2.0"
+```
+
+---
+
+## Quick tour
 
 ### CRUD
 
 ```nim
-import glen/types, glen/db
+import glen/glen, glen/types, glen/db
 
 let db = newGlenDB("./mydb")
 
-var user = VObject()
-user["name"] = VString("Alice")
-user["age"] = VInt(30)
+var alice = VObject()
+alice["name"] = VString("Alice")
+alice["age"]  = VInt(30)
 
-db.put("users", "u1", user)
-echo db.get("users", "u1")           # {age: 30, name: "Alice"}
+db.put("users", "u1", alice)
+echo db.get("users", "u1")          # {age: 30, name: "Alice"}
 
 db.delete("users", "u1")
-echo db.get("users", "u1") == nil     # true
+assert db.get("users", "u1").isNil
 
-# Batch writes to reduce lock overhead
+# Batch — single lock acquisition, batched WAL append
 db.putMany("users", @[("u2", VString("a")), ("u3", VString("b"))])
-db.deleteMany("users", @["u2", "u3"]) 
+db.deleteMany("users", @["u2", "u3"])
 ```
 
-### Transactions (optimistic)
+### Borrowed reads (zero-copy)
+
+`get` clones the returned value so callers can't tamper with cached state. When that clone is wasted — read-only hot loops — use the borrowed variants:
 
 ```nim
-import glen/types, glen/db, glen/txn
-
-let db = newGlenDB("./mydb")
-db.put("items", "i1", VString("old"))
-
-let t = db.beginTxn()
-discard db.get("items", "i1", t)       # record read version
-t.stagePut(Id(collection: "items", docId: "i1", version: 0'u64), VString("new"))
-let res = db.commit(t)                    # CommitResult
-echo res.status                           # csOk or csConflict
-
-```
-### Borrowed reads (no clone)
-
-Borrowed variants return shared references for performance. Do not mutate the returned `Value`. Ideal for read-only hot paths.
-
-```nim
-let vRef = db.getBorrowed("users", "u1")
-for (id, v) in db.getBorrowedMany("users", @[["u1", "u2"]]): discard
+let v = db.getBorrowed("users", "u1")        # do not mutate v
+for (id, v) in db.getBorrowedMany("users", @["u1", "u2"]): discard
 for (id, v) in db.getBorrowedAll("users"): discard
 ```
+
+### Optimistic transactions
+
+```nim
+import glen/txn
+
+let t = db.beginTxn()
+discard db.get("items", "i1", t)     # records the read version
+t.stagePut(Id(collection: "items", docId: "i1"), VString("updated"))
+
+let res = db.commit(t)
+case res.status
+of csOk:       echo "applied"
+of csConflict: echo "version moved under us — retry"
+of csInvalid:  echo res.message
+```
+
+Transactions spanning multiple collections lock all touched stripes write-exclusively in sorted order — no deadlock, no cross-collection skew.
+
+### Indexes and queries
+
+```nim
+db.createIndex("users", "byName",    "name")          # equality
+db.createIndex("users", "byNameAge", "name,age")      # composite equality
+db.createIndex("users", "byAge",     "age")           # rangeable
+
+for (id, _) in db.findBy("users", "byName", VString("Alice"), limit = 10):
+  echo id
+
+# Composite equality
+for (id, _) in db.findBy("users", "byNameAge",
+    VArray(@[VString("Alice"), VInt(30)])):
+  echo id
+
+# Range, ascending, inclusive bounds
+for (id, _) in db.rangeBy("users", "byAge",
+    minVal = VInt(25), maxVal = VInt(40),
+    inclusiveMin = true, inclusiveMax = true,
+    limit = 0, asc = true):
+  echo id
+```
+
 ### Subscriptions
 
+Three flavours, pick the granularity you need:
 
 ```nim
-import glen/types, glen/db
-
-let db = newGlenDB("./mydb")
+# Whole-document
 let h = db.subscribe("users", "u1", proc(id: Id; v: Value) =
-  echo "Update:", $id, " -> ", $v
-)
-db.put("users", "u1", VObject())
-db.unsubscribe(h)
+  echo "doc changed: ", id, " -> ", v)
+
+# Specific field path — fires only when that path's value differs (deep-eq)
+let hf = db.subscribeField("users", "u1", "profile.age",
+  proc(id: Id; path: string; oldV, newV: Value) =
+    echo path, ": ", oldV, " -> ", newV)
+
+# Field delta — string-aware: emits {kind: "append", added: " world"}
+# for incremental string growth, "set"/"replace"/"delete" otherwise
+let hd = db.subscribeFieldDelta("logs", "x1", "text",
+  proc(id: Id; path: string; delta: Value) = echo delta)
 ```
 
-### Snapshots and compaction
+Each variant has a `subscribe*Stream` companion that frames events into a `std/streams` Stream using the binary codec — handy for piping to a socket or IPC channel.
+
+### Schema validation
 
 ```nim
-import glen/db
-let db = newGlenDB("./mydb")
-db.snapshotAll()     # write all collections to snapshots
-db.compact()         # snapshot + truncate WAL
+import glen/validators
+
+let UserSchema = zobject:
+  name:   zString().trim().minLen(2).maxLen(64)
+  age:    zInt().gte(0).lte(150)
+  email:  zString().trim().minLen(3)
+  role:   zEnum(["admin", "member", "guest"]).default("member")
+  active: zBool().default(true)
+
+let res = UserSchema.parse(doc)
+if not res.ok:
+  for issue in res.issues:
+    echo describePath(issue.path), ": ", issue.message
+else:
+  db.put("users", id, doc)        # res.value also holds the coerced doc
 ```
 
-### Indexing and queries
+Validators coerce, fill defaults, and report path-tagged issues. There's no automatic gating on `put` — wrap your writes in a helper if you want every mutation validated (see `examples/crud_validated.nim`).
 
-Create an equality index, then query by value (with optional limit):
+### Multi-master replication
+
+Glen ships the data plane only — bring your own transport (HTTP, gRPC, NATS, files-on-a-USB-stick). Three primitives:
 
 ```nim
-import glen/types, glen/db
+# Sender
+let (nextCursor, batch) = db.exportChanges(
+  since = lastSentToPeer,
+  includeCollections = @["users", "orders"])    # optional allowlist
+# transport.send(peer, batch)
+db.setPeerCursor("peerB", nextCursor)            # persisted to peers.state
 
-let db = newGlenDB("./mydb")
-db.createIndex("users", "byName", "name")
-
-var u1 = VObject(); u1["name"] = VString("Alice"); db.put("users", "1", u1)
-var u2 = VObject(); u2["name"] = VString("Bob");   db.put("users", "2", u2)
-var u3 = VObject(); u3["name"] = VString("Alice"); db.put("users", "3", u3)
-
-for (id, v) in db.findBy("users", "byName", VString("Alice"), 10):
-  echo id, " -> ", v
+# Receiver — idempotent (changeId) + LWW (HLC)
+db.applyChanges(received)
 ```
 
-Composite keys and range scans with order and limit:
+Conflict resolution uses a hybrid logical clock: `(wallMillis, counter, nodeId)`. After receiving a remote change Glen advances its local HLC, so future writes always sort after the freshest thing it's seen.
 
-```nim
-import glen/types, glen/db
+`gcReplLog()` trims the in-memory change log up to `min(peerCursors)` — call it periodically once peers have ack'd.
 
-let db = newGlenDB("./mydb")
-db.createIndex("users", "byNameAge", "name,age")   # composite equality
-db.createIndex("users", "byAge", "age")            # single-field, rangeable
+---
 
-var u1 = VObject(); u1["name"] = VString("Alice"); u1["age"] = VInt(30); db.put("users", "1", u1)
-var u2 = VObject(); u2["name"] = VString("Bob");   u2["age"] = VInt(25); db.put("users", "2", u2)
-var u3 = VObject(); u3["name"] = VString("Alice"); u3["age"] = VInt(35); db.put("users", "3", u3)
+## Persistence model
 
-# composite equality
-for (id, _) in db.findBy("users", "byNameAge", VArray(@[VString("Alice"), VInt(30)])):
-  echo id   # 1
-
-# range scan by age (ascending)
-for (id, _) in db.rangeBy("users", "byAge", VInt(26), VInt(40), true, true, 0, true):
-  echo id   # 1, 3
-
-# descending with limit
-for (id, _) in db.rangeBy("users", "byAge", VInt(0), VInt(40), true, true, 2, false):
-  echo id   # 3, 1
+```
+mydb/
+├── glen.wal.0          ← active append-only segment
+├── glen.wal.1
+├── users.snap          ← per-collection snapshot
+├── orders.snap
+├── node.id             ← stable node identifier (auto-generated)
+└── peers.state         ← persisted per-peer replication cursors
 ```
 
-### Safe getters and typed accessors
+**Recovery order on `newGlenDB`:**
+1. Load every `*.snap` into the in-memory tables.
+2. Replay every WAL segment in order, applying puts/deletes and rebuilding indexes.
+3. Restore replication metadata (HLC, changeId per doc) so LWW conflict resolution stays correct across restarts.
+
+**Compaction.** `db.compact()` writes a fresh snapshot for each collection and resets the WAL to segment 0. Snapshot writes are atomic — temp file + `rename(2)` (POSIX) or temp + remove + move (Windows).
+
+### WAL sync policies
+
+| Mode | Behaviour | Use when |
+|---|---|---|
+| `wsmAlways` | `flushFile` after every record | strict durability, low write rate |
+| `wsmInterval` *(default)* | flush every `flushEveryBytes` (default 8 MiB) | typical workloads |
+| `wsmNone` | rely on the OS page cache | bulk imports, throwaway databases |
 
 ```nim
-import glen/types
-var o = VObject()
-o["b"] = VBool(true)
-o["n"] = VInt(7)
-o["s"] = VString("x")
-
-discard o.hasKey("b")               # true
-echo o.getOrNil("missing") == nil   # true
-echo o.getOrDefault("missing", VString("def")).toStringOpt().get()  # def
-echo o["n"].toIntOpt().get()        # 7
+let db = newGlenDB("./mydb", walSync = wsmInterval, walFlushEveryBytes = 8 * 1024 * 1024)
+db.setWalSync(wsmAlways)        # change at runtime
 ```
 
-## Durability
+---
 
-- Write-Ahead Log with per-record checksums and segment headers (magic + version)
-- Snapshot files are written atomically (temp-file + rename) with best-effort directory flush on Windows
-- Recovery: load snapshots first, then replay WAL segments until the tail
+## Configuration
 
-### WAL sync policy (durability vs throughput)
+Most knobs are constructor args, but everything also reads from environment variables for ops that don't want to recompile:
 
-By default Glen uses interval flushing for better throughput. You can tune this:
-
-- `wsmAlways`: flush every WAL append (most durable, slowest).
-- `wsmInterval` (default): batch fsyncs based on a byte threshold.
-- `wsmNone`: rely on OS page cache (fastest, least durable).
-
-Usage:
-
-```nim
-import glen/db, glen/wal
-
-let db = newGlenDB("./mydb", walSync = wsmInterval)      # interval policy
-db.setWalSync(wsmInterval, flushEveryBytes = 8 * 1024 * 1024)   # 8 MiB batches
-
-# Or via environment variables and helper:
-# set GLEN_WAL_SYNC=interval
-# set GLEN_WAL_FLUSH_BYTES=8388608
-# set GLEN_CACHE_CAP_BYTES=67108864
-# set GLEN_CACHE_SHARDS=16
-let db2 = newGlenDBFromEnv("./mydb2")
-
-### Concurrency (striped locks)
-
-Glen uses striped read/write locks per collection to reduce contention under mixed workloads. You can tune the stripe count:
+| Env var | Default | Maps to |
+|---|---|---|
+| `GLEN_NODE_ID` | random | stable replication node identity |
+| `GLEN_WAL_SYNC` | `interval` | `always` / `interval` / `none` |
+| `GLEN_WAL_FLUSH_BYTES` | 8 MiB | bytes between fsyncs in `interval` mode |
+| `GLEN_CACHE_CAP_BYTES` | 64 MiB | total LRU budget |
+| `GLEN_CACHE_SHARDS` | 16 | LRU shard count (per-shard locks) |
+| `GLEN_MAX_STRING_OR_BYTES` | 16 MiB | codec safety cap |
+| `GLEN_MAX_ARRAY_LEN` | 1,000,000 | codec safety cap |
+| `GLEN_MAX_OBJECT_FIELDS` | 1,000,000 | codec safety cap |
 
 ```nim
-let db = newGlenDB("./mydb", cacheCapacity = 128*1024*1024, cacheShards = 32, lockStripesCount = 32)
+let db = newGlenDBFromEnv("./mydb")    # reads all of the above
 ```
 
-Transactions spanning multiple collections lock the needed stripes in a fixed order to avoid deadlocks.
-**Note: On Windows, directory metadata is flushed when new WAL segments or snapshots are created. On POSIX, standard file flush is used.**
+### Tuning
 
-## Multi-Master Replication (see multi-comm branch)
+- **Stripe count** (`lockStripesCount`, default 32): bump if you have a lot of collections accessed in parallel and write contention dominates.
+- **Cache shards** (`cacheShards`): set ≥ number of writer threads to minimise per-shard contention.
+- **Cache capacity**: Glen estimates value byte-size and evicts LRU-style; size it at 1–2× your hot working set.
 
-Glen provides a transport-agnostic API for multi-master sync. You wire the transport; Glen handles filtering, idempotency, and conflict resolution (HLC-based LWW).
+### Concurrency notes
 
-- Change export (filterable):
-  - `exportChanges(sinceCursor, includeCollections = @[], excludeCollections = @[]) -> (nextCursor, changes)`
-  - If `includeCollections` is non-empty, only those are sent. Collections in `excludeCollections` are omitted.
-- Apply changes (idempotent, LWW):
-  - `applyChanges(changes)` updates local state, indexes, cache, and fires subscriptions.
-- Node identity (optional):
-  - Set `GLEN_NODE_ID` to a stable node id; otherwise one is generated.
+A single `GlenDB` is safe to share across threads. Concurrent writes to
+different collections, concurrent first-writes to brand-new collections,
+and concurrent `createIndex`/`put` on disjoint collections are all fine —
+Glen wraps per-collection state in a ref behind a struct-rwlock.
 
-Minimal flow (peer-to-peer):
+The one build-time requirement: **compile multi-threaded callers with
+`--mm:atomicArc -d:useMalloc`.** ORC's default refcounter and cycle
+collector are not thread-safe across cross-thread Value refs and will
+crash in `unregisterCycle` at shutdown. Glen's value graph is acyclic, so
+atomicArc has no functional downside. Single-threaded callers can keep
+`--mm:orc` (the default).
 
-```nim
-# On sender (A)
-var cursorForB: uint64 = 0
-let (nextCursor, batch) = dbA.exportChanges(cursorForB, includeCollections = @("users"))  # you choose filters
-# send `batch` to B via your transport
+---
 
-# On receiver (B)
-dbB.applyChanges(batch)
-# On sender (A)
-cursorForB = nextCursor  # persist per-peer cursor
+## Performance
+
+Apple M5, `-d:release`, ORC + `-O3`.
+
+**Single-threaded** (`nimble bench_release`):
+
+```
+BENCH puts:               270k ops/s
+BENCH gets (cloned):      1.67M ops/s
+BENCH gets (borrowed):    20M ops/s
+BENCH getMany:            28k batches/s  ×100 docs ≈ 2.8M doc reads/s
+BENCH txn commits:        333k ops/s
 ```
 
-Bootstrap a new node (B):
-- Choose collections B wants; copy snapshots for those collections (or send a bulk dump).
-- Initialize B, load snapshots, then start tailing A with exportChanges from an agreed cursor using the same filters.
+The borrowed-read path skips the defensive `clone()` and is appropriate for
+read-only hot loops. Use it where you can.
 
-Topologies:
-- Full mesh or hub/spoke; keep one export cursor per peer. Changes can traverse multiple hops; duplicates are ignored and conflicts converge via LWW.
+**Multi-threaded contention** (`nimble bench_concurrent`, atomicArc + `-d:useMalloc`):
 
-## Binary formats
+```
+disjoint-write-only   4w/0r ×50k =>  214k ops/s   (low stripe contention)
+disjoint-mixed-rw     4w/4r ×50k =>  426k ops/s
+shared-write-only     4w/0r ×50k =>  174k ops/s   (max stripe contention)
+shared-mixed-rw       4w/4r ×50k =>  406k ops/s
+read-heavy-shared     1w/8r ×50k =>  2.1M ops/s
+```
 
-- Codec: tagged binary format (null/bool/int/float/string/bytes/array/object/id) with varuints and zigzag ints
-- Snapshot: varuint count, then (idLen|id|valueLen|valueBinary) repeated
+---
 
-### Streaming codec and runtime limits
+## Worked example: local-first todos
 
-Glen’s codec is available in two forms:
-
-- Buffer API: `encode(value): string` and `decode(string): Value`
-- Streaming API: `encodeTo(stream, value)` and `decodeFrom(stream)` (exported via `glen/codec_stream`).
-
-Runtime limits are configurable via environment variables (defaults in parentheses):
-
-- `GLEN_MAX_STRING_OR_BYTES` (16 MiB)
-- `GLEN_MAX_ARRAY_LEN` (1,000,000)
-- `GLEN_MAX_OBJECT_FIELDS` (1,000,000)
-
-Example:
+`examples/todo_sync.nim` is a small CLI that uses Glen's replication API to
+sync todos across two processes via a shared mailbox directory. Build it
+once, run it twice:
 
 ```bash
-set GLEN_MAX_STRING_OR_BYTES=33554432
-set GLEN_MAX_ARRAY_LEN=2000000
-set GLEN_MAX_OBJECT_FIELDS=2000000
+nim c -d:release --path:src examples/todo_sync.nim
+
+# terminal 1
+./examples/todo_sync --db ./node-a add "buy milk"
+./examples/todo_sync --db ./node-a add "ship glen 0.3"
+./examples/todo_sync --db ./node-a push ./mailbox
+
+# terminal 2
+./examples/todo_sync --db ./node-b pull ./mailbox
+./examples/todo_sync --db ./node-b list             # sees both todos
+./examples/todo_sync --db ./node-b complete <id>
+./examples/todo_sync --db ./node-b push ./mailbox
+
+# terminal 1 picks up the completion
+./examples/todo_sync --db ./node-a pull ./mailbox
+./examples/todo_sync --db ./node-a list
 ```
 
-Streaming usage:
+The mailbox is just a directory of `.batch` files containing
+codec-encoded change sets. `pull` is idempotent — running it twice
+applies nothing the second time, because every change carries a
+`changeId` that Glen recognises on apply.
 
-```nim
-import std/streams
-import glen/types, glen/codec_stream
+A second, smaller example with strict schema validation lives in
+`examples/crud_validated.nim`.
 
-var ss = newStringStream()
-encodeTo(ss, VArray(@[VInt(1), VString("x")]))
-ss.setPosition(0)
-let v = decodeFrom(ss)
-```
+## Architecture, in one paragraph
 
-### Streaming subscriptions
+A `GlenDB` is a `ref` holding `collection -> docId -> Value` tables under striped RW-locks, a sharded LRU cache fronting reads, a `WriteAheadLog` that owns the on-disk segment files, a `SubscriptionManager` keyed by `collection:docId`, and `IndexesByName` per collection backed by `CritBitTree` for ordered keys. Every mutation: assign a replication change record under `replLock` (incrementing seq + advancing local HLC), append to the WAL (write-ahead, before in-memory state), apply to the table, update indexes and cache, and finally fan out subscriptions outside the locks. Transactions defer all of this until `commit`, which acquires every touched stripe in sorted order, validates recorded read versions against current versions, and applies the staged writes batched into a single `appendMany` WAL call.
 
-You can stream document updates to any `Stream`. Each event is a Glen `Value` object encoded with the streaming codec and has fields: `collection`, `docId`, `version`, `value`.
-
-```nim
-import std/streams
-import glen/glen
-
-let db = newGlenDB("./mydb")
-var ss = newStringStream()
-let h = db.subscribe("users", "u1", proc (id: Id; v: Value) = discard)  # regular callback
-let hs = db.subs.subscribeStream("users", "u1", ss)                      # streaming
-
-db.put("users", "u1", VString("hi"))
-
-ss.setPosition(0)
-let ev = decodeFrom(ss)                   # => {collection:"users", docId:"u1", version:1, value:"hi"}
-
-db.unsubscribe(hs)
-```
-
-### Field-level subscriptions
-
-Subscribe to a single field path on a document. Callbacks fire only if that field’s value actually changes (deep equality):
-
-```nim
-import glen/glen
-
-let db = newGlenDB("./mydb")
-let h = db.subscribeField("users", "u1", "profile.age", proc(id: Id; path: string; oldV: Value; newV: Value) =
-  echo path, ": ", $oldV, " -> ", $newV
-)
-
-db.put("users", "u1", VObject())                # no event
-var u = VObject(); var p = VObject(); p["age"] = VInt(30); u["profile"] = p
-db.put("users", "u1", u)                         # profile.age: nil -> 30 (fires)
-
-db.unsubscribeField(h)
-```
-
-You can also stream field-level events to a `Stream` with `subscribeFieldStream`.
-
-#### Delta field subscriptions
-
-For large strings or frequently-growing values, subscribe to just the delta:
-
-```nim
-let h = db.subscribeFieldDelta("logs", "x1", "text", proc(id: Id; path: string; delta: Value) =
-  # delta is an object with { kind: "append"|"replace"|"delete"|"set", ... }
-  echo delta
-)
-
-var v = VObject(); v["text"] = VString("hello")
-db.put("logs", "x1", v)                      # {kind:"set", new:"hello"}
-v["text"] = VString("hello world")
-db.put("logs", "x1", v)                      # {kind:"append", added:" world"}
-
-db.unsubscribeFieldDelta(h)
-```
-
-Delta stream: `subscribeFieldDeltaStream` writes framed events with `{collection, docId, version, fieldPath, delta}`.
+---
 
 ## Testing
 
-Run the suite (debug):
+```
+nimble test            # debug, all 31 cases
+nimble test_release    # ORC + -O3
+nimble bench_release   # benchmarks only
+```
 
-```
-nimble test
-```
-Release/optimized run (ORC + O3):
+Suites cover: basic CRUD, WAL replay & corrupt-tail tolerance, snapshot round-trip, compaction, transactions, subscriptions (doc / field / field-delta / streaming), cache eviction, codec fuzzing, soak tests with periodic compaction-and-reopen, indexed soak under churn, multi-master export/apply with idempotency, LWW convergence, durability across reopen, filter include/exclude, and validator schemas.
 
-```
-nimble test_release
-nimble bench_release
-```
-Topic-specific tests are under `tests/`.
+---
+
+## Roadmap
+
+- Auto-compaction (size-based + time-based triggers)
+- Query layer: filters, projections, cursor pagination
+- Secondary derived indexes (computed fields)
+- Optional zstd page compression for snapshots
+- Native async transport adapters for replication
+
+---
+
+## License
+
+MIT. See `LICENSE`.

@@ -1,21 +1,49 @@
+# Nim build cache & compiler artefacts
 nimcache/
+nimblecache-*/
+
+# Native object / binary outputs
 *.o
 *.obj
 *.dll
 *.so
 *.dylib
 *.pdb
-nimblecache-*/
+*.exe
+*.dSYM/
+
+# OS
 .DS_Store
 Thumbs.db
+
+# Editor / tooling
 .vscode/
 .idea/
-*.exe
-exampledb/
+.claude/
+
+# Env
 .env
 .env.*
-docs/
-# Compiled Nim test executables (sources live under tests/*.nim)
+
+# Generated docs (nimble docs task)
+/docs/
+
+# Compiled Nim test binaries — keep *.nim sources, ignore executables.
 tests/test_*
 !tests/*.nim
 
+# Compiled example binaries. Each example file in examples/foo.nim produces
+# an executable at examples/foo with no extension. List them explicitly so
+# stray files in examples/ aren't hidden by a wildcard.
+/examples/basic
+/examples/crud_validated
+/examples/todo_sync
+
+# Glen on-disk databases created by examples & ad-hoc usage at the repo root.
+# Layout: glen.wal.<n>, <collection>.snap, node.id, peers.state.
+/exampledb/
+/crud_example_db/
+/glen.wal.*
+/*.snap
+/node.id
+/peers.state
