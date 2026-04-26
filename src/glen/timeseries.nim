@@ -397,9 +397,14 @@ proc range*(s: Series; fromMs, toMs: int64): seq[(int64, float64)] =
   for ci in 0 ..< s.blockIndex.len:
     let meta = s.blockIndex[ci]
     if meta.endTs < fromMs or meta.startTs > toMs: continue
-    for (ts, v) in s.decodedChunk(ci):
-      if ts >= fromMs and ts <= toMs:
-        result.add((ts, v))
+    let samples = s.decodedChunk(ci)
+    if meta.startTs >= fromMs and meta.endTs <= toMs:
+      # Whole chunk falls inside the window; skip per-sample bounds checks.
+      for sample in samples: result.add(sample)
+    else:
+      for (ts, v) in samples:
+        if ts >= fromMs and ts <= toMs:
+          result.add((ts, v))
   for (ts, v) in s.active:
     if ts >= fromMs and ts <= toMs:
       result.add((ts, v))

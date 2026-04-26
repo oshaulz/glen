@@ -8,7 +8,7 @@ db.put("users", "u1", VObject())
 echo db.get("users", "u1")
 ```
 
-> **Status:** beta (0.4.3). On-disk formats are versioned and tested across reopen / replay / replication: WAL v2, snapshot **v2** (with v1 read-back compat), GRI/GPI v1, GTS/TTS v1. Expect minor API churn until 1.0.
+> **Status:** beta (0.4.4). On-disk formats are versioned and tested across reopen / replay / replication: WAL v2, snapshot **v2** (with v1 read-back compat), GRI/GPI v1, GTS/TTS v1. Expect minor API churn until 1.0.
 
 ---
 
@@ -488,32 +488,37 @@ nearest k=10:      10k queries   =>  123k q/s
 nearestGeo k=10:   10k queries   =>   93k q/s   (haversine bbox lower-bound)
 ```
 
-GlenDB-integrated geo index (100k docs):
+GlenDB-integrated geo index, eager mode (100k docs):
 
 ```
-put (no index):                   255k docs/s
-createGeoIndex (STR bulk-build):  862k docs/s    (just builds the tree)
-put (with active geo index):      242k docs/s    (~5% overhead vs no index)
-findWithinRadius 100km:            69k q/s
-findNearest planar k=10:           63k q/s
-findNearest geographic k=10:       55k q/s
+put (no index):                   238k docs/s
+createGeoIndex (STR bulk-build):  813k docs/s
+put (with active geo index):      211k docs/s
+findWithinRadius 100km:            81k q/s
+findNearest planar k=10:           64k q/s
+findNearest geographic k=10:       28k q/s        (~2× slower than planar; trig-bound)
 ```
 
-Polygons (50k docs, ~3°-square axis-aligned shapes):
+Polygons, eager mode (50k docs, ~3°-square axis-aligned shapes):
 
 ```
-put polygons:                     99k docs/s
-createPolygonIndex (STR):        943k docs/s
-findPolygonsContaining:           46k q/s        (R-tree prefilter + ray-cast)
+put polygons:                    127k docs/s
+createPolygonIndex (STR):        893k docs/s
+findPolygonsContaining:           48k q/s        (R-tree prefilter + ray-cast)
 ```
 
 Index persistence:
 
 ```
-reopen with .gri present:        765 ms          (load + WAL replay)
-compact (snapshot + .gri dump):  182 ms
-reopen with corrupt .gri:        411 ms          (CRC fail → bulk-rebuild)
+reopen with .gri present:        866 ms          (load + WAL replay)
+compact (snapshot + .gri dump):  200 ms
+reopen with corrupt .gri:        475 ms          (CRC fail → bulk-rebuild)
 ```
+
+Read paths use a single `cs.snapshot.isNil` branch to dispatch between the
+inlined eager fast-path (one Table lookup) and the spill path (mmap + index
++ tombstone checks). In eager mode there's no measurable overhead vs the
+pre-spill code.
 
 ### Time-series (`nimble bench_timeseries`)
 

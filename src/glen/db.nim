@@ -194,32 +194,38 @@ proc evictColdDoc(cs: CollectionStore) =
   if victim.len > 0:
     cs.docs.del(victim)
 
-proc lookupDoc(cs: CollectionStore; docId: string): Value =
+proc lookupDoc(cs: CollectionStore; docId: string): Value {.inline.} =
+  ## Read with cache-fill on snapshot fault. Eager mode (no snapshot) collapses
+  ## to a single Table lookup — same hot path as before spillable mode landed.
   if cs.isNil: return nil
+  if cs.snapshot.isNil:
+    return if docId in cs.docs: cs.docs[docId] else: nil
   if docId in cs.deleted: return nil
   if docId in cs.docs: return cs.docs[docId]
-  if cs.snapshot.isNil: return nil
   result = loadDocFromMmap(cs.snapshot, docId)
   if not result.isNil:
     cs.docs[docId] = result
     if cs.hotDocCap > 0 and cs.docs.len > cs.hotDocCap:
       evictColdDoc(cs)
 
-proc lookupDocBypass(cs: CollectionStore; docId: string): Value =
+proc lookupDocBypass(cs: CollectionStore; docId: string): Value {.inline.} =
   ## Read variant that does NOT populate cs.docs. For bulk paths (getAll,
   ## index rebuild) where caching every doc would defeat the point of spill
-  ## mode and trash the hot working set.
+  ## mode and trash the hot working set. Eager mode (no snapshot) also takes
+  ## the single-Table-lookup fast path.
   if cs.isNil: return nil
+  if cs.snapshot.isNil:
+    return if docId in cs.docs: cs.docs[docId] else: nil
   if docId in cs.deleted: return nil
   if docId in cs.docs: return cs.docs[docId]
-  if cs.snapshot.isNil: return nil
   loadDocFromMmap(cs.snapshot, docId)
 
-proc hasDoc(cs: CollectionStore; docId: string): bool =
+proc hasDoc(cs: CollectionStore; docId: string): bool {.inline.} =
   if cs.isNil: return false
+  if cs.snapshot.isNil: return docId in cs.docs
   if docId in cs.deleted: return false
   if docId in cs.docs: return true
-  not cs.snapshot.isNil and docId in cs.snapshot.index
+  docId in cs.snapshot.index
 
 proc markDirty(cs: CollectionStore; docId: string) {.inline.} =
   cs.dirty.incl(docId)
@@ -1262,11 +1268,16 @@ proc createIndex*(db: GlenDB; collection: string; name: string; fieldPath: strin
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
   let idx = newIndex(name, fieldPath)
-  # Walk every doc, including snapshot-only ones in spill mode, without
-  # populating the hot table.
-  for id in allDocIds(cs):
-    let v = lookupDocBypass(cs, id)
-    if not v.isNil: idx.indexDoc(id, v)
+  if cs.snapshot.isNil:
+    # Eager fast path: direct iteration, matches pre-spill perf.
+    for id, v in cs.docs:
+      idx.indexDoc(id, v)
+  else:
+    # Spill path: walk every doc, including snapshot-only ones, without
+    # populating the hot table.
+    for id in allDocIds(cs):
+      let v = lookupDocBypass(cs, id)
+      if not v.isNil: idx.indexDoc(id, v)
   cs.indexes[name] = idx
   db.releaseStripeWrite(collection)
   db.addManifestEntry(IndexManifestEntry(
@@ -1291,13 +1302,17 @@ proc createGeoIndex*(db: GlenDB; collection: string; name: string; lonField, lat
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
   let gix = newGeoIndex(name, lonField, latField)
-  # In spill mode, materialise the full doc set (snapshot + in-memory) so
-  # bulkBuild sees every doc, then discard. Bypass the hot cache.
-  var allDocs = initTable[string, Value]()
-  for id in allDocIds(cs):
-    let v = lookupDocBypass(cs, id)
-    if not v.isNil: allDocs[id] = v
-  gix.bulkBuild(allDocs)
+  if cs.snapshot.isNil:
+    # Eager fast path: bulkBuild reads cs.docs directly.
+    gix.bulkBuild(cs.docs)
+  else:
+    # Spill path: materialise full doc set (snapshot + in-memory) once,
+    # bypass-loading any snapshot-only entries.
+    var allDocs = initTable[string, Value]()
+    for id in allDocIds(cs):
+      let v = lookupDocBypass(cs, id)
+      if not v.isNil: allDocs[id] = v
+    gix.bulkBuild(allDocs)
   cs.geoIndexes[name] = gix
   db.releaseStripeWrite(collection)
   db.addManifestEntry(IndexManifestEntry(
@@ -1394,11 +1409,14 @@ proc createPolygonIndex*(db: GlenDB; collection: string; name: string;
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
   let pix = newPolygonIndex(name, polygonField)
-  var allDocs = initTable[string, Value]()
-  for id in allDocIds(cs):
-    let v = lookupDocBypass(cs, id)
-    if not v.isNil: allDocs[id] = v
-  pix.bulkBuild(allDocs)
+  if cs.snapshot.isNil:
+    pix.bulkBuild(cs.docs)
+  else:
+    var allDocs = initTable[string, Value]()
+    for id in allDocIds(cs):
+      let v = lookupDocBypass(cs, id)
+      if not v.isNil: allDocs[id] = v
+    pix.bulkBuild(allDocs)
   cs.polygonIndexes[name] = pix
   db.releaseStripeWrite(collection)
   db.addManifestEntry(IndexManifestEntry(
