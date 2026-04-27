@@ -1,6 +1,6 @@
 # Glen DB high-level API
 
-import std/[os, tables, locks, strutils, streams, hashes, algorithm, parseutils, random, sets]
+import std/[os, tables, locks, strutils, streams, hashes, algorithm, parseutils, random, sets, atomics]
 import glen/types, glen/wal, glen/storage, glen/cache, glen/subscription, glen/txn
 import glen/rwlock
 import glen/index
@@ -80,6 +80,12 @@ type
     # Index manifest: persisted definitions of all indexes; rebuilt on open.
     indexManifestPath: string
     indexManifestLock: Lock
+    # Auto-compaction triggers (0 = off for each)
+    compactWalBytes*: int      # WAL byte threshold across all segments
+    compactIntervalMs*: int    # min ms between compactions
+    compactDirtyCount*: int    # sum of cs.dirty.len across collections
+    lastCompactMs: Atomic[int64]
+    compactInFlight: Atomic[int]   # 0 = idle, 1 = a compact is running
 
 # ---- Index manifest persistence ----
 #
@@ -298,7 +304,10 @@ proc newGlenDB*(dir: string;
                 lockStripesCount = 32;
                 spillableMode = false;
                 hotDocCap = 0;
-                maxDirtyDocs = 0): GlenDB =
+                maxDirtyDocs = 0;
+                compactWalBytes = 0;
+                compactIntervalMs = 0;
+                compactDirtyCount = 0): GlenDB =
   ## `spillableMode = true` opens any existing snapshot v2 file via mmap and
   ## defers loading docs until they're touched. Combined with `hotDocCap > 0`,
   ## cold non-dirty docs are evicted from RAM under pressure and faulted back
@@ -319,8 +328,13 @@ proc newGlenDB*(dir: string;
     subs: newSubscriptionManager(),
     replSeq: 0,
     replLog: @[],
-    replLogByCollection: initTable[string, seq[(uint64, ReplChange)]]()
+    replLogByCollection: initTable[string, seq[(uint64, ReplChange)]](),
+    compactWalBytes: compactWalBytes,
+    compactIntervalMs: compactIntervalMs,
+    compactDirtyCount: compactDirtyCount
   )
+  result.lastCompactMs.store(nowMillis())
+  result.compactInFlight.store(0)
   initLock(result.replLock)
   initLock(result.indexManifestLock)
   initRwLock(result.structLock)
@@ -876,6 +890,8 @@ proc getAll*(db: GlenDB; collection: string; t: Txn): seq[(string, Value)] =
 
 ## Upsert a document value. Appends to WAL, updates in-memory state, versions,
 ## cache, and notifies subscribers.
+proc maybeAutoCompact*(db: GlenDB)
+
 proc put*(db: GlenDB; collection, docId: string; value: Value) =
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
@@ -916,6 +932,7 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
+  db.maybeAutoCompact()
 
 ## Delete a document if it exists. Appends a delete to WAL, removes from
 ## in-memory state and cache, bumps the version, and notifies subscribers.
@@ -959,6 +976,7 @@ proc delete*(db: GlenDB; collection, docId: string) =
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
+  db.maybeAutoCompact()
 
 # Transaction support
 ## Begin a new transaction (optimistic).
@@ -1092,6 +1110,7 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
+  db.maybeAutoCompact()
   return CommitResult(status: csOk)
 
 ## Subscribe to updates for a specific (collection, docId). Returns a handle
@@ -1186,6 +1205,7 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
+  db.maybeAutoCompact()
 
 ## Batch delete: delete multiple documents under one write lock, batch WAL appends.
 proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
@@ -1245,6 +1265,7 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
+  db.maybeAutoCompact()
 
 # Snapshot trigger (simple: write all collections)
 ## Write snapshots for all collections to durable storage.
@@ -1516,6 +1537,65 @@ proc rangeBy*(db: GlenDB; collection: string; indexName: string; minVal, maxVal:
 # Compaction: snapshot all collections and truncate WAL
 ## Snapshot all collections and truncate the WAL so that recovery can start
 ## from the snapshots and a fresh log.
+proc countDirtyAcrossCollections(db: GlenDB): int =
+  acquireRead(db.structLock)
+  defer: releaseRead(db.structLock)
+  result = 0
+  for _, cs in db.collections:
+    result += cs.dirty.len
+
+proc maybeAutoCompact*(db: GlenDB) =
+  ## Check the configured auto-compact triggers and run compact() if any of
+  ## them has crossed its threshold. Safe to call from any mutation site
+  ## *after* the per-collection stripe locks have been released; calling it
+  ## while holding a stripe write lock would deadlock since compact() needs
+  ## all stripes. Re-entrancy guard prevents recursive compaction.
+  if db.compactWalBytes <= 0 and
+     db.compactIntervalMs <= 0 and
+     db.compactDirtyCount <= 0:
+    return
+  # Acquire the in-flight slot. If another thread (or a recursive call from
+  # inside compact's own bookkeeping) is already running, skip silently.
+  var expected: int = 0
+  if not db.compactInFlight.compareExchange(expected, 1):
+    return
+  defer: db.compactInFlight.store(0)
+  var fire = false
+  if db.compactWalBytes > 0 and db.wal != nil:
+    if db.wal.totalSize() >= db.compactWalBytes:
+      fire = true
+  if not fire and db.compactIntervalMs > 0:
+    let elapsed = nowMillis() - db.lastCompactMs.load()
+    if elapsed >= int64(db.compactIntervalMs):
+      fire = true
+  if not fire and db.compactDirtyCount > 0:
+    if db.countDirtyAcrossCollections() >= db.compactDirtyCount:
+      fire = true
+  if not fire: return
+  # Bypass the in-flight guard: compact() itself doesn't call maybeAutoCompact.
+  db.acquireAllStripesWrite()
+  defer: db.releaseAllStripesWrite()
+  acquireRead(db.structLock)
+  var pairs: seq[(string, CollectionStore)] = @[]
+  for name, cs in db.collections:
+    pairs.add((name, cs))
+  releaseRead(db.structLock)
+  for (name, cs) in pairs:
+    let docs = if cs.snapshot.isNil: cs.docs else: materializeAllDocs(cs)
+    writeSnapshotV3(db.dir, name, docs)
+    for idxName, gix in cs.geoIndexes:
+      dumpGeoIndex(gix, geoIndexFilePath(db.dir, name, idxName))
+    for idxName, pix in cs.polygonIndexes:
+      dumpPolygonIndex(pix, polygonIndexFilePath(db.dir, name, idxName))
+    if not cs.snapshot.isNil:
+      closeSnapshotMmap(cs.snapshot)
+      cs.snapshot = openSnapshotMmap(db.dir, name)
+      cs.dirty.clear()
+      cs.deleted.clear()
+  if db.wal != nil:
+    db.wal.reset()
+  db.lastCompactMs.store(nowMillis())
+
 proc compact*(db: GlenDB) =
   db.acquireAllStripesWrite()
   defer: db.releaseAllStripesWrite()
@@ -1549,6 +1629,7 @@ proc compact*(db: GlenDB) =
   # Reset WAL after snapshot to start a new, empty log
   if db.wal != nil:
     db.wal.reset()
+  db.lastCompactMs.store(nowMillis())
 
 # Close database resources
 ## Close database resources (WAL file handles, snapshot mmaps).
@@ -1585,7 +1666,10 @@ proc newGlenDBFromEnv*(dir: string): GlenDB =
     cacheCapacity = cfg.cacheCapacityBytes,
     cacheShards = cfg.cacheShards,
     walSync = mode,
-    walFlushEveryBytes = cfg.walFlushEveryBytes
+    walFlushEveryBytes = cfg.walFlushEveryBytes,
+    compactWalBytes = cfg.compactWalBytes,
+    compactIntervalMs = cfg.compactIntervalMs,
+    compactDirtyCount = cfg.compactDirtyCount
   )
 
 # -------- Streaming iterators --------
@@ -2012,4 +2096,5 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
     db.subs.notify(it[0], it[1])
   for it in fieldNotifications:
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
+  db.maybeAutoCompact()
 
