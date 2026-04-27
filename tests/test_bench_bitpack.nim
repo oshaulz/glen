@@ -117,7 +117,7 @@ proc main() =
     let (payload, bitLen) = encodeXorStream(xs)
     echo "smooth(4096):              encoded ", payload.len, " B / ", bitLen, " bits = ",
       formatFloat(bitLen.float64 / float64(n), ffDecimal, 2), " bits/value"
-    discard timed("decodeXor smooth(4096)", 5_000, (let _ = decodeXorStream(payload, bitLen, n); discard))
+    discard timed("decodeXor smooth(4096)", 20_000, (let _ = decodeXorStream(payload, bitLen, n); discard))
   block:
     let n = 4096
     let xs = constFloats(n)
@@ -133,7 +133,7 @@ proc main() =
     let (payload, bitLen) = encodeXorStream(xs)
     echo "noisy(4096):               encoded ", payload.len, " B / ", bitLen, " bits = ",
       formatFloat(bitLen.float64 / float64(n), ffDecimal, 2), " bits/value"
-    discard timed("decodeXor noisy(4096)", 5_000, (let _ = decodeXorStream(payload, bitLen, n); discard))
+    discard timed("decodeXor noisy(4096)", 20_000, (let _ = decodeXorStream(payload, bitLen, n); discard))
 
   echo ""
   echo "------- decodeDoD (timestamps) -------"
@@ -148,7 +148,7 @@ proc main() =
     let (payload, bitLen) = encodeDoDStream(ts)
     echo "irregular(4096):           encoded ", payload.len, " B / ", bitLen, " bits = ",
       formatFloat(bitLen.float64 / float64(ts.len - 1), ffDecimal, 2), " bits/delta"
-    discard timed("decodeDoD irregular(4096)", 5_000, (let _ = decodeDoDStream(payload, bitLen, ts.len, 0); discard))
+    discard timed("decodeDoD irregular(4096)", 20_000, (let _ = decodeDoDStream(payload, bitLen, ts.len, 0); discard))
 
   echo ""
   echo "------- decodeSimple8b -------"
@@ -177,7 +177,7 @@ proc main() =
     let words = encodeSimple8b(dods)
     echo "wide(4096):                encoded ", words.len, " words = ",
       formatFloat(float64(words.len * 64) / float64(n), ffDecimal, 4), " bits/value"
-    discard timed_s8b("decodeSimple8b wide(4096)", 20_000, words, n)
+    discard timed_s8b("decodeSimple8b wide(4096)", 50_000, words, n)
 
   echo ""
   echo "------- decodeXorRun (clz zero-run skip) vs per-call -------"
@@ -239,8 +239,8 @@ proc main() =
       for i in 0 ..< (n - 1):
         prev = prev xor xors[i]
         result[i + 1] = cast[float64](prev)
-    discard timed("smooth: per-call decodeXor",    5_000, (let _ = decodePerCall(); discard))
-    discard timed("smooth: decodeXorRun (clz)",    5_000, (let _ = decodeRun(); discard))
+    discard timed("smooth: per-call decodeXor",    20_000, (let _ = decodePerCall(); discard))
+    discard timed("smooth: decodeXorRun (clz)",    20_000, (let _ = decodeRun(); discard))
 
   echo ""
   echo "------- bit primitives (clz/ctz hot path) -------"
@@ -249,11 +249,11 @@ proc main() =
     var inputs = newSeq[uint64](100_000)
     for i in 0 ..< inputs.len: inputs[i] = uint64(rng.rand(int.high))
     let n = inputs.len
-    discard timed("countLeadingZeros64", 100, (block:
+    discard timed("countLeadingZeros64", 500, (block:
       var s = 0
       for x in inputs: s += countLeadingZeros64(x)
       doAssert s >= 0))
-    discard timed("countTrailingZeros64", 100, (block:
+    discard timed("countTrailingZeros64", 500, (block:
       var s = 0
       for x in inputs: s += countTrailingZeros64(x)
       doAssert s >= 0))

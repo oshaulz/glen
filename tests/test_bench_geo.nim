@@ -233,11 +233,11 @@ when isMainModule:
   benchRTreeBulkLoad(100_000)
   benchRTreeBulkLoad(1_000_000)
   benchRTreeIncrementalInsert(100_000)
-  benchRTreeBBoxSearch(100_000, 10_000)
-  benchRTreeBBoxSearch(1_000_000, 1_000)
-  benchRTreeKNN(100_000, 10_000, 10)
-  benchRTreeKNN(1_000_000, 1_000, 10)
-  benchRTreeNearestGeo(100_000, 10_000, 10)
+  benchRTreeBBoxSearch(100_000, 50_000)
+  benchRTreeBBoxSearch(1_000_000, 5_000)
+  benchRTreeKNN(100_000, 50_000, 10)
+  benchRTreeKNN(1_000_000, 5_000, 10)
+  benchRTreeNearestGeo(100_000, 50_000, 10)
 
   echo "\n------- GlenDB-integrated geo index -------"
   let dir = getTempDir() / "glen_bench_geo"
@@ -250,12 +250,12 @@ when isMainModule:
   benchGeoIndexCreate(database, N)
   benchGeoIndexedPut(database, 50_000)
 
-  benchFindWithinRadius(database, 5_000)
-  benchFindNearestPlanar(database, 5_000, k = 10)
-  benchFindNearestGeographic(database, 5_000, k = 10)
+  benchFindWithinRadius(database, 20_000)
+  benchFindNearestPlanar(database, 20_000, k = 10)
+  benchFindNearestGeographic(database, 20_000, k = 10)
 
   echo "\n------- polygon index -------"
-  benchPolygonIndex(database, 50_000, 5_000)
+  benchPolygonIndex(database, 50_000, 20_000)
 
   echo "\n------- persistence -------"
   database.close()

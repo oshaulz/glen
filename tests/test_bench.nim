@@ -67,7 +67,7 @@ when isMainModule:
   let dir = getTempDir() / "glen_bench_db"
   if dirExists(dir): removeDir(dir)
   let database = newGlenDB(dir, cacheCapacity = 128*1024*1024, cacheShards = 32, walFlushEveryBytes = 8*1024*1024, lockStripesCount = 64)
-  let N = 20000
+  let N = 100_000
   var keys: seq[string] = newSeq[string](N)
   for i in 0 ..< N: keys[i] = "k" & $i
 
@@ -79,6 +79,6 @@ when isMainModule:
   benchGet(database2, N, keys)
   benchGetBorrowed(database2, N, keys)
   benchGetMany(database2, N, 100, keys)
-  benchTxn(database2, 1000)
+  benchTxn(database2, 5_000)
   database2.close()
 

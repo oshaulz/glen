@@ -236,9 +236,9 @@ when isMainModule:
 
   # Reuse the noisy series for read benchmarks (it's the most realistic).
   benchSeriesReopenScan(path)
-  benchSeriesRange(path, n, 5_000)
+  benchSeriesRange(path, n, 20_000)
   benchSeriesLatestN(path, 100_000, 100)
-  benchSeriesLatestN(path,  10_000, 1000)
+  benchSeriesLatestN(path,  50_000, 1000)
   removeFile(path)
 
   echo "\n------- glen/tilestack (Gorilla raster-over-time) -------"
@@ -248,15 +248,15 @@ when isMainModule:
   # Small radar-shaped grid, modest frame count: typical NEXRAD-ish workload.
   benchTileStackAppend(dir, rows = 200, cols = 200, frames = 200,
                        tileSize = 64, chunkSize = 64)
-  benchTileStackPointHistory(dir, queries = 1000)
-  benchTileStackReadFrame(dir, numFrames = 200, queries = 200)
+  benchTileStackPointHistory(dir, queries = 5_000)
+  benchTileStackReadFrame(dir, numFrames = 200, queries = 1_000)
   removeDir(dir)
 
   # Larger grid, fewer frames — model-output style.
   benchTileStackAppend(dir, rows = 512, cols = 512, frames = 64,
                        tileSize = 128, chunkSize = 32)
-  benchTileStackPointHistory(dir, queries = 1000)
-  benchTileStackReadFrame(dir, numFrames = 64, queries = 50)
+  benchTileStackPointHistory(dir, queries = 5_000)
+  benchTileStackReadFrame(dir, numFrames = 64, queries = 200)
   removeDir(dir)
 
   echo "\n------- glen/tilestack: sparse vs dense (cold-decode) -------"
@@ -272,9 +272,9 @@ when isMainModule:
   benchTileStackAppendWith(denseDir,  rows = 200, cols = 200, frames = 200,
                            tileSize = 64, chunkSize = 64,
                            producer = fillDenseFrame, label = "dense ")
-  benchTileStackColdReadFrame("sparse", sparseDir, numFrames = 200, queries = 200)
-  benchTileStackColdReadFrame("dense ", denseDir,  numFrames = 200, queries = 200)
-  benchTileStackColdPointHistory("sparse", sparseDir, queries = 200)
-  benchTileStackColdPointHistory("dense ", denseDir,  queries = 200)
+  benchTileStackColdReadFrame("sparse", sparseDir, numFrames = 200, queries = 500)
+  benchTileStackColdReadFrame("dense ", denseDir,  numFrames = 200, queries = 50)
+  benchTileStackColdPointHistory("sparse", sparseDir, queries = 500)
+  benchTileStackColdPointHistory("dense ", denseDir,  queries = 100)
   removeDir(sparseDir)
   removeDir(denseDir)

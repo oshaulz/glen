@@ -14,7 +14,7 @@
 import std/[os, times, strformat, locks, atomics]
 import glen/db as glendb, glen/types
 
-const DEFAULT_OPS = 50_000
+const DEFAULT_OPS = 200_000
 
 type
   Worker = object
