@@ -7,11 +7,11 @@ should be treated as the order of magnitude you'll see, not exact constants.
 ## Core CRUD (`nimble bench_release`)
 
 ```
-puts:                218k ops/s
-gets (cloned):       1.23M ops/s
-gets (borrowed):     8.3M ops/s
-getMany:             17.9k batches/s  ×100 docs ≈ 1.79M doc reads/s
-txn commits:         294k ops/s
+puts:                320k ops/s
+gets (cloned):       1.35M ops/s
+gets (borrowed):     9.1M ops/s
+getMany:             20k batches/s   ×100 docs ≈ 2.0M doc reads/s
+txn commits:         333k ops/s
 ```
 
 The borrowed-read path skips the defensive `clone()` and is appropriate for
@@ -20,11 +20,11 @@ read-only hot loops.
 ## Multi-threaded contention (`nimble bench_concurrent`, `--mm:atomicArc -d:useMalloc`)
 
 ```
-disjoint-write-only   4w/0r ×200k =>  134k ops/s   (low stripe contention)
-disjoint-mixed-rw     4w/4r ×200k =>  306k ops/s
-shared-write-only     4w/0r ×200k =>  139k ops/s   (max stripe contention)
-shared-mixed-rw       4w/4r ×200k =>  295k ops/s
-read-heavy-shared     1w/8r ×200k =>  1.7M ops/s
+disjoint-write-only   4w/0r ×200k =>  320k ops/s   (low stripe contention)
+disjoint-mixed-rw     4w/4r ×200k =>  640k ops/s
+shared-write-only     4w/0r ×200k =>  188k ops/s   (max stripe contention)
+shared-mixed-rw       4w/4r ×200k =>  440k ops/s
+read-heavy-shared     1w/8r ×200k =>  2.5M ops/s
 ```
 
 ## Geospatial (`nimble bench_geo`)
@@ -45,20 +45,20 @@ nearestGeo k=10:   50k queries   =>   85k q/s   (haversine bbox lower-bound)
 GlenDB-integrated geo index, eager mode (100k docs):
 
 ```
-put (no index):                   218k docs/s
-createGeoIndex (STR bulk-build):  800k docs/s
-put (with active geo index):      242k docs/s
-findWithinRadius 100km:            62.5k q/s
-findNearest planar k=10:           63.5k q/s
-findNearest geographic k=10:       52k q/s    (~1.2× slower than planar; trig-bound)
+put (no index):                   334k docs/s
+createGeoIndex (STR bulk-build):  1.03M docs/s
+put (with active geo index):      312k docs/s
+findWithinRadius 100km:            84k q/s
+findNearest planar k=10:           67k q/s
+findNearest geographic k=10:       57k q/s    (~1.2× slower than planar; trig-bound)
 ```
 
 Polygons, eager mode (50k docs, ~3°-square axis-aligned shapes):
 
 ```
-put polygons:                    143k docs/s
-createPolygonIndex (STR):        877k docs/s
-findPolygonsContaining:           47.5k q/s    (R-tree prefilter + ray-cast)
+put polygons:                    181k docs/s
+createPolygonIndex (STR):        847k docs/s
+findPolygonsContaining:           63k q/s    (R-tree prefilter + ray-cast)
 ```
 
 Index persistence:
