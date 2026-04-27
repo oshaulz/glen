@@ -1,6 +1,6 @@
 # Glen core value types (Convex-like)
 
-import std/[tables, hashes, strutils, options]
+import std/[tables, hashes, strutils, options, math]
 
 # Supported Value kinds
 
@@ -127,12 +127,15 @@ proc clone*(v: Value): Value =
   of vkString: VString(v.s)
   of vkBytes: VBytes(v.bytes)
   of vkArray:
-    var items: seq[Value] = @[]
-    items.setLen(v.arr.len)
+    var items: seq[Value] = newSeq[Value](v.arr.len)
     for i, it in v.arr: items[i] = clone(it)
-    VArray(items)
+    Value(kind: vkArray, arr: items)
   of vkObject:
-    var o = VObject()
+    # Pre-size the destination table to avoid the default 64-slot allocation
+    # for typical 1-8 field objects (huge waste on hot read/clone paths).
+    let cap = nextPowerOfTwo(max(v.obj.len * 2, 2))
+    var o = Value(kind: vkObject,
+                  obj: initTable[string, Value](cap))
     for k, vv in v.obj: o.obj[k] = clone(vv)
     o
   of vkId: VId(v.id.collection, v.id.docId, v.id.version)

@@ -86,9 +86,9 @@ proc get*(c: LruCache; key: string): Value =
   let s = c.chooseShard(key)
   acquire(s.lock)
   defer: release(s.lock)
-  if key in s.map:
-    let e = s.map[key]
-    s.touch(e)
+  let e = s.map.getOrDefault(key, nil)
+  if e != nil:
+    if e != s.head: s.touch(e)
     inc s.hits; inc c.hits
     return e.value
   inc s.misses; inc c.misses
@@ -98,12 +98,12 @@ proc put*(c: LruCache; key: string; value: Value) =
   acquire(s.lock)
   defer: release(s.lock)
   let size = estimateSize(value)
-  if key in s.map:
-    let e = s.map[key]
-    s.current -= e.size
-    e.value = value; e.size = size
+  let existing = s.map.getOrDefault(key, nil)
+  if existing != nil:
+    s.current -= existing.size
+    existing.value = value; existing.size = size
     s.current += size
-    s.touch(e)
+    if existing != s.head: s.touch(existing)
   else:
     let e = CacheEntry(key: key, value: value, size: size)
     s.map[key] = e
@@ -137,8 +137,8 @@ proc del*(c: LruCache; key: string) =
   let s = c.chooseShard(key)
   acquire(s.lock)
   defer: release(s.lock)
-  if key in s.map:
-    let e = s.map[key]
+  let e = s.map.getOrDefault(key, nil)
+  if e != nil:
     s.removeNode(e)
     s.current -= e.size
     s.map.del(key)

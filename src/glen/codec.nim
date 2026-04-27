@@ -169,6 +169,18 @@ proc encode*(v: Value): string =
     activeEncodeDict = prev
   result = encStream.data
 
+## Encode `v` directly into the caller's stream. No dict scope, no per-call
+## heap allocation for an intermediate buffer. Useful for hot paths (WAL
+## append, batched encoders) that already manage their own output buffer.
+proc encodeInto*(s: Stream; v: Value) =
+  ensureCfg()
+  let prev = activeEncodeDict
+  activeEncodeDict = nil
+  try:
+    encodeValue(s, v)
+  finally:
+    activeEncodeDict = prev
+
 ## Encode `v` using `dict` to compress repeated object keys. Produces output
 ## that can ONLY be read by `decodeWithDict` with the same dict; never put
 ## the result on the wire or in a WAL — it's only for snapshot bodies.

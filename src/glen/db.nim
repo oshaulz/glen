@@ -215,9 +215,10 @@ proc lookupDoc(cs: CollectionStore; docId: string): Value {.inline.} =
   ## to a single Table lookup — same hot path as before spillable mode landed.
   if cs.isNil: return nil
   if cs.snapshot.isNil:
-    return if docId in cs.docs: cs.docs[docId] else: nil
+    return cs.docs.getOrDefault(docId, nil)
   if docId in cs.deleted: return nil
-  if docId in cs.docs: return cs.docs[docId]
+  let hit = cs.docs.getOrDefault(docId, nil)
+  if hit != nil: return hit
   result = loadDocFromMmap(cs.snapshot, docId)
   if not result.isNil:
     cs.docs[docId] = result
@@ -231,9 +232,10 @@ proc lookupDocBypass(cs: CollectionStore; docId: string): Value {.inline.} =
   ## the single-Table-lookup fast path.
   if cs.isNil: return nil
   if cs.snapshot.isNil:
-    return if docId in cs.docs: cs.docs[docId] else: nil
+    return cs.docs.getOrDefault(docId, nil)
   if docId in cs.deleted: return nil
-  if docId in cs.docs: return cs.docs[docId]
+  let hit = cs.docs.getOrDefault(docId, nil)
+  if hit != nil: return hit
   loadDocFromMmap(cs.snapshot, docId)
 
 proc hasDoc(cs: CollectionStore; docId: string): bool {.inline.} =
@@ -778,8 +780,8 @@ proc get*(db: GlenDB; collection, docId: string): Value {.inline.} =
   if docId in cs.deleted:
     db.releaseStripeRead(collection)
     return nil
-  if docId in cs.docs:
-    let v = cs.docs[docId]
+  let v = cs.docs.getOrDefault(docId, nil)
+  if v != nil:
     db.cache.put(key, v)
     let cloned = v.clone()
     db.releaseStripeRead(collection)
@@ -805,8 +807,8 @@ proc getBorrowed*(db: GlenDB; collection, docId: string): Value {.inline.} =
   if docId in cs.deleted:
     db.releaseStripeRead(collection)
     return nil
-  if docId in cs.docs:
-    let v = cs.docs[docId]
+  let v = cs.docs.getOrDefault(docId, nil)
+  if v != nil:
     db.cache.put(key, v)
     db.releaseStripeRead(collection)
     return v
@@ -824,7 +826,7 @@ proc getBorrowed*(db: GlenDB; collection, docId: string): Value {.inline.} =
 # blocks all writers to the relevant stripes).
 proc currentVersionFromStore(cs: CollectionStore; docId: string): uint64 {.inline.} =
   if cs.isNil: return 0
-  if docId in cs.versions: cs.versions[docId] else: 0'u64
+  cs.versions.getOrDefault(docId, 0'u64)
 
 # Transaction-aware read: records version for OCC
 ## Transaction-aware get. Records the version read into the provided transaction
@@ -843,8 +845,9 @@ proc get*(db: GlenDB; collection, docId: string; t: Txn): Value =
 ## region without populating cs.docs (so a giant getMany doesn't trash the
 ## hot working set).
 proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(string, Value)] =
-  result = @[]
-  var missing: seq[string] = @[]
+  result = newSeqOfCap[(string, Value)](docIds.len)
+  var missing = newSeqOfCap[string](docIds.len)
+  var missingKeys = newSeqOfCap[string](docIds.len)
   for id in docIds:
     let key = collection & ":" & id
     let cached = db.cache.get(key)
@@ -852,21 +855,23 @@ proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(s
       result.add((id, cached.clone()))
     else:
       missing.add(id)
+      missingKeys.add(key)
   if missing.len == 0: return
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return
   db.acquireStripeRead(collection)
-  for id in missing:
+  for i, id in missing:
     let v = lookupDocBypass(cs, id)
     if not v.isNil:
-      db.cache.put(collection & ":" & id, v)
+      db.cache.put(missingKeys[i], v)
       result.add((id, v.clone()))
   db.releaseStripeRead(collection)
 
 ## Borrowed batch get: returns refs without cloning. Caller must not mutate.
 proc getBorrowedMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(string, Value)] =
-  result = @[]
-  var missing: seq[string] = @[]
+  result = newSeqOfCap[(string, Value)](docIds.len)
+  var missing = newSeqOfCap[string](docIds.len)
+  var missingKeys = newSeqOfCap[string](docIds.len)
   for id in docIds:
     let key = collection & ":" & id
     let cached = db.cache.get(key)
@@ -874,14 +879,15 @@ proc getBorrowedMany*(db: GlenDB; collection: string; docIds: openArray[string])
       result.add((id, cached))
     else:
       missing.add(id)
+      missingKeys.add(key)
   if missing.len == 0: return
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return
   db.acquireStripeRead(collection)
-  for id in missing:
+  for i, id in missing:
     let v = lookupDocBypass(cs, id)
     if not v.isNil:
-      db.cache.put(collection & ":" & id, v)
+      db.cache.put(missingKeys[i], v)
       result.add((id, v))
   db.releaseStripeRead(collection)
 
@@ -964,14 +970,14 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
   markDirty(cs, docId)
   cs.versions[docId] = newVer
   db.cache.put(collection & ":" & docId, stored)
-  for _, idx in cs.indexes:
-    idx.reindexDoc(docId, oldDoc, stored)
-  for _, gix in cs.geoIndexes:
-    gix.reindexDoc(docId, oldDoc, stored)
-  for _, pix in cs.polygonIndexes:
-    pix.reindexDoc(docId, oldDoc, stored)
-  for _, vix in cs.vectorIndexes:
-    vix.reindexDoc(docId, oldDoc, stored)
+  if cs.indexes.len > 0:
+    for _, idx in cs.indexes: idx.reindexDoc(docId, oldDoc, stored)
+  if cs.geoIndexes.len > 0:
+    for _, gix in cs.geoIndexes: gix.reindexDoc(docId, oldDoc, stored)
+  if cs.polygonIndexes.len > 0:
+    for _, pix in cs.polygonIndexes: pix.reindexDoc(docId, oldDoc, stored)
+  if cs.vectorIndexes.len > 0:
+    for _, vix in cs.vectorIndexes: vix.reindexDoc(docId, oldDoc, stored)
   notifications.add((Id(collection: collection, docId: docId, version: newVer), stored))
   fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, stored))
   db.releaseStripeWrite(collection)
@@ -1006,17 +1012,17 @@ proc delete*(db: GlenDB; collection, docId: string) =
     db.wal.append(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
     cs.replMetaHlc[docId] = chHlc
     cs.replMetaChangeId[docId] = chChangeId
-    for _, idx in cs.indexes:
-      idx.unindexDoc(docId, oldDoc)
-    for _, gix in cs.geoIndexes:
-      gix.unindexDoc(docId, oldDoc)
-    for _, pix in cs.polygonIndexes:
-      pix.unindexDoc(docId, oldDoc)
-    for _, vix in cs.vectorIndexes:
-      vix.unindexDoc(docId, oldDoc)
-    if docId in cs.docs: cs.docs.del(docId)
+    if cs.indexes.len > 0:
+      for _, idx in cs.indexes: idx.unindexDoc(docId, oldDoc)
+    if cs.geoIndexes.len > 0:
+      for _, gix in cs.geoIndexes: gix.unindexDoc(docId, oldDoc)
+    if cs.polygonIndexes.len > 0:
+      for _, pix in cs.polygonIndexes: pix.unindexDoc(docId, oldDoc)
+    if cs.vectorIndexes.len > 0:
+      for _, vix in cs.vectorIndexes: vix.unindexDoc(docId, oldDoc)
+    cs.docs.del(docId)
     markDeleted(cs, docId)
-    if docId in cs.versions: cs.versions.del(docId)
+    cs.versions.del(docId)
     db.cache.del(collection & ":" & docId)
     notifications.add((Id(collection: collection, docId: docId, version: ver), VNull()))
     fieldNotifications.add((Id(collection: collection, docId: docId, version: ver), oldDoc, nil))
@@ -1101,17 +1107,17 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
         release(db.replLock)
         # write-ahead
         walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: newVer, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
-        for _, idx in cs.indexes:
-          idx.unindexDoc(docId, oldDoc)
-        for _, gix in cs.geoIndexes:
-          gix.unindexDoc(docId, oldDoc)
-        for _, pix in cs.polygonIndexes:
-          pix.unindexDoc(docId, oldDoc)
-        for _, vix in cs.vectorIndexes:
-          vix.unindexDoc(docId, oldDoc)
-        if docId in cs.docs: cs.docs.del(docId)
+        if cs.indexes.len > 0:
+          for _, idx in cs.indexes: idx.unindexDoc(docId, oldDoc)
+        if cs.geoIndexes.len > 0:
+          for _, gix in cs.geoIndexes: gix.unindexDoc(docId, oldDoc)
+        if cs.polygonIndexes.len > 0:
+          for _, pix in cs.polygonIndexes: pix.unindexDoc(docId, oldDoc)
+        if cs.vectorIndexes.len > 0:
+          for _, vix in cs.vectorIndexes: vix.unindexDoc(docId, oldDoc)
+        cs.docs.del(docId)
         markDeleted(cs, docId)
-        if docId in cs.versions: cs.versions.del(docId)
+        cs.versions.del(docId)
         db.cache.del(collection & ":" & docId)
         notifications.add((Id(collection: collection, docId: docId, version: newVer), VNull()))
         fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, nil))
@@ -1135,14 +1141,14 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       markDirty(cs, docId)
       cs.versions[docId] = newVer
       db.cache.put(collection & ":" & docId, w.value)
-      for _, idx in cs.indexes:
-        idx.reindexDoc(docId, oldDoc, w.value)
-      for _, gix in cs.geoIndexes:
-        gix.reindexDoc(docId, oldDoc, w.value)
-      for _, pix in cs.polygonIndexes:
-        pix.reindexDoc(docId, oldDoc, w.value)
-      for _, vix in cs.vectorIndexes:
-        vix.reindexDoc(docId, oldDoc, w.value)
+      if cs.indexes.len > 0:
+        for _, idx in cs.indexes: idx.reindexDoc(docId, oldDoc, w.value)
+      if cs.geoIndexes.len > 0:
+        for _, gix in cs.geoIndexes: gix.reindexDoc(docId, oldDoc, w.value)
+      if cs.polygonIndexes.len > 0:
+        for _, pix in cs.polygonIndexes: pix.reindexDoc(docId, oldDoc, w.value)
+      if cs.vectorIndexes.len > 0:
+        for _, vix in cs.vectorIndexes: vix.reindexDoc(docId, oldDoc, w.value)
       notifications.add((Id(collection: collection, docId: docId, version: newVer), w.value))
       fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, w.value))
   if walRecs.len > 0:

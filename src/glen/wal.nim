@@ -174,50 +174,104 @@ proc flush*(wal: WriteAheadLog) =
   if wal.fs != nil:
     wal.fs.flushFile()
 
-proc append*(wal: WriteAheadLog; rec: WalRecord) =
-  acquire(wal.lock)
-  defer: release(wal.lock)
-  var ms = newStringStream()
-  # recordType
+# Thread-local body buffer reused across append() calls to avoid per-record
+# StringStream and result-string heap allocations on the hot WAL write path.
+var bodyStream {.threadvar.}: StringStream
+
+proc encodeRecordBody(rec: WalRecord; ms: Stream) {.inline.} =
   writeVarUint(ms, uint64(rec.kind.ord))
-  # collection
   writeVarUint(ms, uint64(rec.collection.len)); ms.write(rec.collection)
-  # docId
   writeVarUint(ms, uint64(rec.docId.len)); ms.write(rec.docId)
-  # version
   ms.write(rec.version)
-  # value if put (optional compression could be inserted here in future)
   if rec.kind == wrPut:
-    let payload = encode(rec.value)
-    writeVarUint(ms, uint64(payload.len))
-    ms.write(payload)
+    # Stash a placeholder for the payload length, then encode the value
+    # directly into `ms` and patch the length in. Saves both the temporary
+    # `payload` string allocation AND a second copy into the body buffer.
+    let lenPos = ms.getPosition()
+    writeVarUint(ms, 0'u64) # placeholder (varuint of 0 = 1 byte)
+    let valStart = ms.getPosition()
+    encodeInto(ms, rec.value)
+    let valEnd = ms.getPosition()
+    let valLen = uint64(valEnd - valStart)
+    # Re-encode the length as a varuint at lenPos. If the new varuint is
+    # longer than 1 byte we shift the payload to make room.
+    var lenBuf: array[10, byte]
+    var lenN = 0
+    var v = valLen
+    while true:
+      var b = uint8(v and 0x7F)
+      v = v shr 7
+      if v != 0: b = b or 0x80'u8
+      lenBuf[lenN] = b
+      inc lenN
+      if v == 0: break
+    if lenN == 1:
+      ms.setPosition(lenPos)
+      ms.write(lenBuf[0])
+      ms.setPosition(valEnd)
+    else:
+      # Shift payload right by (lenN - 1) bytes, then patch the length.
+      let shift = lenN - 1
+      let dataRef = StringStream(ms)
+      let oldLen = dataRef.data.len
+      dataRef.data.setLen(oldLen + shift)
+      # memmove payload bytes
+      let buf = addr dataRef.data[0]
+      moveMem(cast[pointer](cast[uint](buf) + uint(valStart + shift)),
+              cast[pointer](cast[uint](buf) + uint(valStart)),
+              valEnd - valStart)
+      copyMem(cast[pointer](cast[uint](buf) + uint(lenPos)),
+              addr lenBuf[0], lenN)
+      dataRef.setPosition(oldLen + shift)
   else:
-    writeVarUint(ms, 0) # zero length
-  # Replication metadata (v2+): write strings and HLC
+    writeVarUint(ms, 0)
   writeVarUint(ms, uint64(rec.changeId.len)); if rec.changeId.len > 0: ms.write(rec.changeId)
   writeVarUint(ms, uint64(rec.originNode.len)); if rec.originNode.len > 0: ms.write(rec.originNode)
   ms.write(rec.hlc.wallMillis)
   ms.write(rec.hlc.counter)
   writeVarUint(ms, uint64(rec.hlc.nodeId.len)); if rec.hlc.nodeId.len > 0: ms.write(rec.hlc.nodeId)
 
-  let body = ms.data
+proc resetBodyStream() {.inline.} =
+  if bodyStream.isNil:
+    bodyStream = newStringStream()
+  else:
+    bodyStream.setPosition(0)
+    bodyStream.data.setLen(0)
+
+proc writeFramedRecord(wal: WriteAheadLog; body: string): int {.inline.} =
+  ## Writes header(varuint length) + crc(4 LE bytes) + body to wal.fs.
+  ## Returns total bytes written.
   let crc = fnv1a32(body)
-  var header = newStringStream()
-  writeVarUint(header, uint64(body.len))
-  let headerStr = header.data
-  # include 4 bytes for checksum
-  wal.rotateIfNeeded(headerStr.len + 4 + body.len)
-  wal.fs.write(headerStr)
-  # write checksum (little-endian) without extra allocation
-  var csBuf: array[4, byte]
-  csBuf[0] = byte(crc and 0xFF)
-  csBuf[1] = byte((crc shr 8) and 0xFF)
-  csBuf[2] = byte((crc shr 16) and 0xFF)
-  csBuf[3] = byte((crc shr 24) and 0xFF)
-  discard wal.fs.writeBuffer(addr csBuf[0], 4)
-  wal.fs.write(body)
-  wal.currentSize += headerStr.len + 4 + body.len
-  let written = headerStr.len + 4 + body.len
+  # Header: varuint of body length. Worst case 10 bytes; stack-allocated.
+  var hdr: array[14, byte]
+  var hdrN = 0
+  var v = uint64(body.len)
+  while true:
+    var b = uint8(v and 0x7F)
+    v = v shr 7
+    if v != 0: b = b or 0x80'u8
+    hdr[hdrN] = b
+    inc hdrN
+    if v == 0: break
+  hdr[hdrN]   = byte(crc and 0xFF)
+  hdr[hdrN+1] = byte((crc shr 8) and 0xFF)
+  hdr[hdrN+2] = byte((crc shr 16) and 0xFF)
+  hdr[hdrN+3] = byte((crc shr 24) and 0xFF)
+  let prefixLen = hdrN + 4
+  wal.rotateIfNeeded(prefixLen + body.len)
+  discard wal.fs.writeBuffer(addr hdr[0], prefixLen)
+  if body.len > 0:
+    discard wal.fs.writeBuffer(unsafeAddr body[0], body.len)
+  prefixLen + body.len
+
+proc append*(wal: WriteAheadLog; rec: WalRecord) =
+  acquire(wal.lock)
+  defer: release(wal.lock)
+  resetBodyStream()
+  encodeRecordBody(rec, bodyStream)
+  let body = bodyStream.data
+  let written = writeFramedRecord(wal, body)
+  wal.currentSize += written
   case wal.syncMode
   of wsmAlways:
     wal.fs.flushFile()
@@ -235,40 +289,11 @@ proc appendMany*(wal: WriteAheadLog; recs: openArray[WalRecord]) =
   defer: release(wal.lock)
   var totalWritten = 0
   for rec in recs:
-    var ms = newStringStream()
-    writeVarUint(ms, uint64(rec.kind.ord))
-    writeVarUint(ms, uint64(rec.collection.len)); ms.write(rec.collection)
-    writeVarUint(ms, uint64(rec.docId.len)); ms.write(rec.docId)
-    ms.write(rec.version)
-    if rec.kind == wrPut:
-      let payload = encode(rec.value)
-      writeVarUint(ms, uint64(payload.len))
-      ms.write(payload)
-    else:
-      writeVarUint(ms, 0)
-    # Replication metadata (v2+)
-    writeVarUint(ms, uint64(rec.changeId.len)); if rec.changeId.len > 0: ms.write(rec.changeId)
-    writeVarUint(ms, uint64(rec.originNode.len)); if rec.originNode.len > 0: ms.write(rec.originNode)
-    ms.write(rec.hlc.wallMillis)
-    ms.write(rec.hlc.counter)
-    writeVarUint(ms, uint64(rec.hlc.nodeId.len)); if rec.hlc.nodeId.len > 0: ms.write(rec.hlc.nodeId)
-
-    let body = ms.data
-    let crc = fnv1a32(body)
-    var header = newStringStream()
-    writeVarUint(header, uint64(body.len))
-    let headerStr = header.data
-    wal.rotateIfNeeded(headerStr.len + 4 + body.len)
-    wal.fs.write(headerStr)
-    var csBuf: array[4, byte]
-    csBuf[0] = byte(crc and 0xFF)
-    csBuf[1] = byte((crc shr 8) and 0xFF)
-    csBuf[2] = byte((crc shr 16) and 0xFF)
-    csBuf[3] = byte((crc shr 24) and 0xFF)
-    discard wal.fs.writeBuffer(addr csBuf[0], 4)
-    wal.fs.write(body)
-    wal.currentSize += headerStr.len + 4 + body.len
-    totalWritten += headerStr.len + 4 + body.len
+    resetBodyStream()
+    encodeRecordBody(rec, bodyStream)
+    let written = writeFramedRecord(wal, bodyStream.data)
+    wal.currentSize += written
+    totalWritten += written
 
   case wal.syncMode
   of wsmAlways:
