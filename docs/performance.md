@@ -6,11 +6,11 @@ Apple M5, `-d:release`, ORC + `-O3`. Reproduce with the corresponding
 ## Core CRUD (`nimble bench_release`)
 
 ```
-puts:                320k ops/s
-gets (cloned):       1.35M ops/s
+puts:                380k ops/s
+gets (cloned):       1.28M ops/s
 gets (borrowed):     9.1M ops/s
-getMany:             20k batches/s   ×100 docs ≈ 2.0M doc reads/s
-txn commits:         333k ops/s
+getMany:             21k batches/s   ×100 docs ≈ 2.1M doc reads/s
+txn commits:         357k ops/s
 ```
 
 The borrowed-read path skips the defensive `clone()` and is appropriate for
@@ -31,41 +31,41 @@ read-heavy-shared     1w/8r ×200k =>  2.5M ops/s
 Raw R-tree (in-memory, no GlenDB):
 
 ```
-bulkLoad (STR):    100k entries  =>  2.6M entries/s
-bulkLoad (STR):     1M entries   =>  2.2M entries/s
-insert (Guttman): 100k ops       =>  1.75M ops/s
-searchBBox (5°):   50k queries   =>  325k q/s   (100k pts, ~159 hits/query)
-searchBBox (5°):    5k queries   =>   31k q/s   (1M pts, ~1594 hits/query)
-nearest k=10:      50k queries   =>  112k q/s   (100k pts)
-nearest k=10:       5k queries   =>   82k q/s   (1M pts)
-nearestGeo k=10:   50k queries   =>   85k q/s   (haversine bbox lower-bound)
+bulkLoad (STR):    100k entries  =>  2.7M entries/s
+bulkLoad (STR):     1M entries   =>  2.1M entries/s
+insert (Guttman): 100k ops       =>  1.72M ops/s
+searchBBox (5°):   50k queries   =>  318k q/s   (100k pts, ~159 hits/query)
+searchBBox (5°):    5k queries   =>   30k q/s   (1M pts, ~1594 hits/query)
+nearest k=10:      50k queries   =>  111k q/s   (100k pts)
+nearest k=10:       5k queries   =>   85k q/s   (1M pts)
+nearestGeo k=10:   50k queries   =>   83k q/s   (haversine bbox lower-bound)
 ```
 
 GlenDB-integrated geo index, eager mode (100k docs):
 
 ```
-put (no index):                   334k docs/s
-createGeoIndex (STR bulk-build):  1.03M docs/s
-put (with active geo index):      312k docs/s
-findWithinRadius 100km:            84k q/s
-findNearest planar k=10:           67k q/s
-findNearest geographic k=10:       57k q/s    (~1.2× slower than planar; trig-bound)
+put (no index):                   358k docs/s
+createGeoIndex (STR bulk-build):  1.05M docs/s
+put (with active geo index):      329k docs/s
+findWithinRadius 100km:            89k q/s
+findNearest planar k=10:           70k q/s
+findNearest geographic k=10:       59k q/s    (~1.2× slower than planar; trig-bound)
 ```
 
 Polygons, eager mode (50k docs, ~3°-square axis-aligned shapes):
 
 ```
-put polygons:                    181k docs/s
-createPolygonIndex (STR):        847k docs/s
-findPolygonsContaining:           63k q/s    (R-tree prefilter + ray-cast)
+put polygons:                    214k docs/s
+createPolygonIndex (STR):        962k docs/s
+findPolygonsContaining:           70k q/s    (R-tree prefilter + ray-cast)
 ```
 
 Index persistence:
 
 ```
-reopen with .gri present:        865 ms      (load + WAL replay)
-compact (snapshot + .gri dump):  433 ms
-reopen with corrupt .gri:        720 ms      (CRC fail → bulk-rebuild)
+reopen with .gri present:        752 ms      (load + WAL replay)
+compact (snapshot + .gri dump):  398 ms
+reopen with corrupt .gri:        771 ms      (CRC fail → bulk-rebuild)
 ```
 
 The compact time reflects v4's per-collection dictionary build (two
@@ -93,16 +93,16 @@ Gorilla scalar TSDB, 1M samples per series:
 
 | Value pattern | Append rate | Bits/sample on disk |
 |---|---|---|
-| Constant | **100M samples/s** | 2.11 |
-| Regular cadence | **31.3M samples/s** | 14.13 |
-| Smooth (sin) | 4.65M samples/s | 59.60 |
+| Constant | **77M samples/s** | 2.11 |
+| Regular cadence | **29.4M samples/s** | 14.13 |
+| Smooth (sin) | 4.63M samples/s | 59.60 |
 | Noisy | 4.72M samples/s | 59.28 |
 
 ```
 open (scan all chunk headers):  10 ms for 1M-sample file
-range (random window):          8.2k q/s    (avg 550 samples returned)  ← was 1.3k pre-bitpack
-latest n=100:                   855k q/s
-latest n=1000:                  108k q/s
+range (random window):          7.9k q/s    (avg 550 samples returned)  ← was 1.3k pre-bitpack
+latest n=100:                   833k q/s
+latest n=1000:                  107k q/s
 ```
 
 The **6.3× boost on `range`** vs the pre-bitpack baseline comes from the
@@ -114,8 +114,8 @@ Tile time-stack — append, warm-cache reads (default `fillRadarFrame`):
 
 | Geometry | Append | Compression | bits/cell | Point-history | readFrame |
 |---|---|---|---|---|---|
-| 200×200, 200 frames | **4,255 frames/s** | **79.5×** | 0.81 | 1,263 q/s | 372 q/s |
-| 512×512, 64 frames | **736 frames/s** | **106×** | 0.60 | 918 q/s | 113 q/s |
+| 200×200, 200 frames | **4,255 frames/s** | **79.5×** | 0.81 | 1,255 q/s | 371 q/s |
+| 512×512, 64 frames | **736 frames/s** | **106×** | 0.60 | 912 q/s | 111 q/s |
 
 The compression jump (24.9× → 79.5× on 200×200; 21.2× → 106× on 512×512)
 comes from the constant-chunk RLE path: chunks where every cell stays
@@ -126,10 +126,10 @@ Tile time-stack — sparse vs dense cold-decode (cache reopened per query):
 
 | Workload | Sparse (radar, 99.5% zero cells) | Dense (every cell varies) |
 |---|---|---|
-| readFrame (cold) | **188 q/s** | 7 q/s |
-| readPointHistory (cold) | **680 q/s** | 33 q/s |
+| readFrame (cold) | **181 q/s** | 6 q/s |
+| readPointHistory (cold) | **678 q/s** | 32 q/s |
 | Disk size | 805 KB (80× compression) | 59.8 MB (1.1× compression) |
-| Append throughput | 4,444 fps | 110 fps |
+| Append throughput | 3,333 fps | 105 fps |
 
 The 22–27× spread between sparse and dense is `decodeXorRun`'s clz
 zero-run-skip earning its keep — bulk-skipping runs of zero-XOR cells in
