@@ -218,5 +218,5 @@ and `tests/test_snapshot_v4.nim`, both part of `nimble test`.
   codec exists and is wired into `tilestack`; TSDB blocks still use the
   legacy interleaved DoD-and-XOR layout, which would need restructuring.
 
-These are tracked in [TODO.md](../TODO.md). None are blockers for current
-workloads; they're constant-factor improvements where you'd notice.
+None of these are blockers for current workloads; they're constant-factor
+improvements where you'd notice.

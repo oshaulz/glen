@@ -191,7 +191,10 @@ proc forward(W: Matrix; b, x: Vector): Vector =
 - **No element-wise broadcasting, axis ops, slicing** beyond `add`/`sub`/`mul`/`dot`.
 - **No determinant / inverse / decompositions** beyond `trace`. Reach for an
   external lib for solving linear systems.
-- **No vector index** — linear scan only. HNSW / IVF is on the roadmap.
+- **No collection-wide nearest-neighbour search at the `glen/linalg` level**
+  — the per-doc Vector primitives are scalar. For approximate KNN over an
+  embedding field across an entire collection, see `createVectorIndex` in
+  [api/core.md](core.md#vector-index-hnsw) (HNSW with cosine / L2 / dot).
 
 ## See also
 
