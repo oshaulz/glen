@@ -53,14 +53,14 @@ suite "auto-compaction triggers":
     for i in 0 ..< 500:
       let g = db.get("c", "d" & $i)
       check not g.isNil
-      check g["k"].sval == "val" & $i
+      check g["k"].s == "val" & $i
     db.close()
     # Reopen and verify durability.
     let db2 = newGlenDB(dir)
     for i in 0 ..< 500:
       let g = db2.get("c", "d" & $i)
       check not g.isNil
-      check g["k"].sval == "val" & $i
+      check g["k"].s == "val" & $i
     db2.close()
 
   test "manual compact() updates lastCompactMs (interval re-arms)":

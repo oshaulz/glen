@@ -38,7 +38,8 @@ const testFiles = @[
   "tests/test_tilestack.nim",
   "tests/test_spillable.nim",
   "tests/test_streaming.nim",
-  "tests/test_snapshot_v3.nim"
+  "tests/test_snapshot_v3.nim",
+  "tests/test_autocompact.nim"
 ]
 
 task test, "Run test suite":
