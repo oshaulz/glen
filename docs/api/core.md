@@ -205,7 +205,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange])
 
 proc setPeerCursor*(db: GlenDB; peerId: string; seq: uint64)
 proc getPeerCursor*(db: GlenDB; peerId: string): uint64
-proc gcReplLog*(db: GlenDB)        # trim in-memory log up to min(peerCursors)
+proc gcReplLog*(db: GlenDB)        # trim every cs.replLog up to min(peerCursors);
+                                   # setPeerCursor calls this automatically
 ```
 
 Conflict resolution is HLC last-write-wins; idempotent via `changeId`.

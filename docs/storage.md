@@ -47,6 +47,11 @@ radar/KMUX/
     write rate.
   - `wsmInterval` *(default)* — flush every `flushEveryBytes` (default 8 MiB).
   - `wsmNone` — rely on OS page cache. Bulk imports / throwaway DBs only.
+- **Concurrency**: each writer encodes its record body into a thread-local
+  buffer outside `wal.lock`, then takes the lock only for the framed
+  `writeBuffer` calls + any flush. Multi-record commits go through
+  `appendMany`, which pre-encodes every record before grabbing the lock
+  once for the whole batch.
 - **Recovery**: replay reads each segment in order, validating checksum +
   length. The first invalid tail record halts replay for that segment; later
   segments are still consulted. Crash-mid-record is tolerated.
@@ -225,13 +230,14 @@ Recovery order on `newGlenDB(dir)`:
    For spatial indexes, try to load the matching `.gri`/`.gpi` binary dump
    into the R-tree. CRC mismatch → silently fall back to bulk-rebuild.
 3. **Replay every WAL segment** in order. Each record advances the in-memory
-   replication seq, restores per-doc HLC + changeId metadata, and updates any
-   loaded indexes incrementally — so post-compact mutations are reflected on
-   any `.gri`/`.gpi`-loaded tree.
+   replication seq, populates `cs.replMeta[docId]` with `(hlc, changeId)`,
+   appends to the corresponding `cs.replLog`, and updates any loaded indexes
+   incrementally — so post-compact mutations are reflected on any
+   `.gri`/`.gpi`-loaded tree.
 4. **Bulk-build** any equality / geo / polygon index that didn't have a dump
    loaded, walking all docs (eager: cs.docs; spill: snapshot + cs.docs).
-5. Restore replication metadata (HLC, changeId per doc) and per-peer
-   replication cursors from `peers.state`.
+5. Restore per-peer replication cursors from `peers.state` (per-doc HLC
+   metadata was already restored in step 3).
 
 The whole process is read-only on the on-disk side — no file is rewritten
 during open. Crash-during-recovery is therefore safe.

@@ -1,8 +1,7 @@
 # Performance
 
 Apple M5, `-d:release`, ORC + `-O3`. Reproduce with the corresponding
-`nimble` task; numbers are best-of-a-few-runs for stability. All values
-should be treated as the order of magnitude you'll see, not exact constants.
+`nimble` task; All values should be treated as the order of magnitude you'll see, not exact constants.
 
 ## Core CRUD (`nimble bench_release`)
 

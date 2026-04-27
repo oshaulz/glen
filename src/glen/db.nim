@@ -13,6 +13,10 @@ export query
 type
   ReplOp* = enum roPut, roDelete
 
+  ReplMeta* = object
+    hlc*: Hlc
+    changeId*: string
+
   ReplChange* = object
     collection*: string
     docId*: string
@@ -35,8 +39,16 @@ type
     geoIndexes:       GeoIndexesByName
     polygonIndexes:   PolygonIndexesByName
     vectorIndexes:    VectorIndexesByName
-    replMetaHlc:      Table[string, Hlc]
-    replMetaChangeId: Table[string, string]
+    # Per-doc replication metadata. Both fields are read together during HLC
+    # conflict resolution and written together on every put/delete/apply, so
+    # one Table holding the pair beats two parallel Tables (one Table insert
+    # + one hash lookup per write instead of two).
+    replMeta:         Table[string, ReplMeta]
+    # Per-collection replication log. Append happens under the collection's
+    # stripe write-lock (which the writer already holds), so concurrent puts
+    # to disjoint collections no longer serialize on a global mutex. Entries
+    # are append-only and seqNo-monotone within the slice.
+    replLog:          seq[(uint64, ReplChange)]
     # ---- Spillable mode (lazy / mmap'd snapshot) ----
     # When `snapshot` is non-nil we mirror the on-disk layout: `docs` only
     # holds the hot working set, the rest is faulted in on demand from the
@@ -65,15 +77,13 @@ type
     cache: LruCache
     subs: SubscriptionManager
     lockStripes: seq[RwLock]
-    # Replication sequencing / clock / log lock (separate from data locks)
+    # Replication sequencing / clock lock (separate from data locks).
+    # Holds only for the seqNo + HLC mutation; the change log itself lives
+    # in CollectionStore.replLog under the writer's already-held stripe lock.
     replLock: Lock
     # Replication
     nodeId*: string
     replSeq: uint64
-    # change log (in-memory): seq -> change
-    replLog: seq[(uint64, ReplChange)]
-    # per-collection in-memory change log for fast export filtering
-    replLogByCollection: Table[string, seq[(uint64, ReplChange)]]
     # local HLC state
     localHlc: Hlc
     # Replication peers cursors (peerId -> last exported/applied seq)
@@ -184,13 +194,13 @@ proc newCollectionStore(): CollectionStore =
     geoIndexes:       initTable[string, GeoIndex](),
     polygonIndexes:   initTable[string, PolygonIndex](),
     vectorIndexes:    initTable[string, VectorIndex](),
-    replMetaHlc:      initTable[string, Hlc](),
-    replMetaChangeId: initTable[string, string](),
+    replMeta:         initTable[string, ReplMeta](),
     snapshot:         nil,
     dirty:            initHashSet[string](),
     deleted:          initHashSet[string](),
     hotDocCap:        0,
-    maxDirtyDocs:     0
+    maxDirtyDocs:     0,
+    replLog:          @[]
   )
 
 # ---- Spillable mode helpers ----
@@ -339,8 +349,6 @@ proc newGlenDB*(dir: string;
     cache: newLruCache(cacheCapacity, numShards = cacheShards),
     subs: newSubscriptionManager(),
     replSeq: 0,
-    replLog: @[],
-    replLogByCollection: initTable[string, seq[(uint64, ReplChange)]](),
     compactWalBytes: compactWalBytes,
     compactIntervalMs: compactIntervalMs,
     compactDirtyCount: compactDirtyCount
@@ -500,15 +508,11 @@ proc newGlenDB*(dir: string;
     ch.changeId = rec.changeId
     ch.originNode = rec.originNode
     ch.hlc = rec.hlc
-    result.replLog.add((result.replSeq, ch))
-    if ch.collection notin result.replLogByCollection:
-      result.replLogByCollection[ch.collection] = @[]
-    result.replLogByCollection[ch.collection].add((result.replSeq, ch))
+    cs.replLog.add((result.replSeq, ch))
     # Restore per-doc replication metadata so HLC-based conflict resolution
     # works correctly across restarts.
     if ch.changeId.len > 0:
-      cs.replMetaHlc[ch.docId] = ch.hlc
-      cs.replMetaChangeId[ch.docId] = ch.changeId
+      cs.replMeta[ch.docId] = ReplMeta(hlc: ch.hlc, changeId: ch.changeId)
       # Advance local HLC past the highest seen value.
       if ch.hlc.wallMillis > result.localHlc.wallMillis:
         result.localHlc.wallMillis = ch.hlc.wallMillis
@@ -583,12 +587,18 @@ proc flushPeersState(db: GlenDB; force = false) =
   if shouldWrite:
     writeFile(db.peersStatePath, payload)
 
+proc gcReplLog*(db: GlenDB)
+
 proc setPeerCursor*(db: GlenDB; peerId: string; seq: uint64) =
+  ## Records a peer's acknowledged cursor and opportunistically trims the
+  ## per-collection replication logs up to the new minimum cursor across
+  ## peers — keeps memory bounded for long-running multi-peer setups.
   acquire(db.replLock)
   db.peersCursors[peerId] = seq
   db.peersDirty = true
   release(db.replLock)
   db.flushPeersState()
+  db.gcReplLog()
 
 proc getPeerCursor*(db: GlenDB; peerId: string): uint64 =
   acquire(db.replLock)
@@ -603,32 +613,46 @@ proc minPeerCursor(db: GlenDB): uint64 =
     if seq < minVal: minVal = seq
   minVal
 
+proc acquireStripeRead(db: GlenDB; collection: string)
+proc releaseStripeRead(db: GlenDB; collection: string)
+proc acquireStripeWrite(db: GlenDB; collection: string)
+proc releaseStripeWrite(db: GlenDB; collection: string)
+
+proc firstAfterSeq(s: seq[(uint64, ReplChange)]; cutoff: uint64): int =
+  ## Binary search the first index whose seqNo > cutoff. The slice is
+  ## seqNo-monotone within a single collection (each writer holds the
+  ## stripe lock during append).
+  var lo = 0
+  var hi = s.len
+  while lo < hi:
+    let mid = (lo + hi) shr 1
+    if s[mid][0] <= cutoff: lo = mid + 1
+    else: hi = mid
+  lo
+
 proc gcReplLog*(db: GlenDB) =
   ## Trim in-memory replication log up to the minimum acknowledged cursor across peers.
+  ## Holds peers state under replLock; trims each collection's log under its
+  ## own stripe write-lock so concurrent reads/writes elsewhere keep moving.
   acquire(db.replLock)
-  defer: release(db.replLock)
-  if db.peersCursors.len == 0: return
+  if db.peersCursors.len == 0:
+    release(db.replLock)
+    return
   var cutoff: uint64 = high(uint64)
   for _, seq in db.peersCursors:
     if seq < cutoff: cutoff = seq
+  release(db.replLock)
   if cutoff == 0'u64: return
-  # seqNo is appended monotonically under db.replLock, so binary search the
-  # first index whose seqNo > cutoff and slice off the prefix.
-  proc firstAfter(s: seq[(uint64, ReplChange)]; cutoff: uint64): int =
-    var lo = 0
-    var hi = s.len
-    while lo < hi:
-      let mid = (lo + hi) shr 1
-      if s[mid][0] <= cutoff: lo = mid + 1
-      else: hi = mid
-    lo
-  let cut = firstAfter(db.replLog, cutoff)
-  if cut > 0:
-    db.replLog = db.replLog[cut .. ^1]
-  for coll, seqs in db.replLogByCollection.mpairs:
-    let cutc = firstAfter(seqs, cutoff)
-    if cutc > 0:
-      seqs = seqs[cutc .. ^1]
+  acquireRead(db.structLock)
+  var pairs: seq[(string, CollectionStore)] = @[]
+  for c, cs in db.collections: pairs.add((c, cs))
+  releaseRead(db.structLock)
+  for (c, cs) in pairs:
+    db.acquireStripeWrite(c)
+    let cut = firstAfterSeq(cs.replLog, cutoff)
+    if cut > 0:
+      cs.replLog = cs.replLog[cut .. ^1]
+    db.releaseStripeWrite(c)
 
 # ---- Collection lifecycle ----
 #
@@ -770,7 +794,7 @@ proc faultInDocFromSnapshot(db: GlenDB; cs: CollectionStore;
   return v
 
 proc get*(db: GlenDB; collection, docId: string): Value {.inline.} =
-  let key = collection & ":" & docId
+  let key: CacheKey = (collection, docId)
   let cached = db.cache.get(key)
   if cached != nil:
     return cached.clone()
@@ -797,7 +821,7 @@ proc get*(db: GlenDB; collection, docId: string): Value {.inline.} =
 
 # Borrowed (non-cloned) read. Caller must not mutate returned Value.
 proc getBorrowed*(db: GlenDB; collection, docId: string): Value {.inline.} =
-  let key = collection & ":" & docId
+  let key: CacheKey = (collection, docId)
   let cached = db.cache.get(key)
   if cached != nil:
     return cached
@@ -847,23 +871,20 @@ proc get*(db: GlenDB; collection, docId: string; t: Txn): Value =
 proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(string, Value)] =
   result = newSeqOfCap[(string, Value)](docIds.len)
   var missing = newSeqOfCap[string](docIds.len)
-  var missingKeys = newSeqOfCap[string](docIds.len)
   for id in docIds:
-    let key = collection & ":" & id
-    let cached = db.cache.get(key)
+    let cached = db.cache.get((collection, id))
     if cached != nil:
       result.add((id, cached.clone()))
     else:
       missing.add(id)
-      missingKeys.add(key)
   if missing.len == 0: return
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return
   db.acquireStripeRead(collection)
-  for i, id in missing:
+  for id in missing:
     let v = lookupDocBypass(cs, id)
     if not v.isNil:
-      db.cache.put(missingKeys[i], v)
+      db.cache.put((collection, id), v)
       result.add((id, v.clone()))
   db.releaseStripeRead(collection)
 
@@ -871,23 +892,20 @@ proc getMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(s
 proc getBorrowedMany*(db: GlenDB; collection: string; docIds: openArray[string]): seq[(string, Value)] =
   result = newSeqOfCap[(string, Value)](docIds.len)
   var missing = newSeqOfCap[string](docIds.len)
-  var missingKeys = newSeqOfCap[string](docIds.len)
   for id in docIds:
-    let key = collection & ":" & id
-    let cached = db.cache.get(key)
+    let cached = db.cache.get((collection, id))
     if cached != nil:
       result.add((id, cached))
     else:
       missing.add(id)
-      missingKeys.add(key)
   if missing.len == 0: return
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return
   db.acquireStripeRead(collection)
-  for i, id in missing:
+  for id in missing:
     let v = lookupDocBypass(cs, id)
     if not v.isNil:
-      db.cache.put(missingKeys[i], v)
+      db.cache.put((collection, id), v)
       result.add((id, v))
   db.releaseStripeRead(collection)
 
@@ -911,7 +929,7 @@ proc getAll*(db: GlenDB; collection: string): seq[(string, Value)] =
   for id in allDocIds(cs):
     let v = lookupDocBypass(cs, id)
     if not v.isNil:
-      db.cache.put(collection & ":" & id, v)
+      db.cache.put((collection, id), v)
       result.add((id, v.clone()))
   db.releaseStripeRead(collection)
 
@@ -924,7 +942,7 @@ proc getBorrowedAll*(db: GlenDB; collection: string): seq[(string, Value)] =
   for id in allDocIds(cs):
     let v = lookupDocBypass(cs, id)
     if not v.isNil:
-      db.cache.put(collection & ":" & id, v)
+      db.cache.put((collection, id), v)
       result.add((id, v))
   db.releaseStripeRead(collection)
 
@@ -951,25 +969,24 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
   let oldVer = currentVersionFromStore(cs, docId)
   let newVer = oldVer + 1
   var stored = value.clone()
-  # assign replication metadata (under replLock)
+  # Acquire just the seqNo + HLC under the (now small) replLock; the change
+  # log entry itself goes into cs.replLog under the already-held stripe lock.
   acquire(db.replLock)
   inc db.replSeq
+  let seqNo = db.replSeq
   let chHlc = db.nextLocalHlc()
-  let chChangeId = $db.replSeq & ":" & db.nodeId
-  let ch = ReplChange(collection: collection, docId: docId, op: roPut, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
-  db.replLog.add((db.replSeq, ch))
-  if collection notin db.replLogByCollection: db.replLogByCollection[collection] = @[]
-  db.replLogByCollection[collection].add((db.replSeq, ch))
   release(db.replLock)
+  let chChangeId = $seqNo & ":" & db.nodeId
+  let ch = ReplChange(collection: collection, docId: docId, op: roPut, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
+  cs.replLog.add((seqNo, ch))
   # append to WAL before mutating (write-ahead)
   db.wal.append(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
-  cs.replMetaHlc[docId] = chHlc
-  cs.replMetaChangeId[docId] = chChangeId
+  cs.replMeta[docId] = ReplMeta(hlc: chHlc, changeId: chChangeId)
   let oldDoc = lookupDoc(cs, docId)   # faults from snapshot if needed
   cs.docs[docId] = stored
   markDirty(cs, docId)
   cs.versions[docId] = newVer
-  db.cache.put(collection & ":" & docId, stored)
+  db.cache.put((collection, docId), stored)
   if cs.indexes.len > 0:
     for _, idx in cs.indexes: idx.reindexDoc(docId, oldDoc, stored)
   if cs.geoIndexes.len > 0:
@@ -998,20 +1015,18 @@ proc delete*(db: GlenDB; collection, docId: string) =
   let oldDoc = lookupDoc(cs, docId)   # may fault from snapshot
   if not oldDoc.isNil:
     let ver = currentVersionFromStore(cs, docId) + 1
-    # assign replication metadata (under replLock)
+    # Acquire just seqNo + HLC under replLock.
     acquire(db.replLock)
     inc db.replSeq
+    let seqNo = db.replSeq
     let chHlc = db.nextLocalHlc()
-    let chChangeId = $db.replSeq & ":" & db.nodeId
-    let ch = ReplChange(collection: collection, docId: docId, op: roDelete, version: ver, value: nil, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
-    db.replLog.add((db.replSeq, ch))
-    if collection notin db.replLogByCollection: db.replLogByCollection[collection] = @[]
-    db.replLogByCollection[collection].add((db.replSeq, ch))
     release(db.replLock)
+    let chChangeId = $seqNo & ":" & db.nodeId
+    let ch = ReplChange(collection: collection, docId: docId, op: roDelete, version: ver, value: nil, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
+    cs.replLog.add((seqNo, ch))
     # append to WAL before mutating (write-ahead)
     db.wal.append(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
-    cs.replMetaHlc[docId] = chHlc
-    cs.replMetaChangeId[docId] = chChangeId
+    cs.replMeta[docId] = ReplMeta(hlc: chHlc, changeId: chChangeId)
     if cs.indexes.len > 0:
       for _, idx in cs.indexes: idx.unindexDoc(docId, oldDoc)
     if cs.geoIndexes.len > 0:
@@ -1023,7 +1038,7 @@ proc delete*(db: GlenDB; collection, docId: string) =
     cs.docs.del(docId)
     markDeleted(cs, docId)
     cs.versions.del(docId)
-    db.cache.del(collection & ":" & docId)
+    db.cache.del((collection, docId))
     notifications.add((Id(collection: collection, docId: docId, version: ver), VNull()))
     fieldNotifications.add((Id(collection: collection, docId: docId, version: ver), oldDoc, nil))
   db.releaseStripeWrite(collection)
@@ -1086,7 +1101,9 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       return CommitResult(status: csConflict, message: "Version mismatch for " & k[0] & ":" & k[1])
   # apply writes (compute WAL with replication metadata, then mutate, then log)
   var walRecs: seq[WalRecord] = @[]
-  var replEntries: seq[(uint64, ReplChange)] = @[]
+  # (cs, seqNo, change) tuples to append to per-collection logs after
+  # walRecs has flushed. Stripe write-locks for every cs are already held.
+  var replEntries: seq[(CollectionStore, uint64, ReplChange)] = @[]
   for key, w in t.writes:
     let collection = key[0]
     let docId = key[1]
@@ -1095,16 +1112,16 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       let oldDoc = if cs.isNil: nil else: lookupDoc(cs, docId)
       if not cs.isNil and not oldDoc.isNil:
         let newVer = currentVersionFromStore(cs, docId) + 1
-        # replication metadata under replLock
+        # seqNo + HLC under replLock
         acquire(db.replLock)
         inc db.replSeq
+        let seqNo = db.replSeq
         let chHlc = db.nextLocalHlc()
-        let chChangeId = $db.replSeq & ":" & db.nodeId
-        let ch = ReplChange(collection: collection, docId: docId, op: roDelete, version: newVer, value: nil, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
-        replEntries.add((db.replSeq, ch))
-        cs.replMetaHlc[docId] = chHlc
-        cs.replMetaChangeId[docId] = chChangeId
         release(db.replLock)
+        let chChangeId = $seqNo & ":" & db.nodeId
+        let ch = ReplChange(collection: collection, docId: docId, op: roDelete, version: newVer, value: nil, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
+        replEntries.add((cs, seqNo, ch))
+        cs.replMeta[docId] = ReplMeta(hlc: chHlc, changeId: chChangeId)
         # write-ahead
         walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: newVer, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
         if cs.indexes.len > 0:
@@ -1118,29 +1135,29 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
         cs.docs.del(docId)
         markDeleted(cs, docId)
         cs.versions.del(docId)
-        db.cache.del(collection & ":" & docId)
+        db.cache.del((collection, docId))
         notifications.add((Id(collection: collection, docId: docId, version: newVer), VNull()))
         fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, nil))
     else:
       let cs = db.getOrCreateCollection(collection)
       let newVer = currentVersionFromStore(cs, docId) + 1
-      # replication metadata under replLock
+      # seqNo + HLC under replLock
       acquire(db.replLock)
       inc db.replSeq
+      let seqNo = db.replSeq
       let chHlc = db.nextLocalHlc()
-      let chChangeId = $db.replSeq & ":" & db.nodeId
-      let ch = ReplChange(collection: collection, docId: docId, op: roPut, version: newVer, value: w.value, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
-      replEntries.add((db.replSeq, ch))
-      cs.replMetaHlc[docId] = chHlc
-      cs.replMetaChangeId[docId] = chChangeId
       release(db.replLock)
+      let chChangeId = $seqNo & ":" & db.nodeId
+      let ch = ReplChange(collection: collection, docId: docId, op: roPut, version: newVer, value: w.value, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc)
+      replEntries.add((cs, seqNo, ch))
+      cs.replMeta[docId] = ReplMeta(hlc: chHlc, changeId: chChangeId)
       # write-ahead
       walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: w.value, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
       let oldDoc = lookupDoc(cs, docId)   # spill-aware: faults if needed
       cs.docs[docId] = w.value
       markDirty(cs, docId)
       cs.versions[docId] = newVer
-      db.cache.put(collection & ":" & docId, w.value)
+      db.cache.put((collection, docId), w.value)
       if cs.indexes.len > 0:
         for _, idx in cs.indexes: idx.reindexDoc(docId, oldDoc, w.value)
       if cs.geoIndexes.len > 0:
@@ -1153,16 +1170,11 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
       fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, w.value))
   if walRecs.len > 0:
     db.wal.appendMany(walRecs)
-  # record replication changes (with precomputed seq) under replLock to avoid
-  # racing with concurrent put/delete/applyChanges on disjoint stripes.
-  if replEntries.len > 0:
-    acquire(db.replLock)
-    for entry in replEntries:
-      db.replLog.add(entry)
-      let coll = entry[1].collection
-      if coll notin db.replLogByCollection: db.replLogByCollection[coll] = @[]
-      db.replLogByCollection[coll].add(entry)
-    release(db.replLock)
+  # Append per-collection log entries; the stripe write-lock for every cs
+  # is held by acquireStripesWrite above, so these adds are serialized
+  # against any other writer to the same collection.
+  for (cs, seqNo, ch) in replEntries:
+    cs.replLog.add((seqNo, ch))
   t.state = tsCommitted
   db.releaseStripesWrite(stripes)
   for it in notifications:
@@ -1234,22 +1246,19 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
     walRecs.add(WalRecord(kind: wrPut, collection: collection, docId: docId, version: newVer, value: stored, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
     let oldDoc = lookupDoc(cs, docId)   # spill-aware
     pending.add(PendingPut(docId: docId, stored: stored, oldDoc: oldDoc, version: newVer, seqNo: seqNo, hlc: chHlc, changeId: chChangeId))
+  release(db.replLock)
   if walRecs.len > 0:
     db.wal.appendMany(walRecs)
-  # replication log and metadata updates
+  # Per-collection log + metadata updates (stripe write-lock is held).
   for entry in pending:
     let change = ReplChange(collection: collection, docId: entry.docId, op: roPut, version: entry.version, value: entry.stored, changeId: entry.changeId, originNode: db.nodeId, hlc: entry.hlc)
-    db.replLog.add((entry.seqNo, change))
-    if collection notin db.replLogByCollection: db.replLogByCollection[collection] = @[]
-    db.replLogByCollection[collection].add((entry.seqNo, change))
-    cs.replMetaHlc[entry.docId] = entry.hlc
-    cs.replMetaChangeId[entry.docId] = entry.changeId
-  release(db.replLock)
+    cs.replLog.add((entry.seqNo, change))
+    cs.replMeta[entry.docId] = ReplMeta(hlc: entry.hlc, changeId: entry.changeId)
   for entry in pending:
     cs.docs[entry.docId] = entry.stored
     markDirty(cs, entry.docId)
     cs.versions[entry.docId] = entry.version
-    db.cache.put(collection & ":" & entry.docId, entry.stored)
+    db.cache.put((collection, entry.docId), entry.stored)
     for _, idx in cs.indexes:
       idx.reindexDoc(entry.docId, entry.oldDoc, entry.stored)
     for _, gix in cs.geoIndexes:
@@ -1297,16 +1306,13 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
       let chChangeId = $seqNo & ":" & db.nodeId
       walRecs.add(WalRecord(kind: wrDelete, collection: collection, docId: docId, version: ver, changeId: chChangeId, originNode: db.nodeId, hlc: chHlc))
       pending.add(PendingDelete(docId: docId, oldDoc: oldDoc, version: ver, seqNo: seqNo, hlc: chHlc, changeId: chChangeId))
+  release(db.replLock)
   if walRecs.len > 0:
     db.wal.appendMany(walRecs)
   for entry in pending:
     let change = ReplChange(collection: collection, docId: entry.docId, op: roDelete, version: entry.version, value: nil, changeId: entry.changeId, originNode: db.nodeId, hlc: entry.hlc)
-    db.replLog.add((entry.seqNo, change))
-    if collection notin db.replLogByCollection: db.replLogByCollection[collection] = @[]
-    db.replLogByCollection[collection].add((entry.seqNo, change))
-    cs.replMetaHlc[entry.docId] = entry.hlc
-    cs.replMetaChangeId[entry.docId] = entry.changeId
-  release(db.replLock)
+    cs.replLog.add((entry.seqNo, change))
+    cs.replMeta[entry.docId] = ReplMeta(hlc: entry.hlc, changeId: entry.changeId)
   for entry in pending:
     for _, idx in cs.indexes:
       idx.unindexDoc(entry.docId, entry.oldDoc)
@@ -1319,7 +1325,7 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
     if entry.docId in cs.docs: cs.docs.del(entry.docId)
     markDeleted(cs, entry.docId)
     if entry.docId in cs.versions: cs.versions.del(entry.docId)
-    db.cache.del(collection & ":" & entry.docId)
+    db.cache.del((collection, entry.docId))
     let idObj = Id(collection: collection, docId: entry.docId, version: entry.version)
     notifications.add((idObj, VNull()))
     fieldNotifications.add((idObj, entry.oldDoc, nil))
@@ -2067,60 +2073,47 @@ proc exportChanges*(db: GlenDB; since: ReplExportCursor; includeCollections: seq
   ## Export changes after the provided cursor, filtered by collection allow/deny lists.
   ## Returns the new cursor and a sequence of changes.
   ##
-  ## Concurrency: the replLock is held only long enough to snapshot the
-  ## relevant slice(s) of the replication log. All filtering, sorting, and
-  ## output construction happen outside the lock so concurrent writers and
-  ## other peers' exportChanges calls aren't serialized through it.
-  # Take a stable snapshot of the slices we need under the lock, then drop it.
-  # ReplChange holds a Value ref; copying the seqs just bumps refcounts.
-  var snapGlobal: seq[(uint64, ReplChange)]
-  var snapByColl: Table[string, seq[(uint64, ReplChange)]]
+  ## Concurrency: per-collection logs are snapshotted under each collection's
+  ## stripe read-lock; outside those locks we filter, merge, and sort.
+  ## Concurrent writers to other collections (or queries to this one) keep
+  ## moving — no global replLock is held across the export.
   let unfiltered = includeCollections.len == 0 and excludeCollections.len == 0
-  acquire(db.replLock)
-  if unfiltered:
-    # Binary-search the first index with seqNo > since (replLog is in
-    # insertion order, which is also seqNo-monotone since seqNo is assigned
-    # under replLock at insert time).
-    var lo = 0
-    var hi = db.replLog.len
-    while lo < hi:
-      let mid = (lo + hi) shr 1
-      if db.replLog[mid][0] <= since: lo = mid + 1
-      else: hi = mid
-    snapGlobal = db.replLog[lo .. ^1]
+  var deny = initTable[string, bool]()
+  for c in excludeCollections: deny[c] = true
+  # Decide which collections to scan, then snapshot each per-coll log.
+  acquireRead(db.structLock)
+  var collNames: seq[string] = @[]
+  if includeCollections.len > 0:
+    for c in includeCollections:
+      if c in db.collections and not deny.getOrDefault(c, false):
+        collNames.add(c)
   else:
-    snapByColl = initTable[string, seq[(uint64, ReplChange)]]()
-    if includeCollections.len > 0:
-      for c in includeCollections:
-        if c in db.replLogByCollection:
-          snapByColl[c] = db.replLogByCollection[c]
-    else:
-      for coll, seqs in db.replLogByCollection:
-        snapByColl[coll] = seqs
-  release(db.replLock)
-  # ---- Outside the lock from here ----
-  var changesOut: seq[ReplChange] = @[]
+    for c, _ in db.collections:
+      if not deny.getOrDefault(c, false): collNames.add(c)
+  releaseRead(db.structLock)
+  var snaps: seq[seq[(uint64, ReplChange)]] = @[]
+  for c in collNames:
+    let cs = db.tryGetCollection(c)
+    if cs.isNil: continue
+    db.acquireStripeRead(c)
+    # Binary-search for the first index whose seqNo > since (per-collection
+    # slice is seqNo-monotone — appended under the stripe write-lock).
+    let cut = firstAfterSeq(cs.replLog, since)
+    if cut < cs.replLog.len:
+      snaps.add(cs.replLog[cut .. ^1])
+    db.releaseStripeRead(c)
+  # ---- Outside any DB lock from here ----
+  var merged: seq[(uint64, ReplChange)] = @[]
+  for s in snaps:
+    for entry in s: merged.add(entry)
+  merged.sort(proc (a, b: (uint64, ReplChange)): int = cmp(a[0], b[0]))
+  var changesOut: seq[ReplChange] = newSeqOfCap[ReplChange](merged.len)
   var nextCursor = since
-  if unfiltered:
-    for (seqNo, ch) in snapGlobal:
-      if ch.changeId.len == 0: continue
-      changesOut.add(ch)
-      if seqNo > nextCursor: nextCursor = seqNo
-  else:
-    var deny = initTable[string, bool]()
-    for c in excludeCollections: deny[c] = true
-    var filtered: seq[(uint64, ReplChange)] = @[]
-    for coll, seqs in snapByColl:
-      if coll in deny: continue
-      for (seqNo, ch) in seqs:
-        if seqNo <= since: continue
-        if ch.collection in deny: continue
-        if ch.changeId.len == 0: continue
-        filtered.add((seqNo, ch))
-    filtered.sort(proc (a, b: (uint64, ReplChange)): int = cmp(a[0], b[0]))
-    for (seqNo, ch) in filtered:
-      changesOut.add(ch)
-      if seqNo > nextCursor: nextCursor = seqNo
+  for (seqNo, ch) in merged:
+    if ch.changeId.len == 0: continue
+    if not unfiltered and ch.collection in deny: continue
+    changesOut.add(ch)
+    if seqNo > nextCursor: nextCursor = seqNo
   return (nextCursor, changesOut)
 
 proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
@@ -2172,17 +2165,19 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
       else: lookupDocBypass(cs, docId)
     var curHlc: Hlc
     var hasHlc = false
+    var curChangeId = ""
     if key in pendingHlc:
       curHlc = pendingHlc[key]
       hasHlc = true
-    elif docId in cs.replMetaHlc:
-      curHlc = cs.replMetaHlc[docId]
-      hasHlc = true
-    var curChangeId = ""
     if key in pendingChangeIds:
       curChangeId = pendingChangeIds[key]
-    elif docId in cs.replMetaChangeId:
-      curChangeId = cs.replMetaChangeId[docId]
+    if (not hasHlc or curChangeId.len == 0) and docId in cs.replMeta:
+      let meta = cs.replMeta[docId]
+      if not hasHlc:
+        curHlc = meta.hlc
+        hasHlc = true
+      if curChangeId.len == 0:
+        curChangeId = meta.changeId
     if curChangeId.len > 0 and ch.changeId.len > 0 and curChangeId == ch.changeId:
       db.mergeRemoteHlc(ch.hlc)
       continue
@@ -2220,7 +2215,7 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
       if docId in cs.docs: cs.docs.del(docId)
       markDeleted(cs, docId)
       if docId in cs.versions: cs.versions.del(docId)
-      db.cache.del(coll & ":" & docId)
+      db.cache.del((coll, docId))
       notifications.add((Id(collection: coll, docId: docId, version: ch.version), VNull()))
       fieldNotifications.add((Id(collection: coll, docId: docId, version: ch.version), act.oldDoc, nil))
     else:
@@ -2230,7 +2225,7 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
       cs.docs[docId] = stored
       markDirty(cs, docId)
       cs.versions[docId] = ch.version
-      db.cache.put(coll & ":" & docId, stored)
+      db.cache.put((coll, docId), stored)
       for _, idx in cs.indexes:
         idx.reindexDoc(docId, act.oldDoc, stored)
       for _, gix in cs.geoIndexes:
@@ -2241,12 +2236,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
         vix.reindexDoc(docId, act.oldDoc, stored)
       notifications.add((Id(collection: coll, docId: docId, version: ch.version), stored))
       fieldNotifications.add((Id(collection: coll, docId: docId, version: ch.version), act.oldDoc, stored))
-    cs.replMetaHlc[docId] = pendingHlc[key]
-    cs.replMetaChangeId[docId] = pendingChangeIds[key]
-    let entry = (act.seqNo, ch)
-    db.replLog.add(entry)
-    if coll notin db.replLogByCollection: db.replLogByCollection[coll] = @[]
-    db.replLogByCollection[coll].add(entry)
+    cs.replMeta[docId] = ReplMeta(hlc: pendingHlc[key], changeId: pendingChangeIds[key])
+    cs.replLog.add((act.seqNo, ch))
   release(db.replLock)
   db.releaseStripesWrite(stripes)
   for it in notifications:

@@ -18,15 +18,15 @@ graph TB
   DB --> ReplLock
 
   Struct -.protects.- Coll[collections Table - name to CollectionStore]
-  Stripes -.protects.- CSData[per-collection state]
-  ReplLock -.protects.- ReplLog[replication seq + HLC + log]
+  Stripes -.protects.- CSData[per-collection state incl. replLog]
+  ReplLock -.protects.- ReplSeq[replSeq + local HLC]
 ```
 
 | Lock | Mode | Protects |
 |---|---|---|
 | `structLock` | reader-prefer RW | The outer `collections` map only. New-collection inserts take it write-mode. |
-| `lockStripes[i]` | reader-prefer RW | All `CollectionStore` mutable state for collections hashed to stripe `i`. Default 32 stripes. |
-| `replLock` | plain mutex | The replication seq counter, local HLC, and the in-memory replication change log. Held briefly under stripe write locks. |
+| `lockStripes[i]` | reader-prefer RW | All `CollectionStore` mutable state for collections hashed to stripe `i`, including `replLog`. Default 32 stripes. |
+| `replLock` | plain mutex | The replication seq counter and local HLC mutation only. Held very briefly per write — the change-log entry itself goes into the writer's per-collection `replLog` under that collection's stripe lock, so disjoint-collection writers don't queue here. |
 
 `db.cache` (sharded LRU) and `db.subs` (subscription manager) carry their
 own internal locks; they are not shared with these.
@@ -54,10 +54,10 @@ sequenceDiagram
   DB->>Struct: releaseRead
   DB->>Stripe: acquireWrite
   DB->>Repl: acquire
-  Note right of Repl: assign seq + HLC<br/>append to repl log
+  Note right of Repl: assign seq + HLC only
   DB->>Repl: release
-  DB->>WAL: append write-ahead
-  DB->>CS: update docs and reindex
+  DB->>WAL: encode (thread-local) + framed write
+  DB->>CS: append cs.replLog, update docs, reindex
   DB->>Stripe: releaseWrite
   DB->>Subs: notify outside locks
 ```
@@ -120,8 +120,11 @@ graph LR
   Mailbox -->|applyChanges| B
 ```
 
-Each mutation gets a `(seq, HLC, changeId, originNode)` triple under
-`replLock`:
+Each mutation produces a `(seq, HLC, changeId, originNode)` tuple. `seq`
+and the HLC are minted under `replLock` (held very briefly), then the
+tuple is appended to the writing collection's `replLog` under that
+collection's stripe write-lock — so two writers on different collections
+don't serialise on a global change-log mutex:
 
 - **`seq`** — local monotonic counter, drives the export cursor.
 - **`HLC`** = `(wallMillis, counter, nodeId)` — Hybrid Logical Clock.
@@ -141,17 +144,25 @@ db.setPeerCursor("peerB", nextCursor)
 db.applyChanges(received)
 ```
 
+`exportChanges` snapshots each relevant collection's `replLog` under the
+collection's stripe read-lock (binary-searching past `since`), then merges
+and sorts the slices outside any DB lock. Filtered exports
+(`includeCollections` / `excludeCollections`) and unfiltered ones share
+the same path; concurrent writers on disjoint collections keep moving.
+
 **Conflict resolution** is HLC-based last-write-wins per doc. On
 `applyChanges`, each incoming change compares its HLC against the doc's
-current HLC (or the highest pending HLC for that doc within the same batch);
-older changes are dropped, newer ones win.
+current HLC (stored in `cs.replMeta`, alongside its `changeId`) or the
+highest pending HLC for that doc within the same batch; older changes are
+dropped, newer ones win.
 
 After receiving a remote change, Glen advances its local HLC past the
 remote's `wallMillis/counter`, so future local writes always sort after the
 freshest remote change it has seen.
 
-`gcReplLog()` trims the in-memory change log up to `min(peerCursors)`. Call
-it periodically once peers have ack'd.
+`gcReplLog()` trims every per-collection log up to `min(peerCursors)`.
+`setPeerCursor` calls it automatically, so the in-memory log shrinks as
+peers ack with no manual GC ticker required.
 
 See [api/core.md#replication](api/core.md#replication) for the full API.
 

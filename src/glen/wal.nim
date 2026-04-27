@@ -265,11 +265,14 @@ proc writeFramedRecord(wal: WriteAheadLog; body: string): int {.inline.} =
   prefixLen + body.len
 
 proc append*(wal: WriteAheadLog; rec: WalRecord) =
-  acquire(wal.lock)
-  defer: release(wal.lock)
+  # Encode the record body OUTSIDE wal.lock — bodyStream is thread-local, so
+  # parallel writers can serialize their record bytes concurrently and only
+  # contend on the lock during the actual file write + flush.
   resetBodyStream()
   encodeRecordBody(rec, bodyStream)
   let body = bodyStream.data
+  acquire(wal.lock)
+  defer: release(wal.lock)
   let written = writeFramedRecord(wal, body)
   wal.currentSize += written
   case wal.syncMode
@@ -285,16 +288,22 @@ proc append*(wal: WriteAheadLog; rec: WalRecord) =
     discard
 
 proc appendMany*(wal: WriteAheadLog; recs: openArray[WalRecord]) =
-  acquire(wal.lock)
-  defer: release(wal.lock)
-  var totalWritten = 0
+  # Encode every record outside wal.lock; only the file write + flush span
+  # holds the lock. bodyStream is thread-local, so each per-record encode
+  # reuses the same buffer (we snapshot via $bodyStream.data into a fresh
+  # string before resetting on the next iteration).
+  var bodies = newSeqOfCap[string](recs.len)
   for rec in recs:
     resetBodyStream()
     encodeRecordBody(rec, bodyStream)
-    let written = writeFramedRecord(wal, bodyStream.data)
+    bodies.add(bodyStream.data)
+  acquire(wal.lock)
+  defer: release(wal.lock)
+  var totalWritten = 0
+  for body in bodies:
+    let written = writeFramedRecord(wal, body)
     wal.currentSize += written
     totalWritten += written
-
   case wal.syncMode
   of wsmAlways:
     wal.fs.flushFile()

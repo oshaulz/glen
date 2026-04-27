@@ -17,13 +17,15 @@ graph TB
     CS --> Eq[indexes]
     CS --> Geo[geoIndexes]
     CS --> Poly[polygonIndexes]
+    CS --> RLog[replLog - change log slice]
+    CS --> RMeta[replMeta - per-doc HLC + changeId]
     CS --> Snap[snapshot mmap]
   end
 
   subgraph "DB-wide subsystems"
     Cache[LruCache - sharded]
     Subs[SubscriptionMgr]
-    Repl[Replication log + HLC]
+    Repl[HLC + repl seq + peer cursors]
     WAL[WriteAheadLog]
   end
 
@@ -42,15 +44,21 @@ A `GlenDB` is a `ref` holding:
   name; multi-collection transactions acquire stripes in sorted order to avoid
   deadlock. See [concurrency.md](concurrency.md).
 - A **sharded LRU cache** fronting reads (default 16 shards, 64 MB budget).
+  Entries are keyed by `(collection, docId)` so reads don't pay a string
+  concat per lookup.
 - A **subscription manager** keyed by `collection:docId`.
 - A **WAL** owning the on-disk segment files.
-- An **in-memory replication log** + Hybrid Logical Clock for multi-master.
+- A Hybrid Logical Clock + monotonic `replSeq` for multi-master ordering.
+  The change log itself is sliced per-collection and lives inside each
+  `CollectionStore`.
 
 Each `CollectionStore` carries:
 
 - `docs` — the in-memory hot working set
 - `versions` — per-doc monotonic counters for OCC
 - `indexes` / `geoIndexes` / `polygonIndexes` — secondary indexes
+- `replLog` — this collection's slice of the replication change log
+- `replMeta` — per-doc HLC + changeId for LWW conflict resolution
 - `snapshot` — optional mmap'd `*.snap` file (active in spillable mode)
 - `dirty` / `deleted` — spill-mode bookkeeping for in-memory mutations
 
@@ -78,10 +86,12 @@ appropriate for hot loops that won't mutate the returned `Value`.
 ```mermaid
 graph LR
   W[db.put / commit] --> Lock[acquire stripe write]
-  Lock --> Repl[assign repl seq + HLC under replLock]
-  Repl --> WAL[append to WAL]
-  WAL --> Apply[update cs.docs + versions + cache]
-  Apply --> Idx[reindex equality / geo / polygon]
+  Lock --> Repl[seq + HLC under replLock - tiny]
+  Repl --> Encode[encode WAL body in thread-local buffer]
+  Encode --> WAL[wal.lock: framed write + flush]
+  WAL --> RLog[append to cs.replLog under stripe lock]
+  RLog --> Apply[update cs.docs + versions + cache]
+  Apply --> Idx[reindex equality / geo / polygon if any]
   Idx --> Unlock[release stripe write]
   Unlock --> Notify[notify subscribers outside locks]
 ```
@@ -90,6 +100,12 @@ Write-ahead durability: the WAL append happens **before** any in-memory
 mutation. If we crash between steps, recovery re-applies from the WAL on next
 open. Subscriber callbacks fire after locks are released, so they can issue
 their own DB calls without deadlock.
+
+Body encoding for the WAL is done in a thread-local buffer outside
+`wal.lock`, so concurrent writers serialize their record bytes in parallel
+and only contend for the lock during the actual file write + flush. Index
+reindexing skips its inner loop when the relevant index Table is empty,
+keeping the index-free common case off the per-write hot path.
 
 ## On-disk layout
 

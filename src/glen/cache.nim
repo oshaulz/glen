@@ -4,14 +4,16 @@ import std/[tables, locks, hashes]
 import glen/types
 
 type
+  CacheKey* = tuple[collection, docId: string]
+
   CacheEntry = ref object
-    key: string
+    key: CacheKey
     value: Value
     prev, next: CacheEntry
     size: int
 
   CacheShard = ref object
-    map: Table[string, CacheEntry]
+    map: Table[CacheKey, CacheEntry]
     head, tail: CacheEntry
     capacity: int
     current: int
@@ -30,7 +32,7 @@ type
     evictions*: int
 
 proc makeShard(capacity: int): CacheShard =
-  result = CacheShard(map: initTable[string, CacheEntry](), capacity: capacity)
+  result = CacheShard(map: initTable[CacheKey, CacheEntry](), capacity: capacity)
   initLock(result.lock)
 
 proc newLruCache*(capacity: int; numShards: int = 1): LruCache =
@@ -78,11 +80,17 @@ proc estimateSize(v: Value): int =
     s
   of vkId: 32 + v.id.collection.len + v.id.docId.len
 
-proc chooseShard(c: LruCache; key: string): CacheShard =
-  let h = abs(hash(key).int)
-  c.shards[h mod c.shards.len]
+proc chooseShard(c: LruCache; key: CacheKey): CacheShard =
+  # Combine the two hashes without joining the strings — saves the string
+  # alloc and memcpy that `collection & ":" & docId` would otherwise pay
+  # on every cache get/put.
+  var h: Hash = 0
+  h = h !& hash(key.collection)
+  h = h !& hash(key.docId)
+  h = !$h
+  c.shards[abs(h.int) mod c.shards.len]
 
-proc get*(c: LruCache; key: string): Value =
+proc get*(c: LruCache; key: CacheKey): Value =
   let s = c.chooseShard(key)
   acquire(s.lock)
   defer: release(s.lock)
@@ -93,7 +101,7 @@ proc get*(c: LruCache; key: string): Value =
     return e.value
   inc s.misses; inc c.misses
 
-proc put*(c: LruCache; key: string; value: Value) =
+proc put*(c: LruCache; key: CacheKey; value: Value) =
   let s = c.chooseShard(key)
   acquire(s.lock)
   defer: release(s.lock)
@@ -133,7 +141,7 @@ proc adjustCapacity*(c: LruCache; newCap: int) =
       s.current -= victim.size
     release(s.lock)
 
-proc del*(c: LruCache; key: string) =
+proc del*(c: LruCache; key: CacheKey) =
   let s = c.chooseShard(key)
   acquire(s.lock)
   defer: release(s.lock)

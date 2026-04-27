@@ -76,8 +76,8 @@ A `GlenDB` is a `ref` carrying:
 - A sharded LRU `db.cache` (default 16 shards, 64 MiB byte-budget).
 - A `SubscriptionManager` keyed by `collection:docId`.
 - A `WriteAheadLog` owning the on-disk segment files.
-- Replication state: `replSeq`, local `Hlc`, in-memory change log, per-peer
-  cursors.
+- Replication state: `replSeq`, local `Hlc`, per-peer cursors. The change
+  log itself lives per-collection inside each `CollectionStore`.
 - An `indexManifestPath` recording persisted index definitions.
 
 Each `CollectionStore` carries:
@@ -85,16 +85,22 @@ Each `CollectionStore` carries:
 - `docs`, `versions` — the in-memory hot working set (eager) or hot subset
   (spill).
 - `indexes`, `geoIndexes`, `polygonIndexes` — secondary indexes.
-- `replMetaHlc`, `replMetaChangeId` — per-doc replication metadata for LWW.
+- `replMeta` — per-doc replication metadata (HLC + changeId) for LWW.
+- `replLog` — the seqNo-monotone change log for this collection, appended
+  under the stripe write-lock so disjoint-collection writers don't serialise
+  on a global mutex.
 - `snapshot` — optional mmap'd `*.snap` file (active in spillable mode).
 - `dirty`, `deleted`, `hotDocCap`, `maxDirtyDocs` — spill-mode bookkeeping.
 
 ### 3.2 Sharded LRU Cache
 
 - Reduces read latency and lock contention. Sized by total byte budget,
-  split across `numShards` shards keyed by `hash(collection:docId)`.
+  split across `numShards` shards keyed by `(collection, docId)` (hashed
+  in-place — no string concatenation per lookup).
 - Each shard has its own lock and LRU list; concurrent reads on different
-  hot keys don't contend.
+  hot keys don't contend. The LRU touch on a hit is skipped when the
+  entry is already at the head, so steady-state hot reads do nothing
+  beyond the table probe.
 - Metrics via `db.cacheStats()`: per-shard hits, misses, puts, evictions.
 
 ### 3.3 Write-Ahead Log
@@ -106,7 +112,13 @@ Each `CollectionStore` carries:
   originNode).
 - Sync policies: `wsmAlways` (fsync per record) / `wsmInterval` (fsync per
   N bytes; default 8 MiB) / `wsmNone` (rely on OS buffering).
-- Batched `appendMany` minimises flushes for multi-record commits.
+- Body encoding happens in a thread-local buffer outside `wal.lock`; the
+  lock only spans the framed `writeBuffer` calls and any flush. Concurrent
+  writers on disjoint collections serialise their record bytes in parallel
+  and only contend for the file write itself.
+- Batched `appendMany` pre-encodes every record, then writes the batch
+  under one lock acquisition — minimises flushes and lock churn for
+  multi-record commits.
 - Replay tolerates a torn final record per segment; subsequent segments still
   consulted.
 
@@ -142,9 +154,13 @@ beginning of time.
   2. Acquire every touched stripe (writes ∪ reads) in **sorted order** —
      deadlock-free.
   3. Validate recorded read versions against current. Mismatch → `csConflict`.
-  4. Build WAL records; assign repl seq + HLC under `replLock`.
-  5. Apply writes to `cs.docs`, `versions`, cache, indexes (eq + geo + poly).
-  6. Batch-append WAL via `appendMany`.
+  4. Build WAL records; mint each write's `seq` + HLC under `replLock`
+     (held briefly, just for the counter mutation).
+  5. Apply writes to `cs.docs`, `versions`, cache, indexes (eq + geo + poly),
+     and append to each touched collection's `cs.replLog` under its
+     already-held stripe lock.
+  6. Batch-append WAL via `appendMany` (records are encoded in a
+     thread-local buffer, written under a single `wal.lock` acquisition).
   7. Release stripes; notify subscribers outside locks.
 
 `csInvalid` is returned if the txn is no longer active or the dirty-budget
@@ -334,10 +350,13 @@ Combined with `spillableMode + hotDocCap`, this gives a memory floor of
 ## 4. Concurrency Model
 
 - **structLock** (RW): protects only the outer `collections` map.
-- **stripe locks** (RW × `lockStripesCount`): protect per-collection state.
-  Stripe selection: `abs(hash(collection)) % stripeCount`.
-- **replLock** (mutex): replication seq counter + local HLC + in-memory
-  change log.
+- **stripe locks** (RW × `lockStripesCount`): protect per-collection state,
+  including each collection's `replLog`. Stripe selection:
+  `abs(hash(collection)) % stripeCount`.
+- **replLock** (mutex): just the replication seq counter and local HLC.
+  Held very briefly per write — the change-log entry itself goes into the
+  writer's per-collection `replLog` under the already-held stripe lock, so
+  disjoint-collection writers don't queue on this lock.
 
 Multi-stripe operations acquire stripes in ascending sorted order →
 deadlock-free. Global ops (`snapshotAll`, `compact`, `close`) acquire every
@@ -365,22 +384,32 @@ keep `--mm:orc` (default).
 
 ## 5. Replication
 
-Multi-master, transport-agnostic. Each mutation gets a tuple under
-`replLock`:
+Multi-master, transport-agnostic. Every mutation gets:
 
-- `seq` — local monotonic counter; drives the export cursor.
-- `hlc = (wallMillis, counter, nodeId)` — Hybrid Logical Clock.
+- `seq` — local monotonic counter assigned under `replLock`; drives the
+  export cursor.
+- `hlc = (wallMillis, counter, nodeId)` — Hybrid Logical Clock, also
+  produced under `replLock`.
 - `changeId = "$seq:$nodeId"` — globally unique; makes apply idempotent.
 - `originNode` — for filtering / topology.
 
+The triple `(seq, hlc, changeId)` is then appended to the writing
+collection's `replLog` under that collection's stripe write-lock — no
+global log, no shared mutex on the change-log itself.
+
 `exportChanges(since: cursor, includeCollections, excludeCollections)`
-returns a (newCursor, changes) pair from the in-memory log.
+takes a stripe-read snapshot of each relevant collection's `replLog`
+(binary-searching past `since`), merges the slices outside any DB lock,
+and returns a `(newCursor, changes)` pair. Concurrent writers and
+exporters on disjoint collections proceed in parallel.
 `applyChanges(changes)` is idempotent via `changeId` and resolves conflicts
 via HLC last-write-wins; older changes are dropped, newer ones win. After
 apply, the local HLC advances past the highest seen value.
 
-`gcReplLog()` trims the in-memory log up to `min(peerCursors)`. Peer
-cursors persist to `peers.state` (debounced; flushed on close).
+`gcReplLog()` trims every per-collection log up to `min(peerCursors)`.
+`setPeerCursor` calls it automatically, so memory stays bounded as peers
+ack — no manual GC ticker needed. Peer cursors persist to `peers.state`
+(debounced; flushed on close).
 
 Glen ships the data plane only — bring your own transport (HTTP, gRPC,
 NATS, mailbox dir, USB stick).
@@ -397,8 +426,8 @@ NATS, mailbox dir, USB stick).
      matching `.gri`/`.gpi` binary dump. CRC mismatch → silent fallback
      to bulk-rebuild post-replay.
   3. Replay every WAL segment in order — each record advances repl seq,
-     restores per-doc HLC + changeId, and incrementally updates any
-     loaded indexes.
+     repopulates `cs.replMeta[docId]` and appends to `cs.replLog`, and
+     incrementally updates any loaded indexes.
   4. Bulk-rebuild any equality / geo / polygon index that didn't have a
      dump loaded.
   5. Restore peer cursors from `peers.state`.
