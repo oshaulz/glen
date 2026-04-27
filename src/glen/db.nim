@@ -5,8 +5,11 @@ import glen/types, glen/wal, glen/storage, glen/cache, glen/subscription, glen/t
 import glen/rwlock
 import glen/index
 import glen/geo
+import glen/vectorindex
+import glen/query
 import glen/config
 import glen/util
+export query
 type
   ReplOp* = enum roPut, roDelete
 
@@ -31,6 +34,7 @@ type
     indexes:          IndexesByName
     geoIndexes:       GeoIndexesByName
     polygonIndexes:   PolygonIndexesByName
+    vectorIndexes:    VectorIndexesByName
     replMetaHlc:      Table[string, Hlc]
     replMetaChangeId: Table[string, string]
     # ---- Spillable mode (lazy / mmap'd snapshot) ----
@@ -45,7 +49,7 @@ type
     hotDocCap:        int   # 0 = unbounded
     maxDirtyDocs:     int   # 0 = unbounded; otherwise cap on cs.dirty.len
 
-  IndexKind = enum ikEq, ikGeo, ikPoly
+  IndexKind = enum ikEq, ikGeo, ikPoly, ikVector
 
   IndexManifestEntry = object
     kind: IndexKind
@@ -105,14 +109,18 @@ const IndexManifestFile = "indexes.manifest"
 proc geoIndexFilePath(dir, collection, name: string): string {.inline.} =
   dir / (collection & "." & name & ".gri")
 
+proc vectorIndexFilePath(dir, collection, name: string): string {.inline.} =
+  dir / (collection & "." & name & ".vri")
+
 proc polygonIndexFilePath(dir, collection, name: string): string {.inline.} =
   dir / (collection & "." & name & ".gpi")
 
 proc serializeManifestEntry(e: IndexManifestEntry): string =
   let kindStr = case e.kind
-    of ikEq:   "eq"
-    of ikGeo:  "geo"
-    of ikPoly: "poly"
+    of ikEq:     "eq"
+    of ikGeo:    "geo"
+    of ikPoly:   "poly"
+    of ikVector: "vec"
   kindStr & "\t" & e.collection & "\t" & e.name & "\t" & e.spec
 
 proc parseManifestEntry(line: string): (bool, IndexManifestEntry) =
@@ -122,6 +130,7 @@ proc parseManifestEntry(line: string): (bool, IndexManifestEntry) =
     of "eq":   ikEq
     of "geo":  ikGeo
     of "poly": ikPoly
+    of "vec":  ikVector
     else: return (false, IndexManifestEntry())
   (true, IndexManifestEntry(kind: kind, collection: parts[1],
                             name: parts[2], spec: parts[3]))
@@ -174,6 +183,7 @@ proc newCollectionStore(): CollectionStore =
     indexes:          initTable[string, Index](),
     geoIndexes:       initTable[string, GeoIndex](),
     polygonIndexes:   initTable[string, PolygonIndex](),
+    vectorIndexes:    initTable[string, VectorIndex](),
     replMetaHlc:      initTable[string, Hlc](),
     replMetaChangeId: initTable[string, string](),
     snapshot:         nil,
@@ -374,7 +384,7 @@ proc newGlenDB*(dir: string;
       cs.maxDirtyDocs = maxDirtyDocs
       if spillableMode:
         let mm = openSnapshotMmap(dir, name)
-        if not mm.isNil and (mm.isV2 or mm.isV3):
+        if not mm.isNil and (mm.isV2 or mm.isV3 or mm.isV4):
           cs.snapshot = mm
           # cs.docs starts empty; lookupDoc will fault from mm on demand.
         else:
@@ -430,6 +440,23 @@ proc newGlenDB*(dir: string;
       if tryLoadPolygonIndex(pix, path):
         cs.polygonIndexes[entry.name] = pix
         loadedFromDump[key] = true
+    of ikVector:
+      # spec format: "<field>:<dim>:<metric>" where metric ∈ cosine|l2|dot
+      let parts = entry.spec.split(':')
+      if parts.len != 3: continue
+      var dim: int
+      try: dim = parseInt(parts[1])
+      except ValueError: continue
+      let metric = case parts[2]
+        of "cosine": vmCosine
+        of "l2":     vmL2
+        of "dot":    vmDot
+        else:         vmCosine
+      let vix = newVectorIndex(entry.name, parts[0], dim, metric)
+      let path = vectorIndexFilePath(result.dir, entry.collection, entry.name)
+      if tryLoadVectorIndex(vix, path):
+        cs.vectorIndexes[entry.name] = vix
+        loadedFromDump[key] = true
   # replay WAL (also rebuild versions/indexes and in-memory replication log).
   for rec in replay(dir):
     if rec.collection notin result.collections:
@@ -454,6 +481,8 @@ proc newGlenDB*(dir: string;
           gix.unindexDoc(rec.docId, oldDoc)
         for _, pix in cs.polygonIndexes:
           pix.unindexDoc(rec.docId, oldDoc)
+        for _, vix in cs.vectorIndexes:
+          vix.unindexDoc(rec.docId, oldDoc)
         if rec.docId in cs.docs: cs.docs.del(rec.docId)
         markDeleted(cs, rec.docId)
       if rec.docId in cs.versions:
@@ -513,6 +542,20 @@ proc newGlenDB*(dir: string;
       let pix = newPolygonIndex(entry.name, entry.spec)
       pix.bulkBuild(allDocs)
       cs.polygonIndexes[entry.name] = pix
+    of ikVector:
+      let parts = entry.spec.split(':')
+      if parts.len != 3: continue
+      var dim: int
+      try: dim = parseInt(parts[1])
+      except ValueError: continue
+      let metric = case parts[2]
+        of "cosine": vmCosine
+        of "l2":     vmL2
+        of "dot":    vmDot
+        else:         vmCosine
+      let vix = newVectorIndex(entry.name, parts[0], dim, metric)
+      vix.bulkBuild(allDocs)
+      cs.vectorIndexes[entry.name] = vix
 
 # ---- Replication peers state and log GC ----
 const PeersStateFlushDebounceMs = 500
@@ -891,6 +934,8 @@ proc getAll*(db: GlenDB; collection: string; t: Txn): seq[(string, Value)] =
 ## Upsert a document value. Appends to WAL, updates in-memory state, versions,
 ## cache, and notifies subscribers.
 proc maybeAutoCompact*(db: GlenDB)
+proc fetchOneBypass(db: GlenDB; cs: CollectionStore;
+                    collection, docId: string): Value
 
 proc put*(db: GlenDB; collection, docId: string; value: Value) =
   var notifications: seq[(Id, Value)] = @[]
@@ -925,6 +970,8 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
     gix.reindexDoc(docId, oldDoc, stored)
   for _, pix in cs.polygonIndexes:
     pix.reindexDoc(docId, oldDoc, stored)
+  for _, vix in cs.vectorIndexes:
+    vix.reindexDoc(docId, oldDoc, stored)
   notifications.add((Id(collection: collection, docId: docId, version: newVer), stored))
   fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, stored))
   db.releaseStripeWrite(collection)
@@ -965,6 +1012,8 @@ proc delete*(db: GlenDB; collection, docId: string) =
       gix.unindexDoc(docId, oldDoc)
     for _, pix in cs.polygonIndexes:
       pix.unindexDoc(docId, oldDoc)
+    for _, vix in cs.vectorIndexes:
+      vix.unindexDoc(docId, oldDoc)
     if docId in cs.docs: cs.docs.del(docId)
     markDeleted(cs, docId)
     if docId in cs.versions: cs.versions.del(docId)
@@ -1058,6 +1107,8 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
           gix.unindexDoc(docId, oldDoc)
         for _, pix in cs.polygonIndexes:
           pix.unindexDoc(docId, oldDoc)
+        for _, vix in cs.vectorIndexes:
+          vix.unindexDoc(docId, oldDoc)
         if docId in cs.docs: cs.docs.del(docId)
         markDeleted(cs, docId)
         if docId in cs.versions: cs.versions.del(docId)
@@ -1090,6 +1141,8 @@ proc commit*(db: GlenDB; t: Txn): CommitResult =
         gix.reindexDoc(docId, oldDoc, w.value)
       for _, pix in cs.polygonIndexes:
         pix.reindexDoc(docId, oldDoc, w.value)
+      for _, vix in cs.vectorIndexes:
+        vix.reindexDoc(docId, oldDoc, w.value)
       notifications.add((Id(collection: collection, docId: docId, version: newVer), w.value))
       fieldNotifications.add((Id(collection: collection, docId: docId, version: newVer), oldDoc, w.value))
   if walRecs.len > 0:
@@ -1197,6 +1250,8 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
       gix.reindexDoc(entry.docId, entry.oldDoc, entry.stored)
     for _, pix in cs.polygonIndexes:
       pix.reindexDoc(entry.docId, entry.oldDoc, entry.stored)
+    for _, vix in cs.vectorIndexes:
+      vix.reindexDoc(entry.docId, entry.oldDoc, entry.stored)
     let idObj = Id(collection: collection, docId: entry.docId, version: entry.version)
     notifications.add((idObj, entry.stored))
     fieldNotifications.add((idObj, entry.oldDoc, entry.stored))
@@ -1253,6 +1308,8 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
       gix.unindexDoc(entry.docId, entry.oldDoc)
     for _, pix in cs.polygonIndexes:
       pix.unindexDoc(entry.docId, entry.oldDoc)
+    for _, vix in cs.vectorIndexes:
+      vix.unindexDoc(entry.docId, entry.oldDoc)
     if entry.docId in cs.docs: cs.docs.del(entry.docId)
     markDeleted(cs, entry.docId)
     if entry.docId in cs.versions: cs.versions.del(entry.docId)
@@ -1281,7 +1338,7 @@ proc snapshotAll*(db: GlenDB) =
   releaseRead(db.structLock)
   for (name, cs) in pairs:
     let docs = if cs.snapshot.isNil: cs.docs else: materializeAllDocs(cs)
-    writeSnapshotV3(db.dir, name, docs)
+    writeSnapshotV4(db.dir, name, docs)
 
 ## Create an equality index on a field path (e.g., "name" or "profile.age").
 ## Persisted in the manifest; auto-rebuilt on reopen.
@@ -1454,6 +1511,77 @@ proc dropPolygonIndex*(db: GlenDB; collection: string; name: string) =
   db.releaseStripeWrite(collection)
   db.removeManifestEntry(ikPoly, collection, name)
 
+## Create an HNSW vector index over `embeddingField` (an array of floats of
+## length `dim`) in `collection`. Documents missing the field, or whose
+## embedding is the wrong length, are skipped. Persisted to the manifest;
+## the binary `.vri` graph dump is written on `compact()` so reopen avoids
+## re-inserting every doc. Distance metric defaults to cosine.
+proc createVectorIndex*(db: GlenDB; collection, name, embeddingField: string;
+                       dim: int; metric: VectorMetric = vmCosine;
+                       M = 16; efConstruction = 200; efSearch = 64) =
+  doAssert dim > 0
+  let cs = db.getOrCreateCollection(collection)
+  db.acquireStripeWrite(collection)
+  let vix = newVectorIndex(name, embeddingField, dim, metric,
+                           M = M, efConstruction = efConstruction,
+                           efSearch = efSearch)
+  if cs.snapshot.isNil:
+    vix.bulkBuild(cs.docs)
+  else:
+    var allDocs = initTable[string, Value]()
+    for id in allDocIds(cs):
+      let v = lookupDocBypass(cs, id)
+      if not v.isNil: allDocs[id] = v
+    vix.bulkBuild(allDocs)
+  cs.vectorIndexes[name] = vix
+  db.releaseStripeWrite(collection)
+  let metricStr = case metric
+    of vmCosine: "cosine"
+    of vmL2:     "l2"
+    of vmDot:    "dot"
+  db.addManifestEntry(IndexManifestEntry(
+    kind: ikVector, collection: collection, name: name,
+    spec: embeddingField & ":" & $dim & ":" & metricStr))
+
+## Drop a vector index by name. Removes both the in-memory graph and the
+## manifest entry; the on-disk `.vri` file is left in place (will be
+## regenerated by the next compact() if the index is recreated).
+proc dropVectorIndex*(db: GlenDB; collection, name: string) =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil:
+    db.removeManifestEntry(ikVector, collection, name); return
+  db.acquireStripeWrite(collection)
+  if name in cs.vectorIndexes:
+    cs.vectorIndexes.del(name)
+  db.releaseStripeWrite(collection)
+  db.removeManifestEntry(ikVector, collection, name)
+
+## Approximate k-nearest-neighbour search via the named HNSW index. Returns
+## (docId, distance) pairs sorted ascending by distance (smaller = closer for
+## every supported metric). Pass a query vector with length matching the
+## index's `dim`; mismatches return an empty seq.
+proc findNearestVector*(db: GlenDB; collection, indexName: string;
+                       query: openArray[float32]; k: int): seq[(string, float32)] =
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil: return @[]
+  if indexName notin cs.vectorIndexes: return @[]
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
+  let vix = cs.vectorIndexes[indexName]
+  vix.findNearest(query, k)
+
+iterator findNearestVectorStream*(db: GlenDB; collection, indexName: string;
+                                  query: openArray[float32]; k: int): (string, float32, Value) =
+  ## Yield (docId, distance, doc) triples for the k nearest. The doc is
+  ## fetched via the same bypass-load path as other streaming iterators —
+  ## bounded memory in spill mode.
+  let cs = db.tryGetCollection(collection)
+  if not cs.isNil and indexName in cs.vectorIndexes:
+    let pairs = db.findNearestVector(collection, indexName, query, k)
+    for (id, dist) in pairs:
+      let v = db.fetchOneBypass(cs, collection, id)
+      if not v.isNil: yield (id, dist, v.clone())
+
 ## Find every polygon in the index whose interior contains the point (x, y).
 ## Uses an R-tree bbox prefilter, then exact ray-cast point-in-polygon test.
 proc findPolygonsContaining*(db: GlenDB; collection, indexName: string;
@@ -1582,11 +1710,13 @@ proc maybeAutoCompact*(db: GlenDB) =
   releaseRead(db.structLock)
   for (name, cs) in pairs:
     let docs = if cs.snapshot.isNil: cs.docs else: materializeAllDocs(cs)
-    writeSnapshotV3(db.dir, name, docs)
+    writeSnapshotV4(db.dir, name, docs)
     for idxName, gix in cs.geoIndexes:
       dumpGeoIndex(gix, geoIndexFilePath(db.dir, name, idxName))
     for idxName, pix in cs.polygonIndexes:
       dumpPolygonIndex(pix, polygonIndexFilePath(db.dir, name, idxName))
+    for idxName, vix in cs.vectorIndexes:
+      dumpVectorIndex(vix, vectorIndexFilePath(db.dir, name, idxName))
     if not cs.snapshot.isNil:
       closeSnapshotMmap(cs.snapshot)
       cs.snapshot = openSnapshotMmap(db.dir, name)
@@ -1608,7 +1738,7 @@ proc compact*(db: GlenDB) =
     # Always write v2 (the spillable-friendly indexed format). Eager-mode
     # readers handle v2 transparently.
     let docs = if cs.snapshot.isNil: cs.docs else: materializeAllDocs(cs)
-    writeSnapshotV3(db.dir, name, docs)
+    writeSnapshotV4(db.dir, name, docs)
     # Persist each spatial index alongside the snapshot. WAL is reset below,
     # so on next open these dumps reflect a state with an empty WAL — the
     # replay loop won't double-apply.
@@ -1616,6 +1746,8 @@ proc compact*(db: GlenDB) =
       dumpGeoIndex(gix, geoIndexFilePath(db.dir, name, idxName))
     for idxName, pix in cs.polygonIndexes:
       dumpPolygonIndex(pix, polygonIndexFilePath(db.dir, name, idxName))
+    for idxName, vix in cs.vectorIndexes:
+      dumpVectorIndex(vix, vectorIndexFilePath(db.dir, name, idxName))
     # If this DB was opened in spillable mode, swap in the new snapshot's
     # mmap and reset dirty/deleted state so future evictions can re-fetch
     # from the new file.
@@ -1928,47 +2060,62 @@ type ReplExportCursor* = uint64
 proc exportChanges*(db: GlenDB; since: ReplExportCursor; includeCollections: seq[string] = @[]; excludeCollections: seq[string] = @[]): (ReplExportCursor, seq[ReplChange]) =
   ## Export changes after the provided cursor, filtered by collection allow/deny lists.
   ## Returns the new cursor and a sequence of changes.
-  var allow = initTable[string, bool]()
-  if includeCollections.len > 0:
-    for c in includeCollections: allow[c] = true
-  var deny = initTable[string, bool]()
-  for c in excludeCollections: deny[c] = true
+  ##
+  ## Concurrency: the replLock is held only long enough to snapshot the
+  ## relevant slice(s) of the replication log. All filtering, sorting, and
+  ## output construction happen outside the lock so concurrent writers and
+  ## other peers' exportChanges calls aren't serialized through it.
+  # Take a stable snapshot of the slices we need under the lock, then drop it.
+  # ReplChange holds a Value ref; copying the seqs just bumps refcounts.
+  var snapGlobal: seq[(uint64, ReplChange)]
+  var snapByColl: Table[string, seq[(uint64, ReplChange)]]
+  let unfiltered = includeCollections.len == 0 and excludeCollections.len == 0
+  acquire(db.replLock)
+  if unfiltered:
+    # Binary-search the first index with seqNo > since (replLog is in
+    # insertion order, which is also seqNo-monotone since seqNo is assigned
+    # under replLock at insert time).
+    var lo = 0
+    var hi = db.replLog.len
+    while lo < hi:
+      let mid = (lo + hi) shr 1
+      if db.replLog[mid][0] <= since: lo = mid + 1
+      else: hi = mid
+    snapGlobal = db.replLog[lo .. ^1]
+  else:
+    snapByColl = initTable[string, seq[(uint64, ReplChange)]]()
+    if includeCollections.len > 0:
+      for c in includeCollections:
+        if c in db.replLogByCollection:
+          snapByColl[c] = db.replLogByCollection[c]
+    else:
+      for coll, seqs in db.replLogByCollection:
+        snapByColl[coll] = seqs
+  release(db.replLock)
+  # ---- Outside the lock from here ----
   var changesOut: seq[ReplChange] = @[]
   var nextCursor = since
-  acquire(db.replLock)
-  if includeCollections.len == 0 and excludeCollections.len == 0:
-    # Fast path: no filters, scan global log
-    for (seqNo, ch) in db.replLog:
-      if seqNo <= since: continue
+  if unfiltered:
+    for (seqNo, ch) in snapGlobal:
       if ch.changeId.len == 0: continue
       changesOut.add(ch)
       if seqNo > nextCursor: nextCursor = seqNo
   else:
-    # Filtered path: iterate per-collection logs
+    var deny = initTable[string, bool]()
+    for c in excludeCollections: deny[c] = true
     var filtered: seq[(uint64, ReplChange)] = @[]
-    if includeCollections.len > 0:
-      for coll, _ in allow:
-        if coll in db.replLogByCollection:
-          for (seqNo, ch) in db.replLogByCollection[coll]:
-            if seqNo <= since: continue
-            if ch.collection in deny: continue
-            if ch.changeId.len == 0: continue
-            filtered.add((seqNo, ch))
-    else:
-      # no explicit include list -> iterate all collections except denied
-      for coll, seqs in db.replLogByCollection:
-        if coll in deny: continue
-        for (seqNo, ch) in seqs:
-          if seqNo <= since: continue
-          if ch.changeId.len == 0: continue
-          filtered.add((seqNo, ch))
+    for coll, seqs in snapByColl:
+      if coll in deny: continue
+      for (seqNo, ch) in seqs:
+        if seqNo <= since: continue
+        if ch.collection in deny: continue
+        if ch.changeId.len == 0: continue
+        filtered.add((seqNo, ch))
     filtered.sort(proc (a, b: (uint64, ReplChange)): int = cmp(a[0], b[0]))
     for (seqNo, ch) in filtered:
       changesOut.add(ch)
       if seqNo > nextCursor: nextCursor = seqNo
-  let res = (nextCursor, changesOut)
-  release(db.replLock)
-  return res
+  return (nextCursor, changesOut)
 
 proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
   ## Apply a batch of changes from a remote node. Idempotent via changeId; resolves conflicts using HLC (LWW semantics).
@@ -2062,6 +2209,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
           gix.unindexDoc(docId, act.oldDoc)
         for _, pix in cs.polygonIndexes:
           pix.unindexDoc(docId, act.oldDoc)
+        for _, vix in cs.vectorIndexes:
+          vix.unindexDoc(docId, act.oldDoc)
       if docId in cs.docs: cs.docs.del(docId)
       markDeleted(cs, docId)
       if docId in cs.versions: cs.versions.del(docId)
@@ -2082,6 +2231,8 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
         gix.reindexDoc(docId, act.oldDoc, stored)
       for _, pix in cs.polygonIndexes:
         pix.reindexDoc(docId, act.oldDoc, stored)
+      for _, vix in cs.vectorIndexes:
+        vix.reindexDoc(docId, act.oldDoc, stored)
       notifications.add((Id(collection: coll, docId: docId, version: ch.version), stored))
       fieldNotifications.add((Id(collection: coll, docId: docId, version: ch.version), act.oldDoc, stored))
     cs.replMetaHlc[docId] = pendingHlc[key]
@@ -2097,4 +2248,129 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
   for it in fieldNotifications:
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
   db.maybeAutoCompact()
+
+# -------- Higher-level query API --------
+#
+# Method-chain over GlenDB: composable predicate filters with planner-style
+# index dispatch. The planner is intentionally simple — it picks at most one
+# equality / `in` predicate that an existing single-field index covers, walks
+# its candidate IDs, and post-filters the rest. With no index match, it falls
+# back to a full collection scan.
+
+type
+  GlenQuery* = object
+    db*:         GlenDB
+    collection*: string
+    preds*:      seq[QueryPredicate]
+    orderBy*:    seq[QueryOrder]
+    limit*:      int
+    cursor*:     string
+
+proc query*(db: GlenDB; collection: string): GlenQuery =
+  GlenQuery(db: db, collection: collection)
+
+proc whereEq*(q: var GlenQuery; field: string; value: Value): var GlenQuery {.discardable.} =
+  q.preds.add(QueryPredicate(op: qoEq, field: field, value: value)); q
+
+proc whereNe*(q: var GlenQuery; field: string; value: Value): var GlenQuery {.discardable.} =
+  q.preds.add(QueryPredicate(op: qoNe, field: field, value: value)); q
+
+proc whereLt*(q: var GlenQuery; field: string; value: Value): var GlenQuery {.discardable.} =
+  q.preds.add(QueryPredicate(op: qoLt, field: field, value: value)); q
+
+proc whereLte*(q: var GlenQuery; field: string; value: Value): var GlenQuery {.discardable.} =
+  q.preds.add(QueryPredicate(op: qoLte, field: field, value: value)); q
+
+proc whereGt*(q: var GlenQuery; field: string; value: Value): var GlenQuery {.discardable.} =
+  q.preds.add(QueryPredicate(op: qoGt, field: field, value: value)); q
+
+proc whereGte*(q: var GlenQuery; field: string; value: Value): var GlenQuery {.discardable.} =
+  q.preds.add(QueryPredicate(op: qoGte, field: field, value: value)); q
+
+proc whereIn*(q: var GlenQuery; field: string; values: openArray[Value]): var GlenQuery {.discardable.} =
+  q.preds.add(QueryPredicate(op: qoIn, field: field, values: @values)); q
+
+proc whereContains*(q: var GlenQuery; field: string; substring: string): var GlenQuery {.discardable.} =
+  q.preds.add(QueryPredicate(op: qoContains, field: field, value: VString(substring))); q
+
+proc orderByField*(q: var GlenQuery; field: string; ascending = true): var GlenQuery {.discardable.} =
+  q.orderBy.add(QueryOrder(field: field, asc: ascending)); q
+
+proc limitN*(q: var GlenQuery; n: int): var GlenQuery {.discardable.} =
+  q.limit = n; q
+
+proc afterCursor*(q: var GlenQuery; c: string): var GlenQuery {.discardable.} =
+  q.cursor = c; q
+
+proc findIndexCoveringField(cs: CollectionStore; field: string): Index =
+  for _, idx in cs.indexes:
+    if idx.spec.fieldPaths.len == 1 and idx.spec.fieldPaths[0].len > 0:
+      let key = idx.spec.fieldPaths[0].join(".")
+      if key == field: return idx
+  nil
+
+proc planAndCollect(q: GlenQuery): seq[(string, Value)] =
+  result = @[]
+  let cs = q.db.tryGetCollection(q.collection)
+  if cs.isNil: return
+  q.db.acquireStripeRead(q.collection)
+  defer: q.db.releaseStripeRead(q.collection)
+  var indexedField = ""
+  var candidateIds: seq[string] = @[]
+  var usedAnIndex = false
+  for p in q.preds:
+    if usedAnIndex: break
+    if p.op == qoEq:
+      let idx = findIndexCoveringField(cs, p.field)
+      if not idx.isNil:
+        candidateIds = idx.findEq(p.value)
+        indexedField = p.field
+        usedAnIndex = true
+    elif p.op == qoIn and p.values.len > 0:
+      let idx = findIndexCoveringField(cs, p.field)
+      if not idx.isNil:
+        var seen = initHashSet[string]()
+        for v in p.values:
+          for id in idx.findEq(v):
+            if id notin seen:
+              seen.incl(id); candidateIds.add(id)
+        indexedField = p.field
+        usedAnIndex = true
+  if usedAnIndex:
+    for id in candidateIds:
+      let doc = lookupDocBypass(cs, id)
+      if doc.isNil: continue
+      var ok = true
+      for p in q.preds:
+        if p.field == indexedField and p.op in {qoEq, qoIn}: continue
+        if not evalPredicate(p, doc): ok = false; break
+      if ok: result.add((id, doc))
+  else:
+    for id in allDocIds(cs):
+      let doc = lookupDocBypass(cs, id)
+      if doc.isNil: continue
+      if evalAll(q.preds, doc):
+        result.add((id, doc))
+
+proc run*(q: GlenQuery): seq[(string, Value)] =
+  ## Materialise the full result set: index-or-scan, post-filter, sort,
+  ## cursor + limit slice. Returned values are clones of the in-memory docs.
+  var rows = planAndCollect(q)
+  sortDocs(rows, q.orderBy)
+  let sliced = applyCursorAndLimit(rows, q.cursor, q.limit)
+  result = newSeqOfCap[(string, Value)](sliced.len)
+  for (id, v) in sliced:
+    result.add((id, if v.isNil: nil else: v.clone()))
+
+iterator runStream*(q: GlenQuery): (string, Value) =
+  ## Streaming variant: still materialises and sorts internally (sort needs
+  ## the full set), but yields one (id, doc) at a time after that.
+  let rows = run(q)
+  for r in rows: yield r
+
+proc nextCursor*(rows: openArray[(string, Value)]): string =
+  ## Encode an opaque "after this docId" cursor from the last row of a page.
+  if rows.len == 0: return ""
+  encodeCursor(rows[^1][0])
+
 

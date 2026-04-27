@@ -80,6 +80,46 @@ proc fillRadarFrame(rows, cols: int; step: int): GeoMesh =
       if dr * dr + dc * dc <= 64:
         result[r, c, 0] = 30.0 + float64(step) * 0.05
 
+proc fillDenseFrame(rows, cols: int; step: int): GeoMesh =
+  ## Every cell varies every frame — worst case for Gorilla / clz path.
+  ## Used as a "no-zero-runs" baseline for comparison with sparse data.
+  result = newGeoMesh(bbox(0.0, 0.0, float64(cols), float64(rows)),
+                      rows = rows, cols = cols, channels = 1)
+  for r in 0 ..< rows:
+    for c in 0 ..< cols:
+      result[r, c, 0] = sin(float64(step) * 0.05 +
+                            float64(r * cols + c) * 0.0011)
+
+proc benchTileStackAppendWith(dir: string; rows, cols, frames, tileSize, chunkSize: int;
+                              producer: proc(rows, cols: int; step: int): GeoMesh;
+                              label: string) =
+  ## Generalised appender: caller supplies the per-frame producer and a label.
+  ## Used by both the sparse (radar) and dense (every-cell-varies) workloads.
+  if dirExists(dir): removeDir(dir)
+  let s = newTileStack(dir,
+    bbox = bbox(0.0, 0.0, float64(cols), float64(rows)),
+    rows = rows, cols = cols, channels = 1,
+    tileSize = tileSize, chunkSize = chunkSize, labels = @["dbz"])
+  let t0 = epochTime()
+  for i in 0 ..< frames:
+    s.appendFrame(int64(i) * 60_000, producer(rows, cols, i))
+  s.flush()
+  let dt = msSince(t0)
+  s.close()
+
+  var diskBytes = 0
+  for kind, path in walkDir(dir):
+    if kind == pcFile:
+      if path.endsWith(".tts") or path.endsWith(".tsm"):
+        diskBytes += int(getFileSize(path))
+  let cellsTotal = rows * cols * frames
+  let bitsPerCell = (float(diskBytes) * 8.0) / float(cellsTotal)
+  let rawBytes = cellsTotal * 8
+  let ratio =
+    if diskBytes == 0: 0.0
+    else: float(rawBytes) / float(diskBytes)
+  echo &"BENCH tilestack append ({label}, {rows}×{cols}, {frames} frames): {frames:>5} frames in {dt:>5} ms => {rate(frames, dt):>10.0f} frames/s  (disk {diskBytes:>10} B vs raw {rawBytes:>10} B = {ratio:>5.1f}× compression, {bitsPerCell:>5.2f} bits/cell)"
+
 proc benchTileStackAppend(dir: string; rows, cols, frames, tileSize, chunkSize: int) =
   if dirExists(dir): removeDir(dir)
   let s = newTileStack(dir,
@@ -134,6 +174,44 @@ proc benchTileStackReadFrame(dir: string; numFrames, queries: int) =
   s.close()
   echo &"BENCH tilestack readFrame:        {queries:>7} queries in {dt:>5} ms => {rate(queries, dt):>10.0f} q/s"
 
+proc benchTileStackColdReadFrame(label, dir: string;
+                                 numFrames, queries: int) =
+  ## Cold-path readFrame: reopens the stack between every query so the
+  ## per-tile chunk cache is empty each time. This is the workload where
+  ## decode performance actually matters — random one-off historical
+  ## lookups, replication catch-up after a cold start, etc.
+  var rng = initRand(19)
+  let t0 = epochTime()
+  for _ in 0 ..< queries:
+    let s = openTileStack(dir)
+    let i = rng.rand(numFrames - 1)
+    discard s.readFrame(int64(i) * 60_000)
+    s.close()
+  let dt = msSince(t0)
+  echo &"BENCH tilestack readFrame (cold, {label:<6}): {queries:>5} queries in {dt:>5} ms => {rate(queries, dt):>10.0f} q/s"
+
+proc benchTileStackColdPointHistory(label, dir: string; queries: int) =
+  ## Same idea for readPointHistory: reopen the stack between queries to
+  ## force cold chunk decodes. This isolates the decode path from the
+  ## chunk LRU and from disk caching benefits across queries.
+  var rng = initRand(23)
+  var totalSamples = 0
+  var rows = 0; var cols = 0
+  block:
+    let s0 = openTileStack(dir)
+    rows = s0.rows; cols = s0.cols
+    s0.close()
+  let t0 = epochTime()
+  for _ in 0 ..< queries:
+    let s = openTileStack(dir)
+    let lon = rng.rand(cols.float64 - 1.0)
+    let lat = rng.rand(rows.float64 - 1.0)
+    totalSamples += s.readPointHistory(lon, lat,
+                                       low(int64), high(int64), 0).len
+    s.close()
+  let dt = msSince(t0)
+  echo &"BENCH tilestack readPointHistory (cold, {label:<6}): {queries:>5} queries in {dt:>5} ms => {rate(queries, dt):>10.0f} q/s  (avg ~{totalSamples div max(queries, 1)} samples per call)"
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -180,3 +258,23 @@ when isMainModule:
   benchTileStackPointHistory(dir, queries = 1000)
   benchTileStackReadFrame(dir, numFrames = 64, queries = 50)
   removeDir(dir)
+
+  echo "\n------- glen/tilestack: sparse vs dense (cold-decode) -------"
+  # Two datasets, identical shape. Sparse: 99.5% of cells stay at 0
+  # (clear-sky radar). Dense: every cell varies every frame. The cold-path
+  # benches reopen the stack per query so the decoded-chunk LRU never
+  # warms — this isolates `decodeXorRun`'s clz zero-run-skip win.
+  let sparseDir = getTempDir() / "glen_bench_tilestack_sparse"
+  let denseDir  = getTempDir() / "glen_bench_tilestack_dense"
+  benchTileStackAppendWith(sparseDir, rows = 200, cols = 200, frames = 200,
+                           tileSize = 64, chunkSize = 64,
+                           producer = fillRadarFrame, label = "sparse")
+  benchTileStackAppendWith(denseDir,  rows = 200, cols = 200, frames = 200,
+                           tileSize = 64, chunkSize = 64,
+                           producer = fillDenseFrame, label = "dense ")
+  benchTileStackColdReadFrame("sparse", sparseDir, numFrames = 200, queries = 200)
+  benchTileStackColdReadFrame("dense ", denseDir,  numFrames = 200, queries = 200)
+  benchTileStackColdPointHistory("sparse", sparseDir, queries = 200)
+  benchTileStackColdPointHistory("dense ", denseDir,  queries = 200)
+  removeDir(sparseDir)
+  removeDir(denseDir)

@@ -7,7 +7,7 @@ should be treated as the order of magnitude you'll see, not exact constants.
 ## Core CRUD (`nimble bench_release`)
 
 ```
-puts:                270k ops/s
+puts:                225–235k ops/s
 gets (cloned):       1.67M ops/s
 gets (borrowed):     20M ops/s
 getMany:             28k batches/s  ×100 docs ≈ 2.8M doc reads/s
@@ -32,41 +32,60 @@ read-heavy-shared     1w/8r ×50k =>  2.1M ops/s
 Raw R-tree (in-memory, no GlenDB):
 
 ```
-bulkLoad (STR):    100k entries  =>  1.6M entries/s
-bulkLoad (STR):     1M entries   =>  2.3M entries/s
-insert (Guttman): 100k ops       =>  1.9M ops/s
-searchBBox (5°):   10k queries   =>  345k q/s   (100k pts, ~159 hits/query)
-searchBBox (5°):    1k queries   =>   30k q/s   (1M pts, ~1592 hits/query)
-nearest k=10:      10k queries   =>  123k q/s
-nearestGeo k=10:   10k queries   =>   93k q/s   (haversine bbox lower-bound)
+bulkLoad (STR):    100k entries  =>  2.4M entries/s
+bulkLoad (STR):     1M entries   =>  2.2M entries/s
+insert (Guttman): 100k ops       =>  1.8M ops/s
+searchBBox (5°):   10k queries   =>  333k q/s   (100k pts, ~159 hits/query)
+searchBBox (5°):    1k queries   =>   26k q/s   (1M pts, ~1592 hits/query)
+nearest k=10:      10k queries   =>  118k q/s
+nearestGeo k=10:   10k queries   =>   88k q/s   (haversine bbox lower-bound)
 ```
 
 GlenDB-integrated geo index, eager mode (100k docs):
 
 ```
-put (no index):                   238k docs/s
-createGeoIndex (STR bulk-build):  813k docs/s
-put (with active geo index):      211k docs/s
-findWithinRadius 100km:            81k q/s
-findNearest planar k=10:           64k q/s
-findNearest geographic k=10:       28k q/s    (~2× slower than planar; trig-bound)
+put (no index):                   220k docs/s
+createGeoIndex (STR bulk-build):  775k docs/s
+put (with active geo index):      207k docs/s
+findWithinRadius 100km:            74k q/s
+findNearest planar k=10:           60k q/s
+findNearest geographic k=10:       27k q/s    (~2× slower than planar; trig-bound)
 ```
 
 Polygons, eager mode (50k docs, ~3°-square axis-aligned shapes):
 
 ```
-put polygons:                    127k docs/s
-createPolygonIndex (STR):        893k docs/s
-findPolygonsContaining:           48k q/s    (R-tree prefilter + ray-cast)
+put polygons:                    111k docs/s
+createPolygonIndex (STR):        794k docs/s
+findPolygonsContaining:           43k q/s    (R-tree prefilter + ray-cast)
 ```
 
 Index persistence:
 
 ```
-reopen with .gri present:        866 ms      (load + WAL replay)
-compact (snapshot + .gri dump):  200 ms
-reopen with corrupt .gri:        475 ms      (CRC fail → bulk-rebuild)
+reopen with .gri present:        970 ms      (load + WAL replay)
+compact (snapshot + .gri dump):  290–450 ms  (range covers v4 dict-build cost)
+reopen with corrupt .gri:        750 ms      (CRC fail → bulk-rebuild)
 ```
+
+The compact range above reflects v4's per-collection dictionary build
+(two pre-passes counting key + `(field, value)` frequencies). On
+workloads with significant repetition the disk savings repay this many
+times over; on workloads with near-unique values everywhere (the geo
+bench's lat/lon floats) it's pure overhead — pass `keyDictThreshold = 0,
+valueDictThreshold = 0` to opt out.
+
+## Vector index (HNSW, `tests/test_vectorindex.nim`)
+
+```
+recall@10 on 1k 16-d L2 vectors:  ≥ 0.90 (M=16, efC=100, efS=50)
+recall@5  on  500 32-d cosine:    ≥ 0.60 (M=16, efC=200, efS=64)
+persistence round-trip:           single .vri dump, identical results on reopen
+```
+
+Distance metrics: cosine (vectors unit-normalised on insert), L2, dot.
+Soft-delete semantics — `unindexDoc` drops the docId mapping but leaves
+the graph node; the graph is rebuilt cleanly on `compact()`.
 
 ## Time-series (`nimble bench_timeseries`)
 
@@ -75,48 +94,64 @@ Gorilla scalar TSDB, 1M samples per series:
 | Value pattern | Append rate | Bits/sample on disk |
 |---|---|---|
 | Constant | **100M samples/s** | 2.11 |
-| Regular cadence | 19M samples/s | 14.13 |
-| Smooth (sin) | 4.4M samples/s | 59.60 |
-| Noisy | 4.5M samples/s | 59.28 |
+| Regular cadence | **30M samples/s** | 14.13 |
+| Smooth (sin) | 4.9M samples/s | 59.60 |
+| Noisy | 5.0M samples/s | 59.28 |
 
 ```
 open (scan all chunk headers):  9 ms for 1M-sample file
-range (random window):          1.3k q/s    (avg 546 samples returned)
-latest n=100:                   901k q/s    ← 60× vs no chunk cache
-latest n=1000:                  115k q/s    ← 115× vs no chunk cache
+range (random window):          8.5k q/s    (avg 546 samples returned)  ← was 1.3k pre-bitpack
+latest n=100:                   900k q/s
+latest n=1000:                  115k q/s
 ```
 
-Tile time-stack (radar-shaped sparse field):
+The **6.6× boost on `range`** vs the pre-bitpack baseline comes from the
+batched 64-bit `BitReader` + hardware `clz`/`ctz` (`__builtin_clzll` /
+`__builtin_ctzll`) replacing scalar bit-shift loops. See
+[storage.md](storage.md#bit-decode-hot-path).
+
+Tile time-stack — append, warm-cache reads (default `fillRadarFrame`):
 
 | Geometry | Append | Compression | bits/cell | Point-history | readFrame |
 |---|---|---|---|---|---|
-| 200×200, 200 frames | 3125 frames/s | **24.9×** | 2.57 | **1166 q/s** | **362 q/s** |
-| 512×512, 64 frames | 432 frames/s | 21.2× | 3.02 | **844 q/s** | **94 q/s** |
+| 200×200, 200 frames | **4,444 frames/s** | **79.5×** | 0.81 | 1,300 q/s | 380 q/s |
+| 512×512, 64 frames | **762 frames/s** | **106×** | 0.60 | 950 q/s | 116 q/s |
 
-The decoded-chunk LRU (`glen/chunkcache`) drives the read-side wins.
+The compression jump (24.9× → 79.5× on 200×200; 21.2× → 106× on 512×512)
+comes from the constant-chunk RLE path: chunks where every cell stays
+identical across all frames now collapse to "one float64 + timestamps"
+instead of full per-cell Gorilla streams.
 
-## Snapshot v3 — paged on-disk doc index (`tests/test_snapshot_v3.nim`)
+Tile time-stack — sparse vs dense cold-decode (cache reopened per query):
 
-```
-v3 snapshot file size:         ~3.9 MB     (100k docs; ~36 bytes/doc + bodies)
-open (just the 40-B header):   0.03 ms     ← O(1), independent of doc count
-random lookup rate:            2.3M q/s    (mmap + binary search)
-resident index RAM at open:    0 bytes     ← OS page cache only
-```
-
-v2 vs v3 comparison for the cold-snapshot-lookup path:
-
-| Metric | v2 (in-memory) | v3 (paged mmap) |
+| Workload | Sparse (radar, 99.5% zero cells) | Dense (every cell varies) |
 |---|---|---|
-| Open time, 100k docs | hundreds of ms | **0.03 ms** |
-| Resident index footprint | ~36 bytes/doc | **0 bytes** |
-| Cold lookup latency | ~100 ns | ~430 ns |
-| Iteration order | insertion | sorted lex |
-| Maximum DB size | bounded by RAM | bounded by disk |
+| readFrame (cold) | **190 q/s** | 7 q/s |
+| readPointHistory (cold) | **714 q/s** | 33 q/s |
+| Disk size | 805 KB (80× compression) | 59.8 MB (1.1× compression) |
+| Append throughput | 4,444 fps | 116 fps |
 
-For workloads that read mostly through `cs.docs` / `db.cache` (the hot path),
-v2 and v3 are indistinguishable. v3 trades 4–5× higher cold-fault latency for
-sub-ms opens and removed RAM ceiling.
+The 22–27× spread between sparse and dense is `decodeXorRun`'s clz
+zero-run-skip earning its keep — bulk-skipping runs of zero-XOR cells in
+one instruction instead of per-bit reads.
+
+## Snapshot v4 — paged on-disk doc index + dictionaries
+
+```
+v3 → v4 keys-only file size:    1000-doc structured collection saves ~5–10%
+v4 + value-dict size:           additional ~5–10% on enum-heavy fields
+open (just the 56-B header + dict): 0.05 ms for 100k docs
+random lookup rate:             ~250k q/s (mmap + binary search + dict resolve)
+resident index RAM at open:     0 bytes (index lives on OS page cache)
+```
+
+v4 carries an optional pair of per-snapshot dictionaries — keys (every
+object-field name across the collection) and per-field string values
+(status enums, region codes). Both are recomputed on every `compact()`.
+v3 readers reject v4 (different magic); v4 readers handle v3 transparently.
+
+Layout details, threshold knobs, and back-compat in
+[storage.md#snapshot-v4](storage.md#snapshot-v4--key--value-dictionaries).
 
 ## Tradeoffs
 
@@ -137,7 +172,7 @@ sub-ms opens and removed RAM ceiling.
 | Range scans on a single sorted field | `createIndex` (rangeable) | same backing |
 | Spatial point queries | `createGeoIndex` | R-tree, STR bulk-load, KNN best-first |
 | "Which zone contains this point?" | `createPolygonIndex` | bbox prefilter + ray-cast |
-| Vector / embedding NN search | (not yet) | future: HNSW or IVF |
+| Vector / embedding NN search | `createVectorIndex` | HNSW; `.vri` graph dump on compact |
 
 ### Storage engine tradeoffs
 
@@ -147,7 +182,8 @@ sub-ms opens and removed RAM ceiling.
 | Single-stream metric / sensor / float values | `glen/timeseries` (Gorilla) |
 | Dense raster pinned to a bbox | `glen/geomesh` (in a doc) |
 | Raster that evolves through time (radar / weather) | `glen/tilestack` |
-| Embeddings | `glen/linalg` (Vector inside a doc) |
+| Embeddings (per-doc field) | `glen/linalg` (Vector inside a doc) |
+| Approximate KNN over embeddings (collection-wide) | `createVectorIndex` (HNSW) |
 
 ## Reproducing
 
@@ -157,21 +193,30 @@ The `tests/` directory contains all the benches:
 nimble bench_release        # core CRUD
 nimble bench_concurrent     # multi-threaded contention (atomicArc + -d:useMalloc)
 nimble bench_geo            # R-tree, geo, polygon, persistence
-nimble bench_timeseries     # Gorilla TSDB + tilestack
+nimble bench_timeseries     # Gorilla TSDB + tilestack, sparse-vs-dense
+nimble bench_bitpack        # BitReader / clz / Simple-8b microbench
 ```
 
-The v3 numbers come from the stress test in `tests/test_snapshot_v3.nim`,
-which is part of `nimble test`.
+The v3/v4 numbers come from stress tests in `tests/test_snapshot_v3.nim`
+and `tests/test_snapshot_v4.nim`, both part of `nimble test`.
 
 ## What's not optimized (yet)
 
-- **SIMD bit-decode** — Gorilla unpack runs scalar; AVX-512 PEXT/PDEP or
-  ARM NEON could push it 5–10×. Platform-specific work; not yet shipped.
-- **Parallel replication export** — `exportChanges` runs single-threaded
-  under `replLock`. Refactorable, not yet done.
+- **AVX-512 PEXT/PDEP path for `decodeXor`/`decodeDoD`** — variable-length
+  prefix codes; requires careful CPUID feature-check + scalar fallback.
+  Untestable on this arm64 dev box.
 - **Per-cell offset table in tile chunks** — would let `readPointHistory`
-  decode just the relevant cell streams instead of full chunks.
-- **Bilinear interpolation in `GeoMesh.sampleAt`** — currently nearest cell.
+  decode just the queried cell's stream instead of the full chunk. Needs a
+  chunk format change.
+- **zstd compression for snapshots and tile chunks** — pure-Nim true zstd
+  doesn't exist; gating optional dep behind `-d:glenZstd` is the obvious
+  path but the policy decision is open.
+- **Encryption at rest** — `nimcrypto` (pure-Nim) covers AES-GCM +
+  ChaCha20-Poly1305 + Argon2id. Threat-model + key-management design
+  not yet drafted.
+- **TSDB block format extension to use Simple-8b for timestamps** — the
+  codec exists and is wired into `tilestack`; TSDB blocks still use the
+  legacy interleaved DoD-and-XOR layout, which would need restructuring.
 
-These are tracked in the [README roadmap](../README.md). None are blockers
-for current workloads; they're constant-factor improvements where you'd notice.
+These are tracked in [TODO.md](../TODO.md). None are blockers for current
+workloads; they're constant-factor improvements where you'd notice.

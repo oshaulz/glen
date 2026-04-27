@@ -105,16 +105,32 @@ import std/[os, locks, strutils, tables, algorithm]
 import glen/geo
 import glen/geomesh
 import glen/bitpack
+import glen/simple8b
 import glen/chunkcache
 
 const
   TileFileMagic    = "GLENTTS1"
-  TileFileVersion  = 1'u32
+  TileFileVersion  = 2'u32   # v1 = Gorilla-only; v2 = adds constant-chunk RLE
   TileFileHdrBytes = 16
   ChunkHdrBytes    = 40
   ManifestFileName = "manifest.tsm"
   DefaultTileSize* = 64
   DefaultChunkSize* = 128
+  # Bits 30 and 31 of the payloadBytes field encode flags. Legacy v1 chunks
+  # always had both bits clear (cap was 256 MiB = 0x10000000) so old files
+  # transparently decode as ckGorilla / DoD timestamps.
+  ChunkKindBit     = 0x80000000'u32   # bit 31: 1 = ckConstant
+  TsCodecBit       = 0x40000000'u32   # bit 30: 1 = timestamps via Simple-8b
+  PayloadBytesMask = 0x3FFFFFFF'u32
+
+type
+  ChunkKind = enum
+    ckGorilla = 0   # full per-cell-channel XOR streams
+    ckConstant = 1  # whole chunk, every cell-channel-frame == minVal == maxVal
+
+  TsCodec = enum
+    tsDoD = 0       # legacy delta-of-delta with 1/2/3/4-bit prefix codes
+    tsSimple8b = 1  # zigzag → Simple-8b on per-frame DoDs
 
 # --------- types ---------
 
@@ -136,6 +152,8 @@ type
     endTs:        int64
     minVal:       float64
     maxVal:       float64
+    kind:         ChunkKind
+    tsCodec:      TsCodec
 
   TileFile = ref object
     path:    string
@@ -246,7 +264,10 @@ proc readFileHeader(f: File): bool =
   if magicBuf != TileFileMagic: return false
   var ver: uint32
   if f.readBuffer(addr ver, 4) != 4: return false
-  if ver != TileFileVersion: return false
+  # Accept v1 (legacy Gorilla-only) and v2 (adds constant-chunk RLE).
+  # Constant chunks set bit 31 of payloadBytes; v1 files never had that bit
+  # set so they decode transparently with the v2 reader.
+  if ver != 1'u32 and ver != TileFileVersion: return false
   var reserved: uint32
   if f.readBuffer(addr reserved, 4) != 4: return false
   true
@@ -274,18 +295,10 @@ proc readF64(f: File): float64 =
 
 # --------- chunk encode / decode ---------
 
-proc encodeTileChunk(timestamps: seq[int64];
-                     frames: seq[seq[float64]];
-                     tileCells, channels: int): (seq[byte], int, float64, float64) =
-  ## frames[i] is row-major channel-interleaved tileCells*channels floats.
-  ## Returns (payload_bytes_with_zero_crc, payloadBitLen, minVal, maxVal).
-  ## Caller is responsible for appending the CRC trailer.
-  doAssert frames.len == timestamps.len
-  doAssert frames.len > 0
-  let n = frames.len
-  let cellChans = tileCells * channels
-  var w = newBitWriter()
-  # ts0 is in the chunk header; we encode ts1.. only.
+proc encodeTimestampsDoDToWriter(w: var BitWriter; timestamps: seq[int64]) =
+  ## Legacy DoD timestamp encoding: 32-bit zigzag first delta + DoD prefix
+  ## codes for the rest.
+  let n = timestamps.len
   if n >= 2:
     let firstDelta = timestamps[1] - timestamps[0]
     w.writeBitsU64(zigzag(firstDelta) and 0xFFFFFFFF'u64, 32)
@@ -295,6 +308,132 @@ proc encodeTileChunk(timestamps: seq[int64];
       let dod = delta - prevDelta
       encodeDoD(w, dod)
       prevDelta = delta
+
+proc decodeTimestampsDoDFromReader(r: var BitReader; n: int; startTs: int64): seq[int64] =
+  result = newSeq[int64](n)
+  result[0] = startTs
+  if n >= 2:
+    let firstDelta = unzigzag(r.readBitsU64(32))
+    result[1] = startTs + firstDelta
+    var prevDelta = firstDelta
+    for i in 2 ..< n:
+      let dod = decodeDoD(r)
+      let delta = prevDelta + dod
+      result[i] = result[i - 1] + delta
+      prevDelta = delta
+
+proc timestampsToZigzagDods(timestamps: seq[int64]): seq[uint64] =
+  ## Build the (n-1)-element vector of zigzag(DoD) values that Simple-8b will
+  ## pack. The first element holds the first delta itself (encoded as if its
+  ## "previous delta" was 0). After the first, true DoDs.
+  let n = timestamps.len
+  if n < 2: return @[]
+  result = newSeqOfCap[uint64](n - 1)
+  let firstDelta = timestamps[1] - timestamps[0]
+  result.add(zigzag64(firstDelta))
+  var prevDelta = firstDelta
+  for i in 2 ..< n:
+    let delta = timestamps[i] - timestamps[i - 1]
+    let dod = delta - prevDelta
+    result.add(zigzag64(dod))
+    prevDelta = delta
+
+proc encodeTimestampsS8bToWriter(w: var BitWriter; timestamps: seq[int64]): int =
+  ## Pack zigzag-DoD timestamps via Simple-8b. We write a single varuint with
+  ## the number of S8b words, then each word as a 64-bit chunk. Returns the
+  ## number of S8b words emitted.
+  ##
+  ## The reader reconstructs (n-1) values from `nWords` words; n is in the
+  ## chunk header so we don't need to write it.
+  let dods = timestampsToZigzagDods(timestamps)
+  if dods.len == 0:
+    # No timestamps to encode beyond ts0 → write 0 words.
+    w.writeBitsU64(0'u64, 16)
+    return 0
+  let words = encodeSimple8b(dods)
+  w.writeBitsU64(uint64(words.len), 16)
+  for word in words: w.writeBitsU64(word, 64)
+  words.len
+
+proc decodeTimestampsS8bFromReader(r: var BitReader; n: int; startTs: int64): seq[int64] =
+  result = newSeq[int64](n)
+  result[0] = startTs
+  let nWords = int(r.readBitsU64(16))
+  if n < 2: return
+  var words = newSeq[uint64](nWords)
+  for i in 0 ..< nWords: words[i] = r.readBitsU64(64)
+  let dods = decodeSimple8b(words, n - 1)
+  let firstDelta = unzigzag64(dods[0])
+  result[1] = startTs + firstDelta
+  var prevDelta = firstDelta
+  for i in 2 ..< n:
+    let delta = prevDelta + unzigzag64(dods[i - 1])
+    result[i] = result[i - 1] + delta
+    prevDelta = delta
+
+proc estimateDoDBits(timestamps: seq[int64]): int =
+  ## Encode timestamps via DoD into a throwaway writer to measure the bit cost.
+  ## Used to pick the smaller of DoD vs Simple-8b for the chunk-header flag.
+  var w = newBitWriter()
+  encodeTimestampsDoDToWriter(w, timestamps)
+  w.bitLen
+
+proc estimateS8bBits(timestamps: seq[int64]): int =
+  ## 16-bit length prefix + 64 bits per word.
+  let dods = timestampsToZigzagDods(timestamps)
+  if dods.len == 0: return 16
+  let words = encodeSimple8b(dods)
+  16 + words.len * 64
+
+proc isWholeChunkConstant(frames: seq[seq[float64]]): (bool, float64) =
+  ## Whole-chunk-constant means every cell of every frame is bit-identical to
+  ## frames[0][0]. Bit-compare via cast — covers signed-zero and NaN edge cases
+  ## consistently (two NaNs with different bit patterns are treated as
+  ## different, which is the safe choice).
+  if frames.len == 0 or frames[0].len == 0: return (false, 0.0)
+  let v0Bits = cast[uint64](frames[0][0])
+  for f in frames:
+    for x in f:
+      if cast[uint64](x) != v0Bits: return (false, 0.0)
+  (true, frames[0][0])
+
+proc encodeTileChunk(timestamps: seq[int64];
+                     frames: seq[seq[float64]];
+                     tileCells, channels: int): (seq[byte], int, float64, float64, ChunkKind, TsCodec) =
+  ## frames[i] is row-major channel-interleaved tileCells*channels floats.
+  ## Returns (payload_bytes_with_zero_crc, payloadBitLen, minVal, maxVal,
+  ## kind, tsCodec). Caller is responsible for appending the CRC trailer.
+  ##
+  ## When every cell of every frame is bit-identical, emits a tiny constant
+  ## chunk: timestamps + 1 × float64. Otherwise the legacy Gorilla layout.
+  ##
+  ## Timestamps are encoded as DoD or via Simple-8b — whichever produces a
+  ## smaller bit count for *this* chunk's timestamps. The choice is recorded
+  ## in the per-chunk tsCodec flag (bit 30 of payloadBytes on disk).
+  doAssert frames.len == timestamps.len
+  doAssert frames.len > 0
+  # Pick smaller timestamp codec. For chunkSize=1 (n=1) both produce 0 bits
+  # past the header, so it doesn't matter; default to DoD.
+  let dodBits = estimateDoDBits(timestamps)
+  let s8bBits = estimateS8bBits(timestamps)
+  let tsCodec = if s8bBits < dodBits: tsSimple8b else: tsDoD
+  template writeTs(w: var BitWriter) =
+    case tsCodec
+    of tsDoD:
+      encodeTimestampsDoDToWriter(w, timestamps)
+    of tsSimple8b:
+      discard encodeTimestampsS8bToWriter(w, timestamps)
+  # Fast path: whole-chunk-constant (clear-sky pixels, flat probability maps).
+  let (allEqual, constVal) = isWholeChunkConstant(frames)
+  if allEqual:
+    var w = newBitWriter()
+    writeTs(w)
+    w.writeBitsU64(cast[uint64](constVal), 64)
+    return (w.bytes, w.bitLen, constVal, constVal, ckConstant, tsCodec)
+  let n = frames.len
+  let cellChans = tileCells * channels
+  var w = newBitWriter()
+  writeTs(w)
   # Per-stream Gorilla. Each cell-channel is independent (its own XorState).
   var minV =  Inf
   var maxV = -Inf
@@ -316,39 +455,46 @@ proc encodeTileChunk(timestamps: seq[int64];
     # min/max from the one frame
     if minV == Inf: minV = 0.0
     if maxV == NegInf: maxV = 0.0
-  (w.bytes, w.bitLen, minV, maxV)
+  (w.bytes, w.bitLen, minV, maxV, ckGorilla, tsCodec)
 
 proc decodeTileChunk(payload: seq[byte];
                      payloadBitLen: int;
                      n, tileCells, channels: int;
-                     startTs: int64): (seq[int64], seq[seq[float64]]) =
+                     startTs: int64;
+                     kind: ChunkKind = ckGorilla;
+                     tsCodec: TsCodec = tsDoD): (seq[int64], seq[seq[float64]]) =
   ## Returns (timestamps, frames). frames[i] is tileCells*channels floats.
   doAssert n >= 1
   var r = newBitReader(payload, payloadBitLen)
-  var timestamps = newSeq[int64](n)
-  timestamps[0] = startTs
-  if n >= 2:
-    let firstDelta = unzigzag(r.readBitsU64(32))
-    timestamps[1] = startTs + firstDelta
-    var prevDelta = firstDelta
-    for i in 2 ..< n:
-      let dod = decodeDoD(r)
-      let delta = prevDelta + dod
-      timestamps[i] = timestamps[i - 1] + delta
-      prevDelta = delta
+  let timestamps =
+    case tsCodec
+    of tsDoD:      decodeTimestampsDoDFromReader(r, n, startTs)
+    of tsSimple8b: decodeTimestampsS8bFromReader(r, n, startTs)
   let cellChans = tileCells * channels
   var frames = newSeq[seq[float64]](n)
   for i in 0 ..< n:
     frames[i] = newSeq[float64](cellChans)
-  for cc in 0 ..< cellChans:
-    let bits0 = r.readBitsU64(64)
-    frames[0][cc] = cast[float64](bits0)
-    var xstate: XorState
-    var prevBits = bits0
-    for i in 1 ..< n:
-      let xord = decodeXor(r, xstate)
-      prevBits = prevBits xor xord
-      frames[i][cc] = cast[float64](prevBits)
+  case kind
+  of ckConstant:
+    let constVal = cast[float64](r.readBitsU64(64))
+    for i in 0 ..< n:
+      for cc in 0 ..< cellChans:
+        frames[i][cc] = constVal
+  of ckGorilla:
+    # Per-cell-channel decode using decodeXorRun, which uses clz to bulk-
+    # skip runs of zero-XOR values (the dominant case for radar / raster
+    # fields with constant cells). The reconstruction (prefix-XOR scan)
+    # stays scalar — measurement showed NEON 2-way pairing didn't beat
+    # scalar here; the lane-shuffling overhead canceled the parallelism.
+    for cc in 0 ..< cellChans:
+      let bits0 = r.readBitsU64(64)
+      frames[0][cc] = cast[float64](bits0)
+      var xstate: XorState
+      let xors = decodeXorRun(r, xstate, n - 1)
+      var prevBits = bits0
+      for i in 0 ..< (n - 1):
+        prevBits = prevBits xor xors[i]
+        frames[i + 1][cc] = cast[float64](prevBits)
   (timestamps, frames)
 
 # --------- tile file open / scan ---------
@@ -379,9 +525,12 @@ proc openTileFile(path: string;
   while true:
     let pos = result.file.getFilePos()
     var meta = ChunkMeta(fileOffset: pos)
-    var pb: uint32
-    try: pb = readU32(result.file)
+    var pbRaw: uint32
+    try: pbRaw = readU32(result.file)
     except IOError: break
+    meta.kind    = if (pbRaw and ChunkKindBit) != 0: ckConstant else: ckGorilla
+    meta.tsCodec = if (pbRaw and TsCodecBit) != 0: tsSimple8b else: tsDoD
+    let pb = pbRaw and PayloadBytesMask
     meta.payloadBytes = int(pb)
     if meta.payloadBytes < 4 or meta.payloadBytes > 256 * 1024 * 1024: break
     try:
@@ -411,12 +560,16 @@ proc flushTile(s: TileStack; tr, tc: int; tf: TileFile) =
   ## Flush the active buffer to one chunk on disk. No-op if empty.
   if tf.activeTs.len == 0: return
   let tc2 = s.tileCellsFor(tr, tc)
-  let (payload, bitLen, minV, maxV) =
+  let (payload, bitLen, minV, maxV, kind, tsCodec) =
     encodeTileChunk(tf.activeTs, tf.activeData, tc2, s.manifest.channels)
   let payloadBytes = payload.len + 4
+  # Bit 31 → ckConstant; bit 30 → Simple-8b ts codec.
+  var pbRaw = uint32(payloadBytes)
+  if kind == ckConstant: pbRaw = pbRaw or ChunkKindBit
+  if tsCodec == tsSimple8b: pbRaw = pbRaw or TsCodecBit
   let pos = tf.file.getFileSize()
   tf.file.setFilePos(pos)
-  writeU32(tf.file, uint32(payloadBytes))
+  writeU32(tf.file, pbRaw)
   writeU32(tf.file, uint32(tf.activeTs.len))
   writeI64(tf.file, tf.activeTs[0])
   writeI64(tf.file, tf.activeTs[^1])
@@ -429,7 +582,8 @@ proc flushTile(s: TileStack; tr, tc: int; tf: TileFile) =
   tf.chunks.add(ChunkMeta(
     fileOffset: pos, payloadBytes: payloadBytes,
     frameCount: tf.activeTs.len, startTs: tf.activeTs[0],
-    endTs: tf.activeTs[^1], minVal: minV, maxVal: maxV))
+    endTs: tf.activeTs[^1], minVal: minV, maxVal: maxV, kind: kind,
+    tsCodec: tsCodec))
   tf.activeTs.setLen(0)
   tf.activeData.setLen(0)
   discard bitLen   # only used during encode; payloadBitLen on read = bytes*8
@@ -550,7 +704,7 @@ proc readChunkFramesUncached(tf: TileFile; idx: int;
   ## Decode a chunk fully — both timestamps and per-frame cell data.
   let m = tf.chunks[idx]
   tf.file.setFilePos(m.fileOffset)
-  discard readU32(tf.file)            # payloadBytes
+  discard readU32(tf.file)            # payloadBytes (incl. kind bit)
   discard readU32(tf.file)            # frameCount
   discard readI64(tf.file)            # startTs
   discard readI64(tf.file)            # endTs
@@ -565,7 +719,7 @@ proc readChunkFramesUncached(tf: TileFile; idx: int;
   if fnv1a32(payload) != crc:
     raise newException(IOError, "tilestack: chunk CRC mismatch")
   decodeTileChunk(payload, payload.len * 8, m.frameCount,
-                  tileCells, channels, m.startTs)
+                  tileCells, channels, m.startTs, m.kind, m.tsCodec)
 
 proc readChunkFrames(tf: TileFile; idx: int;
                      tileCells, channels: int): (seq[int64], seq[seq[float64]]) =

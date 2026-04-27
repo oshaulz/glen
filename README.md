@@ -20,11 +20,13 @@ echo db.get("users", "u1")
 
 | | |
 |---|---|
-| **Core** | Document model + WAL + snapshots, optimistic transactions, sharded LRU cache, striped per-collection RW-locks, multi-master replication (HLC, LWW), schema validation |
-| **Spatial** | R-tree indexes for points and polygons, KNN with planar or geographic (haversine) metrics, point-in-polygon queries |
-| **Temporal** | Gorilla-encoded scalar time-series engine; tile time-stacks for compressed raster-over-time storage |
+| **Core** | Document model + WAL + snapshots, optimistic transactions, sharded LRU cache, striped per-collection RW-locks, multi-master replication (HLC, LWW), schema validation, auto-compaction triggers |
+| **Querying** | Method-chain query layer with predicate filters, orderBy, limit, opaque cursor pagination; planner picks single-field indexes when available, full-scan fallback otherwise |
+| **Indexes** | Equality + range (CritBitTree), geo R-tree (planar or haversine KNN, polygon point-in), HNSW vector index with cosine / L2 / dot metrics |
+| **Temporal** | Gorilla-encoded scalar time-series engine; tile time-stacks for compressed raster-over-time storage with constant-chunk RLE + Simple-8b timestamp codec |
 | **Numeric** | Vector + Matrix primitives, GeoMesh (raster pinned to a bbox) |
-| **Scale** | Spillable mode with paged on-disk doc index — datasets bigger than RAM via mmap; streaming iterators for bounded-memory bulk reads |
+| **Storage** | Snapshot v4 with per-collection key + value dictionaries (typically 5–15% smaller files on structured / enum-heavy data); paged on-disk doc index for spillable mode |
+| **Scale** | Spillable mode with mmap'd snapshot — datasets bigger than RAM; streaming iterators for bounded-memory bulk reads |
 
 No external runtime dependencies. Pure Nim ≥ 1.6.
 

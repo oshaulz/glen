@@ -44,30 +44,88 @@ proc bytes*(w: BitWriter): seq[byte] = w.buf
 proc bitLen*(w: BitWriter): int = w.bitOffset
 
 # --------- BitReader ---------
+#
+# Reader uses a 64-bit register (`cache`) holding the next up-to-64 bits in
+# MSB-aligned form: bit 63 is the next bit to consume. `cacheBits` tracks
+# how many of those bits are still valid.
+#
+# Refill pulls the next byte from `buf`, ORs it into the empty low bits of
+# `cache`, and bumps `cacheBits` by 8. We refill only when needed by the
+# caller-requested width — the common case for `readBit`/`readBitsU64(<=8)`
+# is a single shift+mask with no refill cost.
+#
+# Original semantics preserved: same MSB-first bit ordering, same EOF
+# behaviour (`readBit`/`readBitsU64` raise IOError past `bitLimit`).
 
 type BitReader* = object
   buf*: seq[byte]
-  bitOffset*: int
-  bitLimit*: int
+  bytePos*:   int       # next byte to refill from
+  cache*:     uint64    # holds the next `cacheBits` bits, MSB-aligned
+  cacheBits*: int       # 0..64
+  bitLimit*:  int       # total bits in this stream
+  bitsRead*:  int       # how many we've already consumed
 
 proc newBitReader*(buf: seq[byte]; bitLen: int): BitReader =
-  BitReader(buf: buf, bitOffset: 0, bitLimit: bitLen)
+  result = BitReader(buf: buf, bytePos: 0, cache: 0'u64, cacheBits: 0,
+                     bitLimit: bitLen, bitsRead: 0)
+
+proc bitOffset*(r: BitReader): int {.inline.} = r.bitsRead
+
+proc fillCache(r: var BitReader) {.inline.} =
+  ## Pull whole bytes into the cache until either the cache is full (>=56
+  ## bits, leaving room for 8 more) or the buffer is exhausted.
+  while r.cacheBits <= 56 and r.bytePos < r.buf.len:
+    r.cache = r.cache or (uint64(r.buf[r.bytePos]) shl (56 - r.cacheBits))
+    r.cacheBits += 8
+    inc r.bytePos
 
 proc readBit*(r: var BitReader): bool =
-  if r.bitOffset >= r.bitLimit:
+  if r.bitsRead >= r.bitLimit:
     raise newException(IOError, "bit reader past EOF")
-  let byteIdx = r.bitOffset shr 3
-  let inByte  = r.bitOffset and 7
-  let bit     = (r.buf[byteIdx] shr (7 - inByte)) and 1'u8
-  inc r.bitOffset
-  bit != 0'u8
+  if r.cacheBits == 0: r.fillCache()
+  let bit = (r.cache shr 63) and 1'u64
+  r.cache = r.cache shl 1
+  dec r.cacheBits
+  inc r.bitsRead
+  bit != 0'u64
+
+proc takeFromCache(r: var BitReader; nBits: int): uint64 {.inline.} =
+  ## Caller has verified `1 <= nBits <= r.cacheBits`. Reads the top nBits
+  ## from the cache and consumes them. The `nBits == 64` case is special-
+  ## cased because `x shl 64` is undefined in C (shift count masked to 6
+  ## bits on x86, leaving stale high bits). After a take, the bottom of
+  ## `cache` is zero — important so `fillCache` can OR new bytes in cleanly.
+  if nBits == 64:
+    result = r.cache
+    r.cache = 0'u64
+  else:
+    result = r.cache shr (64 - nBits)
+    r.cache = r.cache shl nBits
+  r.cacheBits -= nBits
+  r.bitsRead += nBits
 
 proc readBitsU64*(r: var BitReader; nBits: int): uint64 =
+  ## Read up to 64 bits in one shot, MSB-first. May span a refill: drains the
+  ## cache, refills, then takes the remainder. Same EOF semantics as the old
+  ## bit-by-bit reader.
   if nBits <= 0: return 0'u64
-  var v: uint64 = 0
-  for _ in 0 ..< nBits:
-    v = (v shl 1) or (if r.readBit(): 1'u64 else: 0'u64)
-  v
+  doAssert nBits <= 64, "BitReader: readBitsU64 capped at 64 bits"
+  if r.bitsRead + nBits > r.bitLimit:
+    raise newException(IOError, "bit reader past EOF")
+  if nBits <= r.cacheBits:
+    return r.takeFromCache(nBits)
+  # Two-phase: drain whatever's currently cached, refill, then take the rest.
+  let first = r.cacheBits
+  var hi: uint64 = 0
+  if first > 0:
+    hi = r.takeFromCache(first)
+  let remaining = nBits - first
+  r.fillCache()
+  if remaining > r.cacheBits:
+    raise newException(IOError, "bit reader past EOF")
+  let lo = r.takeFromCache(remaining)
+  if first == 0: return lo
+  (hi shl remaining) or lo
 
 # --------- zigzag ---------
 
@@ -119,21 +177,35 @@ type XorState* = object
   prevTrailing*: int
   hasPrev*:      bool
 
-proc countLeadingZeros64*(x: uint64): int =
-  if x == 0: return 64
-  var n = 0
-  var v = x
-  while (v and (1'u64 shl 63)) == 0:
-    inc n; v = v shl 1
-  n
+when defined(gcc) or defined(clang):
+  # gcc/clang builtins compile to lzcnt/tzcnt on x86-64 (BMI), clz/rbit+clz on
+  # arm64. Both ~3-cycle hardware operations; the scalar fallback below is a
+  # 32× slower bit-shift loop. The `0` guard is needed because both builtins
+  # are undefined on zero input.
+  proc builtinClzll(x: culonglong): cint {.importc: "__builtin_clzll", nodecl.}
+  proc builtinCtzll(x: culonglong): cint {.importc: "__builtin_ctzll", nodecl.}
 
-proc countTrailingZeros64*(x: uint64): int =
-  if x == 0: return 64
-  var n = 0
-  var v = x
-  while (v and 1'u64) == 0:
-    inc n; v = v shr 1
-  n
+  proc countLeadingZeros64*(x: uint64): int {.inline.} =
+    if x == 0: 64 else: int(builtinClzll(culonglong(x)))
+
+  proc countTrailingZeros64*(x: uint64): int {.inline.} =
+    if x == 0: 64 else: int(builtinCtzll(culonglong(x)))
+else:
+  proc countLeadingZeros64*(x: uint64): int =
+    if x == 0: return 64
+    var n = 0
+    var v = x
+    while (v and (1'u64 shl 63)) == 0:
+      inc n; v = v shl 1
+    n
+
+  proc countTrailingZeros64*(x: uint64): int =
+    if x == 0: return 64
+    var n = 0
+    var v = x
+    while (v and 1'u64) == 0:
+      inc n; v = v shr 1
+    n
 
 proc encodeXor*(w: var BitWriter; xstate: var XorState; xord: uint64) =
   if xord == 0'u64:
@@ -162,6 +234,51 @@ proc encodeXor*(w: var BitWriter; xstate: var XorState; xord: uint64) =
     xstate.prevLeading = leading
     xstate.prevTrailing = trailing
     xstate.hasPrev = true
+
+proc decodeXor*(r: var BitReader; xstate: var XorState): uint64
+
+proc decodeXorRun*(r: var BitReader; xstate: var XorState;
+                   nValues: int): seq[uint64] =
+  ## Bulk-decode `nValues` consecutive XOR values into a buffer. Equivalent
+  ## to calling `decodeXor` `nValues` times, but uses `countLeadingZeros64`
+  ## on the cached bit register to detect runs of zero-XOR values (the
+  ## dominant case for radar/raster fields with constant cells) and skip
+  ## past them in O(1) per run instead of O(N) per individual readBit.
+  ##
+  ## A zero-XOR encoded as `0` (one bit) leaves `prevLeading`/`prevTrailing`
+  ## unchanged, which matches the standalone `decodeXor` semantics, so the
+  ## XorState passed in/out behaves identically across batched and
+  ## per-call decoders.
+  result = newSeq[uint64](nValues)
+  var i = 0
+  while i < nValues:
+    if r.cacheBits == 0: r.fillCache()
+    if r.cacheBits == 0:
+      raise newException(IOError, "bit reader past EOF")
+    if (r.cache shr 63) == 0'u64:
+      # The next bit is 0 → next XOR is 0 → all bits up to the first 1-bit
+      # are also zero-XOR markers. clz on the cache tells us how many.
+      let availBits = r.cacheBits
+      var nZeros: int
+      if r.cache == 0'u64:
+        nZeros = availBits
+      else:
+        let clz = countLeadingZeros64(r.cache)
+        nZeros = if clz < availBits: clz else: availBits
+      let take = min(nZeros, nValues - i)
+      # Skip `take` bits in the cache. Result entries are already 0 from
+      # newSeq, so zero-XOR positions need no further work.
+      if take == 64:
+        r.cache = 0'u64
+      else:
+        r.cache = r.cache shl take
+      r.cacheBits -= take
+      r.bitsRead += take
+      i += take
+    else:
+      # Non-zero XOR; defer to the standard decoder for this one value.
+      result[i] = decodeXor(r, xstate)
+      inc i
 
 proc decodeXor*(r: var BitReader; xstate: var XorState): uint64 =
   if not r.readBit(): return 0'u64

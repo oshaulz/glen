@@ -16,10 +16,13 @@ import glen/geomesh
 import glen/tilestack
 import glen/codec_stream
 import glen/validators
+import glen/simple8b
+import glen/vectorindex
+import glen/query
 
 # Public exports
 
-export types, codec, codec_stream, wal, storage, cache, subscription, txn, db, util, index, geo, linalg, geomesh, tilestack, validators
+export types, codec, codec_stream, wal, storage, cache, subscription, txn, db, util, index, geo, linalg, geomesh, tilestack, validators, simple8b, vectorindex, query
 
 # Placeholder openDatabase
 proc openDatabase*(path: string): GlenDB =

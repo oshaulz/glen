@@ -39,7 +39,17 @@ const testFiles = @[
   "tests/test_spillable.nim",
   "tests/test_streaming.nim",
   "tests/test_snapshot_v3.nim",
-  "tests/test_autocompact.nim"
+  "tests/test_autocompact.nim",
+  "tests/test_repl_export_parallel.nim",
+  "tests/test_tilestack_rle.nim",
+  "tests/test_simple8b.nim",
+  "tests/test_tilestack_s8b.nim",
+  "tests/test_vectorindex.nim",
+  "tests/test_vectorindex_db.nim",
+  "tests/test_query.nim",
+  "tests/test_codec_keydict.nim",
+  "tests/test_codec_valuedict.nim",
+  "tests/test_snapshot_v4.nim"
 ]
 
 task test, "Run test suite":
@@ -58,6 +68,9 @@ task bench_geo, "Geospatial / R-tree benchmarks (release, ORC, O3)":
 
 task bench_timeseries, "Time-series + tilestack benchmarks (release, ORC, O3)":
   exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench_timeseries.nim"
+
+task bench_bitpack, "Bit-decode microbenchmark (release, ORC, O3)":
+  exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench_bitpack.nim"
 
 task bench_concurrent, "Run multi-threaded contention benchmark (release, atomicArc, O3)":
   # atomicArc gives thread-safe refcounting (Glen's Value graph is acyclic so

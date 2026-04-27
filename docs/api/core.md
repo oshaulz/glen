@@ -24,7 +24,10 @@ proc newGlenDB*(dir: string;
                 lockStripesCount = 32;
                 spillableMode = false;
                 hotDocCap = 0;
-                maxDirtyDocs = 0): GlenDB
+                maxDirtyDocs = 0;
+                compactWalBytes = 0;
+                compactIntervalMs = 0;
+                compactDirtyCount = 0): GlenDB
 ```
 
 | Arg | Default | Notes |
@@ -38,6 +41,19 @@ proc newGlenDB*(dir: string;
 | `spillableMode` | `false` | mmap snapshot, lazy fault — see [spillable-mode.md](../spillable-mode.md) |
 | `hotDocCap` | 0 | spill-mode LRU cap on `cs.docs.len` (`0` = unbounded) |
 | `maxDirtyDocs` | 0 | spill-mode in-flight cap (`0` = unbounded) |
+| `compactWalBytes` | 0 | auto-compact when WAL total ≥ N bytes (`0` = off) |
+| `compactIntervalMs` | 0 | auto-compact when ≥ N ms since last compact (`0` = off) |
+| `compactDirtyCount` | 0 | auto-compact when summed `cs.dirty.len` ≥ N (`0` = off; spill-mode only) |
+
+### Auto-compaction triggers
+
+`db.compact()` rewrites every collection's snapshot and resets the WAL. Long-
+running services need this to happen automatically; the three trigger knobs
+above let you opt in. They're all checked at the end of every mutation
+(`put`, `delete`, `putMany`, `deleteMany`, `commit`, `applyChanges`) — first
+trigger to fire wins, and a re-entrancy guard prevents two threads from
+double-compacting. Set any to `0` to disable that trigger; with all three at
+`0` (the default) compaction stays manual.
 
 ## Configuration
 
@@ -58,6 +74,9 @@ let db = newGlenDBFromEnv("./mydb")
 | `GLEN_MAX_STRING_OR_BYTES` | 16 MiB | codec safety cap |
 | `GLEN_MAX_ARRAY_LEN` | 1,000,000 | codec safety cap |
 | `GLEN_MAX_OBJECT_FIELDS` | 1,000,000 | codec safety cap |
+| `GLEN_COMPACT_WAL_BYTES` | 0 | `compactWalBytes` |
+| `GLEN_COMPACT_INTERVAL_MS` | 0 | `compactIntervalMs` |
+| `GLEN_COMPACT_DIRTY_COUNT` | 0 | `compactDirtyCount` |
 
 ## CRUD
 
@@ -239,6 +258,50 @@ db.close()
 
 If you mutate a borrowed value, you'll silently corrupt the cache and other
 callers' views. Use `get` (cloned) when in doubt.
+
+## Vector index (HNSW)
+
+Approximate k-nearest-neighbour search over per-document embedding fields.
+The graph is in-memory (HNSW) and persisted to a `.vri` binary dump on
+`compact()`; reopen auto-loads the dump rather than re-inserting every doc.
+
+```nim
+db.createVectorIndex("docs", "by_emb", embeddingField = "emb", dim = 384,
+                     metric = vmCosine)
+
+let q: seq[float32] = ...   # query embedding
+let hits = db.findNearestVector("docs", "by_emb", q, k = 10)
+for (id, dist) in hits: echo id, " @ ", dist
+```
+
+Knobs (defaults in parens): `M` (16, neighbours per layer), `efConstruction`
+(200, candidate pool during insert), `efSearch` (64, candidate pool during
+query). Distance metrics: `vmCosine` (vectors are unit-normalised on insert),
+`vmL2`, `vmDot`. All metrics are "smaller = closer" for ranking.
+
+`findNearestVectorStream` yields `(docId, distance, doc)` triples for the
+k nearest, fetching docs lazily so spill-mode stays bounded.
+
+## Higher-level query API
+
+Method-chain composer over a collection. Predicates: `whereEq`, `whereNe`,
+`whereLt(e)`, `whereGt(e)`, `whereIn`, `whereContains`. Result shaping:
+`orderByField`, `limitN`, `afterCursor`. Returns `seq[(id, doc-clone)]`.
+
+```nim
+var q = db.query("users")
+let page = q.whereEq("status", VString("active"))
+            .whereGte("age", VInt(18))
+            .orderByField("age")
+            .limitN(20)
+            .run()
+let next = nextCursor(page)
+```
+
+The planner picks at most one equality / `in` predicate that an existing
+single-field index covers, walks its candidate IDs, and post-filters with
+the remaining predicates. Without a covering index, it falls back to a
+collection scan. There are no joins, aggregations, or group-bys — by design.
 
 ## See also
 
