@@ -299,6 +299,47 @@ proc zEnum*(values: openArray[string]): Schema[string] =
     allowed.incl(v)
   zString("enum").refine("Value must be one of " & $values, proc (value: string): bool = value in allowed)
 
+proc zVector*(dim: int): Schema[seq[float32]] =
+  ## Embedding-vector validator: a `VArray` of `dim` floats (or ints
+  ## coerced to floats), parsed into `seq[float32]` ready for the HNSW
+  ## index. Use as a schema field type:
+  ##
+  ##   schema docs:
+  ##     fields:
+  ##       title:     zString()
+  ##       embedding: zVector(384)
+  ##     indexes:
+  ##       byEmbed:   vector embedding, 384, vmCosine
+  let expectedDim = dim
+  newSchema[seq[float32]]("vector(" & $dim & ")",
+    proc (input: Value; path: seq[string]; issues: var seq[ValidationIssue]): Option[seq[float32]] =
+      if input.isNil or input.kind != vkArray:
+        issues.add(mkIssue(path, "vector(" & $expectedDim & ")",
+          kindName(input), "Value must be an array of " & $expectedDim & " floats"))
+        return none(seq[float32])
+      if input.arr.len != expectedDim:
+        issues.add(mkIssue(path, "vector(" & $expectedDim & ")",
+          "len=" & $input.arr.len,
+          "Vector has " & $input.arr.len & " elements, expected " & $expectedDim))
+        return none(seq[float32])
+      var v = newSeq[float32](expectedDim)
+      var ok = true
+      for i, el in input.arr:
+        if el.isNil:
+          issues.add(mkIssue(pushPath(path, $i), "float", "null",
+            "Vector element must be a number"))
+          ok = false
+          continue
+        case el.kind
+        of vkFloat: v[i] = float32(el.f)
+        of vkInt:   v[i] = float32(el.i)
+        else:
+          issues.add(mkIssue(pushPath(path, $i), "float", kindName(el),
+            "Vector element must be a number"))
+          ok = false
+      if ok: some(v) else: none(seq[float32])
+  )
+
 proc zArray*[T](element: Schema[T]): Schema[seq[T]] =
   let inner = element
   newSchema[seq[T]]("array", proc (input: Value; path: seq[string]; issues: var seq[ValidationIssue]): Option[seq[T]] =

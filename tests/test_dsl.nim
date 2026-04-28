@@ -1041,6 +1041,202 @@ suite "dsl: liveQuery":
     check live.len == 0
     db.close()
 
+# ---- vectors: vec() helper, VectorIndex proxy, threshold ------------------
+
+suite "dsl: vec32() helper":
+  test "vec3232([a, b, c]) builds a seq[float32]":
+    let v = vec32([1.0, 2.0, 3.0])
+    check v is seq[float32]
+    check v == @[1.0'f32, 2.0'f32, 3.0'f32]
+
+  test "vec32 accepts mixed-precision floats":
+    let v = vec32([1.0, 2.5, 3.0])
+    check v.len == 3
+    check v[0] == 1.0'f32 and v[1] == 2.5'f32 and v[2] == 3.0'f32
+
+  test "vec32 from a runtime seq[float64]":
+    let raw: seq[float64] = @[1.0, 2.0, 3.0]
+    let v = vec32(raw)
+    check v == @[1.0'f32, 2.0'f32, 3.0'f32]
+
+suite "dsl: VectorIndex proxy":
+  test "create / upsert / search top-k":
+    let dir = freshDir("glen_dsl_vectors")
+    let db = newGlenDB(dir)
+    let idx = db.vectors("docs", "byEmbed")
+    idx.create("embedding", dim = 3)
+    idx.upsert("a", %*{"text": "hello",   "embedding": [1.0, 0.0, 0.0]})
+    idx.upsert("b", %*{"text": "world",   "embedding": [0.0, 1.0, 0.0]})
+    idx.upsert("c", %*{"text": "hello!",  "embedding": [0.95, 0.05, 0.0]})
+
+    # Searching with q ≈ a should return a and c at the top.
+    let hits = idx.search(vec32([1.0, 0.0, 0.0]), k = 2)
+    check hits.len == 2
+    var ids: seq[string] = @[]
+    for (id, _) in hits: ids.add(id)
+    check "a" in ids and "c" in ids
+    db.close()
+
+  test "searchWithin: threshold-based retrieval":
+    let dir = freshDir("glen_dsl_vectors_within")
+    let db = newGlenDB(dir)
+    let idx = db.vectors("docs", "byEmbed")
+    idx.create("embedding", dim = 3)
+    # Cosine distance: d = 1 - cos(a, b)
+    idx.upsert("very_similar", %*{"embedding": [1.0, 0.0, 0.01]})    # d ≈ 0
+    idx.upsert("kinda_similar", %*{"embedding": [0.7, 0.7, 0.0]})    # d ≈ 0.29
+    idx.upsert("far",           %*{"embedding": [0.0, 1.0, 0.0]})    # d ≈ 1
+
+    let close = idx.searchWithin(vec32([1.0, 0.0, 0.0]), maxDistance = 0.05)
+    var closeIds: seq[string] = @[]
+    for (id, _) in close: closeIds.add(id)
+    check "very_similar" in closeIds
+    check "kinda_similar" notin closeIds
+    check "far" notin closeIds
+    db.close()
+
+  test "searchDocs returns matched documents inline":
+    let dir = freshDir("glen_dsl_vectors_docs")
+    let db = newGlenDB(dir)
+    let idx = db.vectors("docs", "byEmbed")
+    idx.create("embedding", dim = 2)
+    idx.upsert("a", %*{"title": "first",  "embedding": [1.0, 0.0]})
+    idx.upsert("b", %*{"title": "second", "embedding": [0.0, 1.0]})
+    let triples = idx.searchDocs(vec32([1.0, 0.0]), k = 1)
+    check triples.len == 1
+    check triples[0][0] == "a"
+    check triples[0][2]["title"].s == "first"
+    db.close()
+
+# ---- vectors: schema-level zVector(dim) -----------------------------------
+
+schema notes:
+  fields:
+    title:     zString()
+    embedding: zVector(3)
+  indexes:
+    byEmbed:   vector embedding, 3, vmCosine
+
+suite "dsl: schema vector field":
+  test "zVector field round-trips through typed put/get":
+    let dir = freshDir("glen_dsl_schema_vec")
+    let db = newGlenDB(dir)
+    registerNotesSchema(db)
+    putNotes(db, "n1", Notes(
+      title: "alpha",
+      embedding: @[1.0'f32, 2.0'f32, 3.0'f32]))
+    let (ok, fetched) = getNotes(db, "n1")
+    check ok
+    check fetched.title == "alpha"
+    check fetched.embedding == @[1.0'f32, 2.0'f32, 3.0'f32]
+    # Index was registered too; nearest-neighbour lookup works.
+    let hits = db.vectors(notesCollection, "byEmbed").search(
+      vec32([1.0, 2.0, 3.0]), k = 1)
+    check hits.len == 1
+    check hits[0][0] == "n1"
+    db.close()
+
+  test "zVector rejects wrong dim and non-numeric values":
+    let r1 = parseNotes(%*{"title": "t", "embedding": [1.0, 2.0]})
+    check not r1.ok
+    let r2 = parseNotes(%*{"title": "t", "embedding": [1.0, "x", 3.0]})
+    check not r2.ok
+
+# ---- query: similar: with threshold ---------------------------------------
+
+suite "dsl: query similar: threshold":
+  test "threshold-only similar:":
+    let dir = freshDir("glen_dsl_similar_thr")
+    let db = newGlenDB(dir)
+    db.createVectorIndex("docs", "byEmbed", "embedding", 3, vmCosine)
+    db.put("docs", "near",  %*{"embedding": [1.0, 0.0, 0.01], "kind": "a"})
+    db.put("docs", "kinda", %*{"embedding": [0.7, 0.7, 0.0],  "kind": "a"})
+    db.put("docs", "far",   %*{"embedding": [0.0, 1.0, 0.0],  "kind": "a"})
+
+    let q = vec32([1.0, 0.0, 0.0])
+    let hits = query(db, "docs"):
+      similar: ("byEmbed", q, threshold = 0.05)
+    var ids: seq[string] = @[]
+    for (id, _) in hits: ids.add(id)
+    check "near" in ids
+    check "kinda" notin ids
+    check "far" notin ids
+    db.close()
+
+  test "top-k AND threshold (positional 4-tuple)":
+    let dir = freshDir("glen_dsl_similar_4tup")
+    let db = newGlenDB(dir)
+    db.createVectorIndex("docs", "byEmbed", "embedding", 3, vmCosine)
+    for i in 0 ..< 10:
+      let v = %*{
+        "embedding": [1.0 - float(i)*0.05, float(i)*0.05, 0.0],
+        "i": i}
+      db.put("docs", $i, v)
+    let q = vec32([1.0, 0.0, 0.0])
+    # Cap at 2 results AND require distance ≤ 0.1 (cosine ≥ 0.9).
+    let hits = query(db, "docs"):
+      similar: ("byEmbed", q, 2, 0.1)
+    check hits.len <= 2
+    db.close()
+
+# ---- geo proxy + polygonLit ------------------------------------------------
+
+suite "dsl: GeoIndex proxy":
+  test "create / near / nearest / inBBox":
+    let dir = freshDir("glen_dsl_geo_proxy")
+    let db = newGlenDB(dir)
+    let g = db.geo("places", "byLoc")
+    g.create("lon", "lat")
+    db.put("places", "nyc",    %*{"name": "NYC",    "lon": -73.98, "lat": 40.75})
+    db.put("places", "philly", %*{"name": "Philly", "lon": -75.16, "lat": 39.95})
+    db.put("places", "la",     %*{"name": "LA",     "lon": -118.24, "lat": 34.05})
+
+    # 200 km of NYC catches Philly, not LA.
+    let nearby = g.near(-73.98, 40.75, 200_000.0)
+    var ids: seq[string] = @[]
+    for (id, _, _) in nearby: ids.add(id)
+    check "nyc" in ids and "philly" in ids and "la" notin ids
+
+    # Top-2 nearest from LA.
+    let knn = g.nearest(-118.24, 34.05, k = 2)
+    check knn.len == 2
+    check knn[0][0] == "la"
+
+    # BBox covering just the NE corner.
+    let inBox = g.inBBox(-80.0, 35.0, -70.0, 45.0)
+    var boxIds: seq[string] = @[]
+    for (id, _) in inBox: boxIds.add(id)
+    check "nyc" in boxIds and "philly" in boxIds and "la" notin boxIds
+    db.close()
+
+suite "dsl: polygonLit":
+  test "polygonLit + readPolygon round-trip":
+    let region = polygonLit [
+      (-74.0, 40.7), (-73.9, 40.7), (-73.9, 40.8), (-74.0, 40.8)]
+    check region.kind == vkArray
+    check region.arr.len == 4
+    let p = readPolygon(region)
+    check p.vertices.len == 4
+    check p.vertices[0] == (-74.0, 40.7)
+
+  test "polygonLit feeds findPointsInPolygon via the geo proxy":
+    let dir = freshDir("glen_dsl_polygonlit")
+    let db = newGlenDB(dir)
+    let g = db.geo("places", "byLoc")
+    g.create("lon", "lat")
+    db.put("places", "in1",  %*{"lon": -73.95, "lat": 40.75})
+    db.put("places", "out1", %*{"lon": -75.16, "lat": 39.95})
+
+    let manhattan = readPolygon(polygonLit [
+      (-74.02, 40.70), (-73.93, 40.70),
+      (-73.93, 40.80), (-74.02, 40.80)])
+    let hits = g.inPolygon(manhattan)
+    var ids: seq[string] = @[]
+    for (id, _) in hits: ids.add(id)
+    check "in1" in ids
+    check "out1" notin ids
+    db.close()
+
 # ---- watch -------------------------------------------------------------
 
 suite "dsl: watch":

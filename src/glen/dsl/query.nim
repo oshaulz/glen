@@ -269,6 +269,22 @@ proc prefilterSimilar*(db: glendb.GlenDB; collection, indexName: string;
     if evalAll(preds, doc):
       result.add((id, doc))
 
+proc prefilterSimilarWithin*(db: glendb.GlenDB; collection, indexName: string;
+                             query: openArray[float32];
+                             maxDistance: float32;
+                             preds: seq[QueryPredicate];
+                             maxResults = 0): seq[(string, Value)] =
+  ## Threshold variant of `prefilterSimilar`: every doc whose embedding
+  ## is within `maxDistance` of `query` AND satisfies the predicates.
+  result = @[]
+  let pairs = db.findNearestVectorWithin(collection, indexName, query,
+                                         maxDistance, maxResults)
+  for (id, _) in pairs:
+    let doc = db.get(collection, id)
+    if doc.isNil: continue
+    if evalAll(preds, doc):
+      result.add((id, doc))
+
 # ---- query macro -----------------------------------------------------------
 
 proc parseSelectFields(body: NimNode): seq[string] =
@@ -324,26 +340,47 @@ proc parseNearArgs(node: NimNode): tuple[idx, lon, lat, radius: NimNode] =
     error("query: near: expected (indexName, lon, lat, radiusMeters)", node)
   result = (args[0], args[1], args[2], args[3])
 
-proc parseSimilarArgs(node: NimNode): tuple[idx, vec, k: NimNode] =
-  ## `similar: "byEmbed", queryVec, 10`
+proc parseSimilarArgs(node: NimNode): tuple[idx, vec, k, threshold: NimNode] =
+  ## `similar: "byEmbed", queryVec, 10`           — top-k
+  ## `similar: ("byEmbed", queryVec, 10)`         — same, paren tuple
+  ## `similar: ("byEmbed", queryVec, 10, 0.2)`    — top-k AND threshold
+  ## `similar: ("byEmbed", queryVec, threshold = 0.2)` — threshold-only
+  ##
+  ## Returns (idx, vec, k, threshold) where unused slots are nil.
   var args: seq[NimNode] = @[]
+  var threshold: NimNode = nil
   proc collect(n: NimNode) =
     case n.kind
     of nnkStmtList:
       for c in n: collect(c)
     of nnkPar, nnkTupleConstr, nnkCommand, nnkCall:
-      for c in n: args.add(c)
+      for c in n: collect(c)
     of nnkInfix:
       if $n[0] == ",":
         collect(n[1]); collect(n[2])
       else:
         args.add(n)
+    of nnkExprEqExpr:
+      if n[0].kind in {nnkIdent, nnkSym} and $n[0] == "threshold":
+        threshold = n[1]
+      else:
+        error("query: similar: only `threshold = X` is supported as a named arg", n)
     else:
       args.add(n)
   collect(node)
-  if args.len != 3:
-    error("query: similar: expected (indexName, queryVec, k)", node)
-  result = (args[0], args[1], args[2])
+  case args.len
+  of 2:
+    if threshold.isNil:
+      error("query: similar: needs at least (indexName, queryVec, k) — got 2 positional args without `threshold`", node)
+    result = (args[0], args[1], newLit(0), threshold)   # threshold-only
+  of 3:
+    result = (args[0], args[1], args[2], threshold)     # top-k (+ optional threshold)
+  of 4:
+    if not threshold.isNil:
+      error("query: similar: cannot mix positional threshold with `threshold = X`", node)
+    result = (args[0], args[1], args[2], args[3])        # top-k AND threshold
+  else:
+    error("query: similar: expected (indexName, queryVec, k [, threshold])", node)
 
 proc rewritePredicateToConstr(stmt: NimNode): NimNode =
   ## Map a single predicate statement to a `QueryPredicate(...)` literal,
@@ -484,16 +521,31 @@ macro query*(db: glendb.GlenDB; collection: static[string]; body: untyped): unty
       rowsExpr = newCall(bindSym"prefilterNear",
         db, newLit(collection), idx, lon, lat, rad, predsExpr, limitExpr)
     else:
-      let (idx, vec, k) = parseSimilarArgs(similarBody)
-      rowsExpr = newCall(bindSym"prefilterSimilar",
-        db, newLit(collection), idx, vec, k, predsExpr)
-      if not limitArg.isNil:
-        # Trim k post-hoc (rare; user usually expresses bound via `k`).
-        rowsExpr = quote do:
-          (
-            let r = `rowsExpr`
-            if `limitArg` > 0 and r.len > `limitArg`: r[0 ..< `limitArg`] else: r
-          )
+      let (idx, vec, k, threshold) = parseSimilarArgs(similarBody)
+      let maxResultsExpr = if limitArg.isNil: newLit(0) else: limitArg
+      if threshold.isNil:
+        # Pure top-k.
+        rowsExpr = newCall(bindSym"prefilterSimilar",
+          db, newLit(collection), idx, vec, k, predsExpr)
+        if not limitArg.isNil:
+          # Trim k post-hoc (rare; user usually expresses bound via `k`).
+          rowsExpr = quote do:
+            (
+              let r = `rowsExpr`
+              if `limitArg` > 0 and r.len > `limitArg`: r[0 ..< `limitArg`] else: r
+            )
+      else:
+        # Threshold path: every match within `threshold`. If a positional
+        # k > 0 was also provided, treat it as the cap on results. The
+        # `threshold` literal is converted to float32 here so callers can
+        # pass an int / float / float32 interchangeably.
+        let thresholdExpr = newCall(ident"float32", threshold)
+        let cap =
+          if k.kind in nnkIntLit..nnkUInt64Lit and k.intVal == 0:
+            maxResultsExpr
+          else: k
+        rowsExpr = newCall(bindSym"prefilterSimilarWithin",
+          db, newLit(collection), idx, vec, thresholdExpr, predsExpr, cap)
 
     var pre = newStmtList()
     let rowsSym = genSym(nskLet, "rows")

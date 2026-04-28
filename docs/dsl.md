@@ -212,6 +212,136 @@ responsibility: `withSeries` / `withTiles` cover the common scoped-use
 case; for long-lived handles, hold the returned ref and call `.close()`.
 Don't open the same series twice concurrently.
 
+## Vector index proxy — `db.vectors`
+
+Same shape as `Collection` and the engine proxies, but for HNSW
+embedding indexes. Bundles `createVectorIndex` / `findNearestVector` /
+`findNearestVectorWithin` / `db.put` under one handle.
+
+```nim
+let idx = db.vectors("docs", "byEmbed")
+
+# Allocate the index lazily off the proxy.
+idx.create(embeddingField = "embedding", dim = 384)
+
+# Insert / update docs (just calls db.put).
+idx.upsert("d1", %*{
+  "title": "hello",
+  "embedding": queryVec.mapIt(float64(it))
+})
+
+# Top-k search.
+let hits = idx.search(vec32([0.1, 0.2, 0.3, ...]), k = 10)
+
+# Threshold-based search: every match within `maxDistance`.
+let close = idx.searchWithin(queryVec, maxDistance = 0.2)   # cosine ≥ 0.8
+
+# Same shape, but pre-fetches the matching documents.
+for (id, dist, doc) in idx.searchDocs(queryVec, k = 5):
+  echo doc["title"].s, " (", dist, ")"
+
+# Atomic "build doc + put" for the common embedding-plus-metadata case.
+idx.upsertVector("d2", "embedding", queryVec,
+                 extra = %*{"title": "world"})
+```
+
+| Method                                      | Returns                                |
+|---------------------------------------------|----------------------------------------|
+| `idx.create(field, dim, metric, ...)`       | (creates the underlying HNSW index)    |
+| `idx.drop()`                                | drops it                               |
+| `idx.search(query, k)`                      | `seq[(string, float32)]`               |
+| `idx.searchWithin(query, maxDistance, [maxResults])` | `seq[(string, float32)]` — every match below the distance threshold |
+| `idx.searchDocs(query, k)`                  | `seq[(string, float32, Value)]` — pre-fetches docs |
+| `idx.searchDocsWithin(query, maxDistance, ...)` | same, threshold variant            |
+| `idx.upsert(id, value)`                     | sugar over `db.put`                    |
+| `idx.upsertVector(id, field, embedding, extra=nil)` | builds the doc and puts in one call |
+
+### `vec32` — fixed-precision vector helper
+
+Embeddings flow through Glen as `seq[float32]`. Building one from a
+literal is verbose (`@[float32(1.0), float32(2.0), ...]`); `vec32`
+shortens it:
+
+```nim
+let q = vec32([0.1, 0.2, 0.3, 0.4])              # bracket arg
+let r = vec32(someSeqOfFloat64)                   # any openArray of numbers
+let s = vec32 someSeqOfFloat64                    # command form, no parens
+```
+
+The name is `vec32` (not `vec`) because `glen/linalg` already exports a
+`vec` for its float64 `Vector` type. Use `vec32` for embeddings,
+`linalg.vec` for math.
+
+### Schema-level embedding fields — `zVector(dim)`
+
+Inside a `schema:` block, declare embedding fields with `zVector(dim)`.
+The validator ensures stored vectors have the right length, the typed
+record gets a `seq[float32]` field, and the existing `indexes:` block
+still registers the HNSW index:
+
+```nim
+schema notes:
+  fields:
+    title:     zString()
+    embedding: zVector(384)
+  indexes:
+    byEmbed:   vector embedding, 384, vmCosine
+
+registerNotesSchema(db)
+putNotes(db, "n1", Notes(
+  title: "hello",
+  embedding: vec32([0.0, 0.0, ...])))           # typed, length-checked
+```
+
+`parseNotes` rejects vectors of the wrong dim and elements that aren't
+numbers, so a malformed embedding gets caught at validation time
+instead of silently corrupting the index.
+
+## Geo index proxy — `db.geo`
+
+Mirror of `db.vectors` for the spatial R-tree:
+
+```nim
+let g = db.geo("places", "byLoc")
+g.create(lonField = "lon", latField = "lat")
+
+let nearby = g.near(lon = -73.98, lat = 40.75, radiusMeters = 2000.0)
+let knn    = g.nearest(-73.98, 40.75, k = 10)
+let inBox  = g.inBBox(-74.0, 40.7, -73.9, 40.8)
+let inReg  = g.inPolygon(myPolygon, metric = gmGeographic)
+```
+
+| Method                                                       | Returns                          |
+|--------------------------------------------------------------|----------------------------------|
+| `g.create(lonField, latField)`                               | (creates the R-tree index)       |
+| `g.drop()`                                                   |                                  |
+| `g.near(lon, lat, radiusMeters [, limit])`                   | `seq[(string, float64, Value)]`  |
+| `g.nearest(lon, lat, k [, metric])`                          | `seq[(string, float64, Value)]`  |
+| `g.inBBox(minLon, minLat, maxLon, maxLat [, limit, metric])` | `seq[(string, Value)]`           |
+| `g.inPolygon(polygon [, limit, metric])`                     | `seq[(string, Value)]`           |
+
+### `polygonLit` — polygon literal
+
+Polygons get stored as `VArray` of `VArray` of floats. Building one by
+hand is verbose; `polygonLit` accepts a bracket of `(lon, lat)` tuples:
+
+```nim
+let manhattan = polygonLit [
+  (-74.02, 40.70), (-73.93, 40.70),
+  (-73.93, 40.80), (-74.02, 40.80)]
+
+# Use directly as a stored value:
+db.put("zones", "manhattan", %*{"shape": manhattan})
+
+# Or convert to the `geo.Polygon` type for in-memory queries:
+let p = readPolygon(manhattan)
+let hits = g.inPolygon(p, metric = gmGeographic)
+```
+
+`readPolygon` is the round-trip back: takes a polygon `Value` (from
+`polygonLit` or read from a doc field) and returns a `geo.Polygon` ready
+for `findPointsInPolygon` / `findPolygonsContaining`.
+
 ## `query:` — query block
 
 Block syntax over the `query / whereEq / orderByField / limitN` builder.
@@ -347,11 +477,33 @@ let nearby = query(db, "stores"):
 let similar = query(db, "docs"):
   similar: ("byEmbed", queryVec, 10)        # (indexName, queryVector, k)
   where: published == true
+
+# Threshold-only: every match within distance 0.2 (cosine ≥ 0.8).
+let close = query(db, "docs"):
+  similar: ("byEmbed", queryVec, threshold = 0.2)
+
+# Top-k AND threshold: capped at 10 results, all with distance ≤ 0.3.
+let bounded = query(db, "docs"):
+  similar: ("byEmbed", queryVec, 10, 0.3)
+  where: published == true
 ```
 
 `near:` returns docs sorted by haversine distance ascending. `similar:`
 returns docs in HNSW's approximate-nearest order. Both compose with
 `select:` and reductions.
+
+The `similar:` section accepts four shapes:
+
+| Shape                                          | Behaviour                                       |
+|------------------------------------------------|-------------------------------------------------|
+| `(idx, query, k)`                              | Top-k                                           |
+| `(idx, query, threshold = X)`                  | Every match with distance ≤ X (no fixed cap)    |
+| `(idx, query, k, X)`                           | Top-k AND distance ≤ X                          |
+| `(idx, query, k, threshold = X)`               | Same                                            |
+
+With the cosine metric, `threshold = 0.2` ≈ "cosine similarity ≥ 0.8".
+With L2 it's Euclidean distance. With dot it's `-dot(a, b)`. In all
+cases, smaller = closer.
 
 If you want raw lookups (no post-filter, no DSL), the underlying procs
 are still exposed:

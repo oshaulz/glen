@@ -358,6 +358,49 @@ proc findNearest*(idx: VectorIndex; query: openArray[float32]; k: int): seq[(str
     result.add((id, dist))
     if result.len >= k: break
 
+proc findNearestWithin*(idx: VectorIndex; query: openArray[float32];
+                       maxDistance: float32;
+                       maxResults = 0): seq[(string, float32)] =
+  ## Find every doc whose distance from `query` is ≤ `maxDistance`.
+  ##
+  ## Useful for "find anything more similar than X" workflows where you
+  ## care about a threshold rather than a fixed top-k. With cosine
+  ## metric, distance is `1 - cos(a, b)` so `maxDistance = 0.2` means
+  ## "cosine similarity ≥ 0.8". With L2, distance is Euclidean. With
+  ## dot, distance is `-dot(a, b)` (smaller = closer for all metrics).
+  ##
+  ## `maxResults` caps the result count (0 = unlimited). Internally we
+  ## keep doubling the search depth until either the next batch all
+  ## exceeds the threshold or we run out of nodes — so for "rare match"
+  ## queries this stays efficient.
+  result = @[]
+  if query.len != idx.dim: return
+  if idx.hnsw.entryPoint < 0: return
+  var depth = max(idx.hnsw.efSearch, 32)
+  let totalNodes = idx.nodeToDoc.len
+  while true:
+    let raw = idx.hnsw.knnSearch(query, depth)
+    var lastDist: float32 = NegInf
+    result.setLen(0)
+    var truncated = false
+    for (dist, nid) in raw:
+      lastDist = dist
+      if dist > maxDistance: continue
+      if int(nid) >= idx.nodeToDoc.len: continue
+      let id = idx.nodeToDoc[int(nid)]
+      if id.len == 0: continue
+      result.add((id, dist))
+      if maxResults > 0 and result.len >= maxResults:
+        truncated = true; break
+    # We're done when (a) the deepest match still fits the threshold or
+    # (b) we've already scanned the whole graph. Otherwise double depth
+    # and re-scan; HNSW search results are sorted, so re-scanning is the
+    # only way to be sure we didn't miss something at the boundary.
+    if truncated: break
+    if lastDist > maxDistance: break
+    if depth >= totalNodes: break
+    depth *= 2
+
 # ---- Persistence ----
 
 const VRIMagic    = "GLENVRI1"

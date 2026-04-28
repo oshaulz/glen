@@ -1613,6 +1613,21 @@ proc findNearestVector*(db: GlenDB; collection, indexName: string;
   let vix = cs.vectorIndexes[indexName]
   vix.findNearest(query, k)
 
+proc findNearestVectorWithin*(db: GlenDB; collection, indexName: string;
+                              query: openArray[float32];
+                              maxDistance: float32;
+                              maxResults = 0): seq[(string, float32)] =
+  ## Threshold-based vector search: every match within `maxDistance` of
+  ## `query`, sorted ascending by distance. With `metric = vmCosine`,
+  ## `maxDistance = 0.2` means cosine similarity ≥ 0.8.
+  let cs = db.tryGetCollection(collection)
+  if cs.isNil: return @[]
+  if indexName notin cs.vectorIndexes: return @[]
+  db.acquireStripeRead(collection)
+  defer: db.releaseStripeRead(collection)
+  let vix = cs.vectorIndexes[indexName]
+  vix.findNearestWithin(query, maxDistance, maxResults)
+
 iterator findNearestVectorStream*(db: GlenDB; collection, indexName: string;
                                   query: openArray[float32]; k: int): (string, float32, Value) =
   ## Yield (docId, distance, doc) triples for the k nearest. The doc is
