@@ -257,8 +257,34 @@ CRC mismatch on a dump silently falls back to bulk-rebuild — never crashes.
 See [storage.md#snapshot-formats](../storage.md#snapshot-formats) for the
 binary dump format.
 
+## Earth-curvature handling
+
+Glen's geo layer is curvature-aware in the cases that matter:
+
+| Operation                                  | Curvature handling |
+|--------------------------------------------|---------------------|
+| Distance (`haversineMeters`, `findWithinRadius`) | Spherical (Earth radius 6,371,008.8 m) |
+| `findNearest` with `metric = gmGeographic` | Haversine, with R-tree pruning via `haversineMinMeters` |
+| `findInBBox` / `findWithinRadius` query bbox crossing the antimeridian | **Auto-split** into two halves and unioned (pass `metric = gmGeographic` for `findInBBox`) |
+| `findInBBox` / `findWithinRadius` query bbox past ±90° latitude | **Auto-clamped** to ±90° |
+| `findPolygonsContaining` with `metric = gmGeographic` | **Spherical PIP** via great-circle winding number (handles antimeridian, poles, continent-scale polygons) |
+| Polygons that themselves cross the antimeridian | Indexed with widened MBR `[-180, +180]`; the spherical PIP post-filter rejects false positives |
+
+`metric = gmPlanar` (the default) preserves the legacy behaviour: raw
+Euclidean distance, no antimeridian splitting, planar ray-cast PIP.
+This is the right choice for non-geographic 2D data (game maps, abstract
+coordinate systems, anything that doesn't wrap).
+
+**Spherical polygons require CCW vertex order** around the intended
+interior (right-hand rule with the normal pointing out of the sphere).
+`pointInPolygonSpherical` reports CW polygons as their *complement*
+(the rest of the sphere). When in doubt, run a centroid sanity check.
+
 ## What's not there
 
+- **Sphere, not WGS84 ellipsoid**: distances assume a perfect sphere
+  with radius 6,371,008.8 m. Error is ~0.3% at extreme latitudes —
+  fine for "find pizza nearby," wrong for sub-meter geodesy.
 - **No native geographic projections** beyond the haversine path metric.
   Coords are interpreted as `(lon, lat)` degrees in WGS84-ish.
 - **No 3D / N-D**. Strictly 2D.

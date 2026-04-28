@@ -10,7 +10,7 @@
 #     optimal KNN traversal (Hjaltason & Samet).
 #   * Fanout (M=16, m=6) is conservative; tweak after profiling.
 
-import std/[algorithm, math, tables, heapqueue, os]
+import std/[algorithm, math, sets, tables, heapqueue, os]
 import glen/types
 
 type
@@ -117,7 +117,12 @@ proc haversineMeters*(lon1, lat1, lon2, lat2: float64): float64 =
   EarthRadiusM * c
 
 # Convert a meter radius around (lon, lat) to a bounding-box of degrees.
-# Slight over-approximation; the post-filter does exact haversine.
+# Slight over-approximation; the post-filter does exact haversine. May
+# produce a bbox that extends beyond ±180° longitude when the radius
+# crosses the antimeridian, or one whose latitude range exceeds ±90°
+# near the poles — `splitAntimeridian` and `clampPolarBBox` normalise it
+# into one or two world-bounded bboxes that can be queried against the
+# R-tree.
 proc radiusBBox*(lon, lat, meters: float64): BBox =
   let latDeg = meters / 111_320.0
   let cosLat = cos(lat * PI / 180.0)
@@ -127,6 +132,52 @@ proc radiusBBox*(lon, lat, meters: float64): BBox =
   BBox(
     minX: lon - lonDeg, minY: lat - latDeg,
     maxX: lon + lonDeg, maxY: lat + latDeg)
+
+proc splitAntimeridian*(b: BBox): seq[BBox] =
+  ## If `b` extends past ±180° longitude (or has minX > maxX, the
+  ## standard "wrapping bbox" convention), split into two bboxes that
+  ## together cover the same region after wrapping. Latitude is left
+  ## untouched — see `clampPolarBBox` for that.
+  ##
+  ## Examples:
+  ##   (170, 0, 190, 10)  → (170, 0, 180, 10) + (-180, 0, -170, 10)
+  ##   (-185, 0, -170, 10) → (175, 0, 180, 10) + (-180, 0, -170, 10)
+  ##   (170, 0, -170, 10)  (minX > maxX) → same wrap split
+  ##   (-180, 0, 180, 10) → unchanged (single bbox)
+  ##   bbox spanning ≥360° → clamps to a single full-world bbox
+  if b.minX >= -180.0 and b.maxX <= 180.0 and b.minX <= b.maxX:
+    return @[b]
+  # If the bbox spans more than 360° of longitude, no point splitting —
+  # collapse to the full world.
+  if (b.maxX - b.minX) >= 360.0 or
+     (b.minX > b.maxX and (180.0 - b.minX + b.maxX + 180.0) >= 360.0):
+    return @[BBox(minX: -180.0, minY: b.minY, maxX: 180.0, maxY: b.maxY)]
+  var lo = b.minX
+  var hi = b.maxX
+  # Convention 1: explicit wrap, minX > maxX (e.g. minX=170, maxX=-170).
+  if lo > hi:
+    return @[
+      BBox(minX: lo,     minY: b.minY, maxX: 180.0, maxY: b.maxY),
+      BBox(minX: -180.0, minY: b.minY, maxX: hi,    maxY: b.maxY)]
+  # Convention 2: out-of-range coords from radiusBBox.
+  if hi > 180.0:
+    return @[
+      BBox(minX: lo,         minY: b.minY, maxX: 180.0, maxY: b.maxY),
+      BBox(minX: -180.0,     minY: b.minY, maxX: hi - 360.0, maxY: b.maxY)]
+  if lo < -180.0:
+    return @[
+      BBox(minX: -180.0,     minY: b.minY, maxX: hi,    maxY: b.maxY),
+      BBox(minX: lo + 360.0, minY: b.minY, maxX: 180.0, maxY: b.maxY)]
+  @[b]
+
+proc clampPolarBBox*(b: BBox): BBox =
+  ## Clamp the latitude range to [-90°, 90°]. `radiusBBox` near the
+  ## poles can compute lat extents past ±90°; the R-tree's bboxes are
+  ## tight ±90° rectangles, so anything outside that range can never
+  ## intersect anyway.
+  result = b
+  if result.minY < -90.0: result.minY = -90.0
+  if result.maxY >  90.0: result.maxY =  90.0
 
 # --------- node helpers ---------
 
@@ -466,6 +517,22 @@ proc searchBBox*(t: RTree; q: BBox; limit = 0): seq[string] =
         if intersects(c.bbox, q):
           stack.add(c)
 
+proc searchBBoxes*(t: RTree; qs: openArray[BBox]; limit = 0): seq[string] =
+  ## Run `searchBBox` against multiple query bboxes (e.g. the two halves
+  ## of an antimeridian-spanning region) and return the deduped union.
+  ## Order is the natural traversal order of the first bbox, then the
+  ## second's new entries, etc.
+  result = @[]
+  if qs.len == 0: return
+  if qs.len == 1: return searchBBox(t, qs[0], limit)
+  var seen: HashSet[string]
+  for q in qs:
+    for id in searchBBox(t, q, 0):
+      if id notin seen:
+        seen.incl(id)
+        result.add(id)
+        if limit > 0 and result.len >= limit: return
+
 # --- KNN with priority queue (best-first) ---
 
 type
@@ -738,9 +805,72 @@ proc polygonBBox*(p: Polygon): BBox =
     if v[1] < result.minY: result.minY = v[1]
     if v[1] > result.maxY: result.maxY = v[1]
 
+proc polygonCrossesAntimeridian*(p: Polygon): bool =
+  ## True iff any edge of the polygon spans more than 180° of longitude
+  ## — the standard heuristic for "this polygon wraps around the date
+  ## line." A polygon with all vertices in [-180, 180] but whose
+  ## *natural* path between adjacent vertices crosses the antimeridian
+  ## will trigger this.
+  let n = p.vertices.len
+  if n < 2: return false
+  var j = n - 1
+  for i in 0 ..< n:
+    if abs(p.vertices[i][0] - p.vertices[j][0]) > 180.0: return true
+    j = i
+  false
+
+proc polygonBBoxes*(p: Polygon): seq[BBox] =
+  ## Same as `polygonBBox` for non-wrapping polygons; for polygons that
+  ## cross the antimeridian, returns two MBRs covering the eastern and
+  ## western hemispheric portions. Used at insert time so the R-tree
+  ## sees both halves.
+  let n = p.vertices.len
+  if n == 0: return @[BBox(minX: 0, minY: 0, maxX: 0, maxY: 0)]
+  if not polygonCrossesAntimeridian(p):
+    return @[polygonBBox(p)]
+  # Walk vertices, normalizing each to either the [0, 360) or
+  # [-180, 180) half. We assume the polygon is "small" relative to the
+  # globe — split it at the antimeridian by translating any lon < 0 by
+  # +360, computing the MBR, then splitting that MBR.
+  var minXEast = Inf
+  var maxXEast = NegInf
+  var minXWest = Inf
+  var maxXWest = NegInf
+  var minY = Inf
+  var maxY = NegInf
+  for v in p.vertices:
+    let lon = v[0]
+    let lat = v[1]
+    if lat < minY: minY = lat
+    if lat > maxY: maxY = lat
+    if lon >= 0.0:
+      if lon < minXEast: minXEast = lon
+      if lon > maxXEast: maxXEast = lon
+    else:
+      if lon < minXWest: minXWest = lon
+      if lon > maxXWest: maxXWest = lon
+  result = @[]
+  if maxXEast > NegInf:
+    result.add(BBox(minX: minXEast, minY: minY, maxX: 180.0, maxY: maxY))
+  if maxXWest > NegInf:
+    result.add(BBox(minX: -180.0, minY: minY, maxX: maxXWest, maxY: maxY))
+  if result.len == 0:
+    result = @[polygonBBox(p)]
+
 proc pointInPolygon*(p: Polygon; x, y: float64): bool =
-  ## Ray-casting (Crossing Number) test. Edge cases: a point exactly on an
-  ## edge may resolve either way — we don't define edge semantics rigorously.
+  ## Ray-casting (Crossing Number) test on the planar (lon, lat) plane.
+  ## Treats polygon edges as straight lines in raw coordinate space —
+  ## fast and correct for non-geographic data and for small geographic
+  ## polygons (city-sized, where great-circle vs Mercator deviation is
+  ## sub-meter).
+  ##
+  ## For continent-scale polygons or polygons that cross the antimeridian,
+  ## use `pointInPolygonSpherical` (or pass `metric = gmGeographic`
+  ## through `findPolygonsContaining`), which treats edges as great-circle
+  ## arcs.
+  ##
+  ## Edge cases: a point exactly on an edge may resolve either way — we
+  ## don't define edge semantics rigorously.
   let n = p.vertices.len
   if n < 3: return false
   var inside = false
@@ -754,6 +884,79 @@ proc pointInPolygon*(p: Polygon; x, y: float64): bool =
         inside = not inside
     j = i
   inside
+
+# ---- Spherical point-in-polygon (great-circle edges) ----------------------
+#
+# Convert query and vertices to 3D unit vectors, then sum the signed
+# dihedral angles around the query point as we walk the polygon. The
+# total winding is 0 for points outside the polygon and ±2π for points
+# inside (sign depending on vertex order).
+#
+# Robust for any polygon size — including continent-scale polygons,
+# polygons crossing the antimeridian, and polygons containing a pole.
+# Cost is O(n) per query, same as planar ray-casting, just with a few
+# more flops per edge.
+
+proc lonLatToVec3(lon, lat: float64): (float64, float64, float64) {.inline.} =
+  let toRad = PI / 180.0
+  let cl = cos(lat * toRad)
+  ((cl * cos(lon * toRad), cl * sin(lon * toRad), sin(lat * toRad)))
+
+proc dot3(a, b: (float64, float64, float64)): float64 {.inline.} =
+  a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+proc cross3(a, b: (float64, float64, float64)): (float64, float64, float64) {.inline.} =
+  ((a[1]*b[2] - a[2]*b[1],
+    a[2]*b[0] - a[0]*b[2],
+    a[0]*b[1] - a[1]*b[0]))
+
+proc length3(a: (float64, float64, float64)): float64 {.inline.} =
+  sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2])
+
+proc pointInPolygonSpherical*(p: Polygon; lon, lat: float64): bool =
+  ## Spherical point-in-polygon: treats polygon edges as great-circle
+  ## arcs and tests winding around the query point on the sphere.
+  ## Correct for any polygon size, polygons crossing the antimeridian,
+  ## and polygons containing a pole.
+  ##
+  ## **Vertex order matters.** The algorithm requires the polygon to be
+  ## listed in **counter-clockwise** order around its intended interior
+  ## (right-hand rule with the normal pointing out of the sphere). For a
+  ## CCW polygon, the signed sum of dihedral angles at an interior point
+  ## is `+2π`; at any exterior point (including the antipode of the
+  ## interior) it is `-2π` or 0. We test `sum > π` to pick out only the
+  ## CCW interior.
+  ##
+  ## Polygons listed CW will be interpreted as their *complement* —
+  ## the rest of the sphere. If you don't know your polygon's
+  ## orientation, run a small sanity check (e.g. the centroid should
+  ## return true) before trusting results at scale.
+  let n = p.vertices.len
+  if n < 3: return false
+  let q = lonLatToVec3(lon, lat)
+  var sum = 0.0
+  var prev = lonLatToVec3(p.vertices[n - 1][0], p.vertices[n - 1][1])
+  for i in 0 ..< n:
+    let cur = lonLatToVec3(p.vertices[i][0], p.vertices[i][1])
+    # Dihedral angle at q from edge (prev → cur). The two great circles
+    # through q are q×prev and q×cur; the angle between their normals
+    # (signed via the triple product) is what we accumulate.
+    let na = cross3(q, prev)
+    let nb = cross3(q, cur)
+    let na_len = length3(na)
+    let nb_len = length3(nb)
+    if na_len < 1e-12 or nb_len < 1e-12:
+      # q is collinear with a polygon vertex — treat as on-boundary "in"
+      # for stability. Real apps that care should perturb the query.
+      return true
+    var c = dot3(na, nb) / (na_len * nb_len)
+    if c >  1.0: c =  1.0
+    if c < -1.0: c = -1.0
+    let unsigned = arccos(c)
+    let s = dot3(q, cross3(na, nb))
+    sum += (if s >= 0: unsigned else: -unsigned)
+    prev = cur
+  sum > PI
 
 proc readPolygonFromValue*(v: Value): (bool, Polygon) =
   ## Polygons are encoded as `VArray([VArray([VFloat(x), VFloat(y)]), ...])`.
@@ -782,13 +985,24 @@ proc extractPolygon*(idx: PolygonIndex; doc: Value): (bool, Polygon) =
   if doc.isNil or doc.kind != vkObject: return (false, Polygon())
   readPolygonFromValue(doc[idx.polygonField])
 
+proc polygonIndexBBox*(p: Polygon): BBox =
+  ## MBR used for indexing. For polygons that cross the antimeridian,
+  ## widen the bbox to the full longitude band [-180, 180]. The spherical
+  ## post-filter will reject any false positives. Polygons that don't
+  ## cross use a tight bbox.
+  if polygonCrossesAntimeridian(p):
+    let p2 = polygonBBox(p)
+    BBox(minX: -180.0, minY: p2.minY, maxX: 180.0, maxY: p2.maxY)
+  else:
+    polygonBBox(p)
+
 proc indexDoc*(idx: PolygonIndex; docId: string; doc: Value) =
   let (ok, poly) = idx.extractPolygon(doc)
   if not ok: return
   if docId in idx.tree.docBBox:
     discard idx.tree.remove(docId)
     idx.polygons.del(docId)
-  idx.tree.insert(docId, polygonBBox(poly))
+  idx.tree.insert(docId, polygonIndexBBox(poly))
   idx.polygons[docId] = poly
 
 proc unindexDoc*(idx: PolygonIndex; docId: string; doc: Value) =
@@ -802,7 +1016,7 @@ proc reindexDoc*(idx: PolygonIndex; docId: string; oldDoc, newDoc: Value) =
   if not newDoc.isNil:
     let (ok, poly) = idx.extractPolygon(newDoc)
     if ok:
-      idx.tree.insert(docId, polygonBBox(poly))
+      idx.tree.insert(docId, polygonIndexBBox(poly))
       idx.polygons[docId] = poly
 
 proc bulkBuild*(idx: PolygonIndex; docs: Table[string, Value]) =
@@ -811,26 +1025,47 @@ proc bulkBuild*(idx: PolygonIndex; docs: Table[string, Value]) =
   for id, v in docs:
     let (ok, poly) = idx.extractPolygon(v)
     if ok:
-      pairs.add((id, polygonBBox(poly)))
+      pairs.add((id, polygonIndexBBox(poly)))
       idx.polygons[id] = poly
   idx.tree.bulkLoad(pairs)
 
 # Public R-tree exact-test queries
 
 proc polygonsContainingPoint*(idx: PolygonIndex; x, y: float64;
-                              limit = 0): seq[string] =
+                              limit = 0;
+                              metric: GeoMetric = gmPlanar): seq[string] =
   ## Find every indexed polygon whose interior contains (x, y).
+  ##
+  ## With `metric = gmPlanar` (default), edges are straight lines in
+  ## raw coordinate space — fast, correct for non-geographic data and
+  ## small geographic polygons (city outlines).
+  ##
+  ## With `metric = gmGeographic`, edges are great-circle arcs and
+  ## containment is computed via the spherical winding-number algorithm
+  ## — correct for any polygon size, polygons crossing the antimeridian,
+  ## and polygons containing a pole. Pass this when your polygons are
+  ## continent-scale, near the date line, or near the poles.
   result = @[]
   let q = point(x, y)
-  for id in idx.tree.searchBBox(q, 0):
-    if id in idx.polygons and pointInPolygon(idx.polygons[id], x, y):
+  let qs = splitAntimeridian(point(x, y))   # for points this is just [q]
+  discard q
+  for id in idx.tree.searchBBoxes(qs, 0):
+    if id notin idx.polygons: continue
+    let inside =
+      case metric
+      of gmPlanar:     pointInPolygon(idx.polygons[id], x, y)
+      of gmGeographic: pointInPolygonSpherical(idx.polygons[id], x, y)
+    if inside:
       result.add(id)
       if limit > 0 and result.len >= limit: return
 
 proc polygonsIntersectingBBox*(idx: PolygonIndex; q: BBox;
                                limit = 0): seq[string] =
   ## Bbox-level intersection (cheap; not exact polygon-polygon intersection).
-  idx.tree.searchBBox(q, limit)
+  ## Antimeridian-aware: a query bbox spanning the date line is split
+  ## into two halves and unioned.
+  let qs = splitAntimeridian(clampPolarBBox(q))
+  idx.tree.searchBBoxes(qs, limit)
 
 type PolygonIndexesByName* = Table[string, PolygonIndex]
 

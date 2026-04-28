@@ -1443,16 +1443,24 @@ proc dropGeoIndex*(db: GlenDB; collection: string; name: string) =
 ## Find docs whose indexed point falls inside the given bounding box.
 proc findInBBox*(db: GlenDB; collection, indexName: string;
                  minLon, minLat, maxLon, maxLat: float64;
-                 limit = 0): seq[(string, Value)] =
+                 limit = 0;
+                 metric: GeoMetric = gmPlanar): seq[(string, Value)] =
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return @[]
   db.acquireStripeRead(collection)
   defer: db.releaseStripeRead(collection)
   if indexName notin cs.geoIndexes: return @[]
   let gix = cs.geoIndexes[indexName]
-  let q = bbox(minLon, minLat, maxLon, maxLat)
+  # `findInBBox` accepts both geographic (lon/lat in degrees) and planar
+  # (game-map / abstract) coordinate systems. Antimeridian splitting +
+  # polar clamping only make sense for the former, so we only apply
+  # them when the caller explicitly opts in via `metric = gmGeographic`.
+  let raw = bbox(minLon, minLat, maxLon, maxLat)
+  let qs =
+    if metric == gmGeographic: splitAntimeridian(clampPolarBBox(raw))
+    else: @[raw]
   result = @[]
-  for id in gix.tree.searchBBox(q, limit):
+  for id in gix.tree.searchBBoxes(qs, limit):
     let v = lookupDocBypass(cs, id)
     if not v.isNil: result.add((id, v.clone()))
 
@@ -1489,12 +1497,15 @@ proc findWithinRadius*(db: GlenDB; collection, indexName: string;
   defer: db.releaseStripeRead(collection)
   if indexName notin cs.geoIndexes: return @[]
   let gix = cs.geoIndexes[indexName]
-  let bb = radiusBBox(lon, lat, radiusMeters)
+  # The radius bbox may extend past ±180° longitude (antimeridian crossing)
+  # or past ±90° latitude (polar overshoot). Normalise both before querying.
+  let bbs = splitAntimeridian(clampPolarBBox(
+    radiusBBox(lon, lat, radiusMeters)))
   var candidates: seq[(string, float64)] = @[]
   # Materialise candidate docs once: bypass-load any snapshot-only ones so
   # the haversine post-filter and the result clone don't have to read twice.
   var docByCandidate = initTable[string, Value]()
-  for id in gix.tree.searchBBox(bb, 0):
+  for id in gix.tree.searchBBoxes(bbs, 0):
     let doc = lookupDocBypass(cs, id)
     if doc.isNil: continue
     let (ok, plon, plat) = gix.extractPoint(doc)
@@ -1615,9 +1626,16 @@ iterator findNearestVectorStream*(db: GlenDB; collection, indexName: string;
       if not v.isNil: yield (id, dist, v.clone())
 
 ## Find every polygon in the index whose interior contains the point (x, y).
-## Uses an R-tree bbox prefilter, then exact ray-cast point-in-polygon test.
+## Uses an R-tree bbox prefilter, then exact point-in-polygon test.
+##
+## `metric = gmPlanar` (default) treats polygon edges as straight lines
+## in raw lon/lat space — fast and correct for small / non-geographic
+## polygons. `metric = gmGeographic` treats edges as great-circle arcs
+## via the spherical winding-number algorithm — correct for any polygon
+## size, antimeridian-crossing polygons, and polygons containing a pole.
 proc findPolygonsContaining*(db: GlenDB; collection, indexName: string;
-                             x, y: float64; limit = 0): seq[(string, Value)] =
+                             x, y: float64; limit = 0;
+                             metric: GeoMetric = gmPlanar): seq[(string, Value)] =
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return @[]
   db.acquireStripeRead(collection)
@@ -1625,12 +1643,13 @@ proc findPolygonsContaining*(db: GlenDB; collection, indexName: string;
   if indexName notin cs.polygonIndexes: return @[]
   let pix = cs.polygonIndexes[indexName]
   result = @[]
-  for id in pix.polygonsContainingPoint(x, y, limit):
+  for id in pix.polygonsContainingPoint(x, y, limit, metric):
     let v = lookupDocBypass(cs, id)
     if not v.isNil: result.add((id, v.clone()))
 
 ## Polygons whose MBR intersects a query bounding box. This is a fast prefilter
 ## (O(log n + k)); the result is a superset of the geometric-intersection set.
+## Antimeridian-aware: a query bbox spanning the date line is split.
 proc findPolygonsIntersecting*(db: GlenDB; collection, indexName: string;
                                minX, minY, maxX, maxY: float64;
                                limit = 0): seq[(string, Value)] =
@@ -1647,24 +1666,35 @@ proc findPolygonsIntersecting*(db: GlenDB; collection, indexName: string;
     if not v.isNil: result.add((id, v.clone()))
 
 ## Query a *point* (geo) index using a polygon: returns all indexed points
-## that lie inside `polygon`. Bbox prefilter + ray-cast.
+## that lie inside `polygon`. Bbox prefilter + point-in-polygon test.
+##
+## `metric = gmPlanar` (default) treats polygon edges as straight lines.
+## `metric = gmGeographic` treats them as great-circle arcs (correct for
+## antimeridian-spanning, polar, or continent-scale polygons).
 proc findPointsInPolygon*(db: GlenDB; collection, geoIndexName: string;
                           polygon: Polygon;
-                          limit = 0): seq[(string, Value)] =
+                          limit = 0;
+                          metric: GeoMetric = gmPlanar): seq[(string, Value)] =
   let cs = db.tryGetCollection(collection)
   if cs.isNil: return @[]
   db.acquireStripeRead(collection)
   defer: db.releaseStripeRead(collection)
   if geoIndexName notin cs.geoIndexes: return @[]
   let gix = cs.geoIndexes[geoIndexName]
-  let bb = polygonBBox(polygon)
+  # Use the antimeridian-aware index bbox so a wrapping polygon's
+  # candidates aren't truncated to one hemisphere.
+  let bbs = splitAntimeridian(polygonIndexBBox(polygon))
   result = @[]
-  for id in gix.tree.searchBBox(bb, 0):
+  for id in gix.tree.searchBBoxes(bbs, 0):
     let doc = lookupDocBypass(cs, id)
     if doc.isNil: continue
     let (ok, x, y) = gix.extractPoint(doc)
     if not ok: continue
-    if pointInPolygon(polygon, x, y):
+    let inside =
+      case metric
+      of gmPlanar:     pointInPolygon(polygon, x, y)
+      of gmGeographic: pointInPolygonSpherical(polygon, x, y)
+    if inside:
       result.add((id, doc.clone()))
       if limit > 0 and result.len >= limit: return
 
@@ -1944,20 +1974,26 @@ iterator rangeByStream*(db: GlenDB; collection, indexName: string;
       if not v.isNil: yield (id, v.clone())
 
 proc snapshotBBoxMatch(db: GlenDB; cs: CollectionStore; collection, indexName: string;
-                       q: BBox; limit: int): seq[string] =
+                       q: BBox; limit: int;
+                       metric: GeoMetric): seq[string] =
   result = @[]
   db.acquireStripeRead(collection)
   if indexName in cs.geoIndexes:
-    result = cs.geoIndexes[indexName].tree.searchBBox(q, limit)
+    let qs =
+      if metric == gmGeographic: splitAntimeridian(clampPolarBBox(q))
+      else: @[q]
+    result = cs.geoIndexes[indexName].tree.searchBBoxes(qs, limit)
   db.releaseStripeRead(collection)
 
 iterator findInBBoxStream*(db: GlenDB; collection, indexName: string;
                            minLon, minLat, maxLon, maxLat: float64;
-                           limit = 0): (string, Value) =
+                           limit = 0;
+                           metric: GeoMetric = gmPlanar): (string, Value) =
   let cs = db.tryGetCollection(collection)
   if not cs.isNil:
     let ids = db.snapshotBBoxMatch(cs, collection, indexName,
-                                   bbox(minLon, minLat, maxLon, maxLat), limit)
+                                   bbox(minLon, minLat, maxLon, maxLat), limit,
+                                   metric)
     for id in ids:
       let v = db.fetchOneBypass(cs, collection, id)
       if not v.isNil: yield (id, v.clone())
@@ -1992,9 +2028,10 @@ proc snapshotRadiusPairs(db: GlenDB; cs: CollectionStore; collection, indexName:
   db.acquireStripeRead(collection)
   if indexName in cs.geoIndexes:
     let gix = cs.geoIndexes[indexName]
-    let bb = radiusBBox(lon, lat, radiusMeters)
+    let bbs = splitAntimeridian(clampPolarBBox(
+      radiusBBox(lon, lat, radiusMeters)))
     var candidates: seq[(string, float64)] = @[]
-    for id in gix.tree.searchBBox(bb, 0):
+    for id in gix.tree.searchBBoxes(bbs, 0):
       let doc = lookupDocBypass(cs, id)
       if doc.isNil: continue
       let (ok, plon, plat) = gix.extractPoint(doc)
@@ -2020,18 +2057,20 @@ iterator findWithinRadiusStream*(db: GlenDB; collection, indexName: string;
 
 proc snapshotPolyContainsIds(db: GlenDB; cs: CollectionStore;
                              collection, indexName: string;
-                             x, y: float64; limit: int): seq[string] =
+                             x, y: float64; limit: int;
+                             metric: GeoMetric): seq[string] =
   result = @[]
   db.acquireStripeRead(collection)
   if indexName in cs.polygonIndexes:
-    result = cs.polygonIndexes[indexName].polygonsContainingPoint(x, y, limit)
+    result = cs.polygonIndexes[indexName].polygonsContainingPoint(x, y, limit, metric)
   db.releaseStripeRead(collection)
 
 iterator findPolygonsContainingStream*(db: GlenDB; collection, indexName: string;
-                                       x, y: float64; limit = 0): (string, Value) =
+                                       x, y: float64; limit = 0;
+                                       metric: GeoMetric = gmPlanar): (string, Value) =
   let cs = db.tryGetCollection(collection)
   if not cs.isNil:
-    let ids = db.snapshotPolyContainsIds(cs, collection, indexName, x, y, limit)
+    let ids = db.snapshotPolyContainsIds(cs, collection, indexName, x, y, limit, metric)
     for id in ids:
       let v = db.fetchOneBypass(cs, collection, id)
       if not v.isNil: yield (id, v.clone())
@@ -2042,6 +2081,7 @@ proc snapshotPolyIntersectIds(db: GlenDB; cs: CollectionStore;
   result = @[]
   db.acquireStripeRead(collection)
   if indexName in cs.polygonIndexes:
+    # polygonsIntersectingBBox already does antimeridian splitting.
     result = cs.polygonIndexes[indexName].polygonsIntersectingBBox(q, limit)
   db.releaseStripeRead(collection)
 
@@ -2058,29 +2098,35 @@ iterator findPolygonsIntersectingStream*(db: GlenDB; collection, indexName: stri
 
 proc snapshotPointsInPolygonIds(db: GlenDB; cs: CollectionStore;
                                 collection, geoIndexName: string;
-                                polygon: Polygon; limit: int): seq[string] =
+                                polygon: Polygon; limit: int;
+                                metric: GeoMetric): seq[string] =
   result = @[]
   db.acquireStripeRead(collection)
   if geoIndexName in cs.geoIndexes:
     let gix = cs.geoIndexes[geoIndexName]
-    let bb = polygonBBox(polygon)
-    for id in gix.tree.searchBBox(bb, 0):
+    let bbs = splitAntimeridian(polygonIndexBBox(polygon))
+    for id in gix.tree.searchBBoxes(bbs, 0):
       let doc = lookupDocBypass(cs, id)
       if doc.isNil: continue
       let (ok, x, y) = gix.extractPoint(doc)
       if not ok: continue
-      if pointInPolygon(polygon, x, y):
+      let inside =
+        case metric
+        of gmPlanar:     pointInPolygon(polygon, x, y)
+        of gmGeographic: pointInPolygonSpherical(polygon, x, y)
+      if inside:
         result.add(id)
         if limit > 0 and result.len >= limit: break
   db.releaseStripeRead(collection)
 
 iterator findPointsInPolygonStream*(db: GlenDB; collection, geoIndexName: string;
                                     polygon: Polygon;
-                                    limit = 0): (string, Value) =
+                                    limit = 0;
+                                    metric: GeoMetric = gmPlanar): (string, Value) =
   let cs = db.tryGetCollection(collection)
   if not cs.isNil:
     let ids = db.snapshotPointsInPolygonIds(cs, collection, geoIndexName,
-                                            polygon, limit)
+                                            polygon, limit, metric)
     for id in ids:
       let v = db.fetchOneBypass(cs, collection, id)
       if not v.isNil: yield (id, v.clone())
