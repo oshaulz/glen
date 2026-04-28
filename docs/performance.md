@@ -16,6 +16,30 @@ txn commits:         357k ops/s
 The borrowed-read path skips the defensive `clone()` and is appropriate for
 read-only hot loops.
 
+## Batched writes (`nimble bench_release`)
+
+Three batched-write paths exist: `putMany` (single collection, multi-doc),
+`deleteMany` (single collection, multi-id), and `commit` over a `Txn` with
+multiple `stagePut`/`stageDelete` calls (multi-collection). All three
+amortize WAL flush + lock acquisition across the batch.
+
+```
+putMany     batch=10:    210k docs/s   (~21k batches/s)
+putMany     batch=100:   270k docs/s   (~2.7k batches/s)
+putMany     batch=1000:  180k docs/s   (~180 batches/s)
+deleteMany  batch=100:   350k docs/s
+deleteMany  batch=1000:  350k docs/s
+commit (writes/txn=10):     220k docs/s  (~22k commits/s)
+commit (writes/txn=100):    130k docs/s  (~1.3k commits/s)
+commit (writes/txn=1000):   210k docs/s  (~210 commits/s)
+```
+
+Batches in the 10–100 range tend to win over single-doc `put` once you
+factor in the lock + WAL framing overhead per call. Past ~1000 docs per
+batch the per-doc rate drops back as the in-flight `walRecs` and `pending`
+seqs grow and you start crossing the WAL flush threshold mid-batch.
+`deleteMany` scales flatter because there's no value-clone cost per record.
+
 ## Multi-threaded contention (`nimble bench_concurrent`, `--mm:atomicArc -d:useMalloc`)
 
 ```

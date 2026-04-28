@@ -63,6 +63,81 @@ proc benchTxn(db: glendb.GlenDB; N: int) =
   let rate = if dtMs == 0: 0.0 else: (float(N) * 1000.0) / float(dtMs)
   echo &"BENCH txn commits: {N} ops in {dtMs} ms => {rate:.1f} ops/s"
 
+proc benchPutMany(db: glendb.GlenDB; total: int; batchSize: int) =
+  ## putMany throughput at a fixed batch size. Reports both
+  ## ops/s (per individual document) and batches/s.
+  let coll = "benchPM_" & $batchSize
+  var batch: seq[(string, Value)] = newSeq[(string, Value)](batchSize)
+  let t0 = epochTime()
+  var written = 0
+  var i = 0
+  while written < total:
+    let n = min(batchSize, total - written)
+    if batch.len != n: batch.setLen(n)
+    for j in 0 ..< n:
+      var v = VObject()
+      v["n"] = VInt((written + j).int64)
+      batch[j] = ("k" & $(written + j), v)
+    db.putMany(coll, batch)
+    written += n
+    inc i
+  let dtMs = int64((epochTime() - t0) * 1000.0)
+  let docRate = if dtMs == 0: 0.0 else: (float(total) * 1000.0) / float(dtMs)
+  let batchRate = if dtMs == 0: 0.0 else: (float(i) * 1000.0) / float(dtMs)
+  echo &"BENCH putMany batch={batchSize}: {total} docs in {dtMs} ms => {docRate:.1f} docs/s ({batchRate:.1f} batches/s)"
+
+proc benchDeleteMany(db: glendb.GlenDB; total: int; batchSize: int) =
+  ## Pre-populate a collection, then deleteMany at a fixed batch size.
+  let coll = "benchDM_" & $batchSize
+  var ids: seq[string] = newSeq[string](total)
+  var seedBatch: seq[(string, Value)] = newSeq[(string, Value)](min(1000, total))
+  var seeded = 0
+  while seeded < total:
+    let n = min(seedBatch.len, total - seeded)
+    if seedBatch.len != n: seedBatch.setLen(n)
+    for j in 0 ..< n:
+      var v = VObject()
+      v["n"] = VInt((seeded + j).int64)
+      let id = "k" & $(seeded + j)
+      seedBatch[j] = (id, v)
+      ids[seeded + j] = id
+    db.putMany(coll, seedBatch)
+    seeded += n
+  let t0 = epochTime()
+  var deleted = 0
+  var i = 0
+  while deleted < total:
+    let n = min(batchSize, total - deleted)
+    db.deleteMany(coll, ids[deleted ..< deleted + n])
+    deleted += n
+    inc i
+  let dtMs = int64((epochTime() - t0) * 1000.0)
+  let docRate = if dtMs == 0: 0.0 else: (float(total) * 1000.0) / float(dtMs)
+  let batchRate = if dtMs == 0: 0.0 else: (float(i) * 1000.0) / float(dtMs)
+  echo &"BENCH deleteMany batch={batchSize}: {total} docs in {dtMs} ms => {docRate:.1f} docs/s ({batchRate:.1f} batches/s)"
+
+proc benchTxnBatch(db: glendb.GlenDB; total: int; writesPerTxn: int) =
+  ## Multi-write transactions: stage `writesPerTxn` puts per commit. Measures
+  ## how OCC commit amortizes WAL + lock acquisition across larger txns.
+  let coll = "benchTB_" & $writesPerTxn
+  let t0 = epochTime()
+  var written = 0
+  var commits = 0
+  while written < total:
+    let n = min(writesPerTxn, total - written)
+    let t = db.beginTxn()
+    for j in 0 ..< n:
+      var v = VObject()
+      v["n"] = VInt((written + j).int64)
+      t.stagePut(Id(collection: coll, docId: "k" & $(written + j), version: 0'u64), v)
+    discard db.commit(t)
+    written += n
+    inc commits
+  let dtMs = int64((epochTime() - t0) * 1000.0)
+  let docRate = if dtMs == 0: 0.0 else: (float(total) * 1000.0) / float(dtMs)
+  let commitRate = if dtMs == 0: 0.0 else: (float(commits) * 1000.0) / float(dtMs)
+  echo &"BENCH txn writes/txn={writesPerTxn}: {total} docs in {dtMs} ms => {docRate:.1f} docs/s ({commitRate:.1f} commits/s)"
+
 when isMainModule:
   let dir = getTempDir() / "glen_bench_db"
   if dirExists(dir): removeDir(dir)
@@ -80,5 +155,16 @@ when isMainModule:
   benchGetBorrowed(database2, N, keys)
   benchGetMany(database2, N, 100, keys)
   benchTxn(database2, 5_000)
+  # Batched-write throughput: amortizes WAL flush + lock acquisition across
+  # the whole batch. Compare these rates against the single-doc `puts` /
+  # `txn commits` lines above.
+  benchPutMany(database2, 100_000, 10)
+  benchPutMany(database2, 100_000, 100)
+  benchPutMany(database2, 100_000, 1000)
+  benchDeleteMany(database2, 100_000, 100)
+  benchDeleteMany(database2, 100_000, 1000)
+  benchTxnBatch(database2, 100_000, 10)
+  benchTxnBatch(database2, 100_000, 100)
+  benchTxnBatch(database2, 100_000, 1000)
   database2.close()
 
