@@ -1,7 +1,7 @@
-## glenWatch — declare reactive subscriptions in a single block and get
+## watch — declare reactive subscriptions in a single block and get
 ## back a `WatchScope` you can close all at once.
 ##
-##   let scope = glenWatch(db):
+##   let scope = watch(db):
 ##     doc "users", "u1":
 ##       echo $id, " -> ", $newValue
 ##
@@ -84,14 +84,14 @@ proc handlerCall(kind: string; scopeSym: NimNode; args: seq[NimNode];
   case kind
   of "doc":
     if args.len != 2:
-      error("glenWatch: `doc` expects (collection, docId)", body)
+      error("watch: `doc` expects (collection, docId)", body)
     let cb = quote do:
       proc (id {.inject.}: Id; newValue {.inject.}: Value) {.closure.} =
         `body`
     result = newCall(bindSym"onDoc", scopeSym, args[0], args[1], cb)
   of "field":
     if args.len != 3:
-      error("glenWatch: `field` expects (collection, docId, fieldPath)", body)
+      error("watch: `field` expects (collection, docId, fieldPath)", body)
     let cb = quote do:
       proc (id {.inject.}: Id; path {.inject.}: string;
             oldValue {.inject.}: Value; newValue {.inject.}: Value) {.closure.} =
@@ -99,7 +99,7 @@ proc handlerCall(kind: string; scopeSym: NimNode; args: seq[NimNode];
     result = newCall(bindSym"onField", scopeSym, args[0], args[1], args[2], cb)
   of "fielddelta":
     if args.len != 3:
-      error("glenWatch: `fieldDelta` expects (collection, docId, fieldPath)", body)
+      error("watch: `fieldDelta` expects (collection, docId, fieldPath)", body)
     let cb = quote do:
       proc (id {.inject.}: Id; path {.inject.}: string;
             deltaEvent {.inject.}: Value) {.closure.} =
@@ -107,32 +107,32 @@ proc handlerCall(kind: string; scopeSym: NimNode; args: seq[NimNode];
     result = newCall(bindSym"onFieldDelta", scopeSym, args[0], args[1], args[2], cb)
   of "collection":
     if args.len != 1:
-      error("glenWatch: `collection` expects (collection)", body)
+      error("watch: `collection` expects (collection)", body)
     let cb = quote do:
       proc (id {.inject.}: Id; newValue {.inject.}: Value) {.closure.} =
         `body`
     result = newCall(bindSym"onCollection", scopeSym, args[0], cb)
   else:
-    error("glenWatch: unknown handler `" & kind & "`. Expected one of: doc, field, fieldDelta, collection", body)
+    error("watch: unknown handler `" & kind & "`. Expected one of: doc, field, fieldDelta, collection", body)
 
-macro glenWatch*(db: glendb.GlenDB; body: untyped): WatchScope =
+macro watch*(db: glendb.GlenDB; body: untyped): WatchScope =
   ## Declare a batch of subscriptions over `db`. Each top-level entry is
   ## `<kind> arg1, arg2, ...: <handler-body>` where `<kind>` is one of
   ## `doc`, `field`, `fieldDelta`, `collection`.
-  let scopeSym = genSym(nskLet, "glenWatchScope")
+  let scopeSym = genSym(nskLet, "watchScope")
   var stmts = newStmtList()
   stmts.add(newLetStmt(scopeSym, newCall(bindSym"newWatchScope", db)))
 
   if body.kind != nnkStmtList:
-    error("glenWatch: expected a block body", body)
+    error("watch: expected a block body", body)
 
   for entry in body:
     if entry.kind == nnkCommentStmt: continue
     if entry.kind notin {nnkCall, nnkCommand}:
-      error("glenWatch: each entry must be `<kind> <args>: <body>`", entry)
+      error("watch: each entry must be `<kind> <args>: <body>`", entry)
     # Shape: nnkCall(kindIdent, arg1, ..., bodyStmtList)
     if entry.len < 2 or entry[0].kind notin {nnkIdent, nnkSym}:
-      error("glenWatch: malformed handler entry", entry)
+      error("watch: malformed handler entry", entry)
     let kind = ($entry[0]).toLowerAscii
     var args: seq[NimNode] = @[]
     var handlerBody: NimNode = nil
@@ -143,7 +143,7 @@ macro glenWatch*(db: glendb.GlenDB; body: untyped): WatchScope =
       else:
         args.add(child)
     if handlerBody.isNil:
-      error("glenWatch: handler must end with a `:` block body", entry)
+      error("watch: handler must end with a `:` block body", entry)
     stmts.add(handlerCall(kind, scopeSym, args, handlerBody))
 
   stmts.add(scopeSym)

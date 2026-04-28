@@ -69,9 +69,9 @@ suite "dsl: Collection proxy":
     check not (users.contains("u1"))
     db.close()
 
-# ---- glenQuery -------------------------------------------------------------
+# ---- query -------------------------------------------------------------
 
-suite "dsl: glenQuery block":
+suite "dsl: query block":
   test "where + orderBy + limit":
     let dir = freshDir("glen_dsl_query")
     let db = newGlenDB(dir)
@@ -79,7 +79,7 @@ suite "dsl: glenQuery block":
     db.put("u", "2", %*{"name": "bob",   "age": 25, "status": "inactive"})
     db.put("u", "3", %*{"name": "carol", "age": 40, "status": "active"})
     db.put("u", "4", %*{"name": "dave",  "age": 35, "status": "active"})
-    let rows = glenQuery(db, "u"):
+    let rows = query(db, "u"):
       where:
         status == "active"
         age >= 30
@@ -97,7 +97,7 @@ suite "dsl: glenQuery block":
     db.put("u", "2", %*{"name": "bob",    "role": "guest"})
     db.put("u", "3", %*{"name": "carol",  "role": "member"})
     db.put("u", "4", %*{"name": "alfred", "role": "admin"})
-    let rows = glenQuery(db, "u"):
+    let rows = query(db, "u"):
       where:
         role in ["admin", "member"]
         name.contains("al")
@@ -108,15 +108,15 @@ suite "dsl: glenQuery block":
     check rows[1][0] == "1"
     db.close()
 
-# ---- glenTxn ---------------------------------------------------------------
+# ---- txn ---------------------------------------------------------------
 
-suite "dsl: glenTxn":
+suite "dsl: txn":
   test "ok path commits":
     let dir = freshDir("glen_dsl_txn_ok")
     let db = newGlenDB(dir)
     db.put("a", "1", %*{"balance": 100})
     db.put("a", "2", %*{"balance": 0})
-    let res = glenTxn(db, retries = 3):
+    let res = txn(db, retries = 3):
       let src = txn.get("a", "1")
       let dst = txn.get("a", "2")
       txn.put("a", "1", %*{"balance": src["balance"].i - 25})
@@ -129,15 +129,15 @@ suite "dsl: glenTxn":
   test "exception in body returns csInvalid":
     let dir = freshDir("glen_dsl_txn_invalid")
     let db = newGlenDB(dir)
-    let res = glenTxn(db):
+    let res = txn(db):
       raise newException(ValueError, "boom")
     check res.status == glentxn.csInvalid
     check res.message.contains("boom")
     db.close()
 
-# ---- glenSchema ------------------------------------------------------------
+# ---- schema ------------------------------------------------------------
 
-glenSchema users:
+schema users:
   fields:
     name:  zString().trim().minLen(2).maxLen(64)
     age:   zInt().gte(0).lte(150)
@@ -146,7 +146,7 @@ glenSchema users:
     byEmail: equality "email"
     byAge:   range    "age"
 
-suite "dsl: glenSchema":
+suite "dsl: schema":
   test "register creates indexes; validate parses docs":
     let dir = freshDir("glen_dsl_schema")
     let db = newGlenDB(dir)
@@ -165,15 +165,15 @@ suite "dsl: glenSchema":
     check good.ok
     db.close()
 
-# ---- glenWatch -------------------------------------------------------------
+# ---- watch -------------------------------------------------------------
 
-suite "dsl: glenWatch":
+suite "dsl: watch":
   test "doc and collection handlers fire; close unsubscribes":
     let dir = freshDir("glen_dsl_watch")
     let db = newGlenDB(dir)
     var docHits = 0
     var collHits = 0
-    let scope = glenWatch(db):
+    let scope = watch(db):
       doc "users", "u1":
         inc docHits
       collection "users":
@@ -189,9 +189,9 @@ suite "dsl: glenWatch":
     check collHits == 2
     db.close()
 
-# ---- glenSync --------------------------------------------------------------
+# ---- sync --------------------------------------------------------------
 
-suite "dsl: glenSync":
+suite "dsl: sync":
   test "two in-memory peers round-trip a write":
     let dirA = freshDir("glen_dsl_sync_a")
     let dirB = freshDir("glen_dsl_sync_b")
@@ -202,11 +202,11 @@ suite "dsl: glenSync":
     tA.peerOf = tB
     tB.peerOf = tA
 
-    let syncA = glenSync(dbA):
+    let syncA = sync(dbA):
       peer "B":
         transport: tA
         intervalMs: 0
-    let syncB = glenSync(dbB):
+    let syncB = sync(dbB):
       peer "A":
         transport: tB
         intervalMs: 0

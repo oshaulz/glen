@@ -1,7 +1,7 @@
-## glenSync — declarative replication topology built on top of
+## sync — declarative replication topology built on top of
 ## `exportChanges` / `applyChanges` / `setPeerCursor`.
 ##
-##   let sync = glenSync(db):
+##   let sync = sync(db):
 ##     peer "node-b":
 ##       transport: myTransport          # SyncTransport ref
 ##       intervalMs: 5000
@@ -107,7 +107,7 @@ proc tickAll*(s: Sync) =
 proc parsePeerOptions(nameLit: NimNode; body: NimNode): NimNode =
   ## Translates `peer "name": <opt-block>` into an `addPeer(...)` call.
   if body.kind != nnkStmtList:
-    error("glenSync: `peer` block must contain options", body)
+    error("sync: `peer` block must contain options", body)
 
   var transport: NimNode = nil
   var intervalMs: NimNode = newLit(5000)
@@ -117,9 +117,9 @@ proc parsePeerOptions(nameLit: NimNode; body: NimNode): NimNode =
   for opt in body:
     if opt.kind == nnkCommentStmt: continue
     if opt.kind notin {nnkCall, nnkCommand}:
-      error("glenSync: peer option must be `key: value`", opt)
+      error("sync: peer option must be `key: value`", opt)
     if opt.len < 2 or opt[0].kind notin {nnkIdent, nnkSym}:
-      error("glenSync: malformed peer option", opt)
+      error("sync: malformed peer option", opt)
     let key = ($opt[0]).toLowerAscii
     var rhs = opt[1]
     if rhs.kind == nnkStmtList and rhs.len == 1:
@@ -130,21 +130,21 @@ proc parsePeerOptions(nameLit: NimNode; body: NimNode): NimNode =
     of "collections":collections = rhs
     of "direction":  direction = rhs
     else:
-      error("glenSync: unknown peer option `" & key & "`. Expected one of: transport, intervalMs, collections, direction", opt[0])
+      error("sync: unknown peer option `" & key & "`. Expected one of: transport, intervalMs, collections, direction", opt[0])
 
   if transport.isNil:
-    error("glenSync: peer must specify a `transport`", body)
+    error("sync: peer must specify a `transport`", body)
 
   result = newCall(bindSym"addPeer", ident"sync", nameLit, transport,
                   newTree(nnkExprEqExpr, ident"intervalMs", intervalMs),
                   newTree(nnkExprEqExpr, ident"collections", collections),
                   newTree(nnkExprEqExpr, ident"direction", direction))
 
-macro glenSync*(db: glendb.GlenDB; body: untyped): Sync =
+macro sync*(db: glendb.GlenDB; body: untyped): Sync =
   ## Build a `Sync` for `db` from a peers block. Returns the supervisor;
   ## call `.tick()` from your event loop.
   if body.kind != nnkStmtList:
-    error("glenSync: expected a block body", body)
+    error("sync: expected a block body", body)
 
   var stmts = newStmtList()
   stmts.add(newLetStmt(ident"sync", newCall(bindSym"newSync", db)))
@@ -152,9 +152,9 @@ macro glenSync*(db: glendb.GlenDB; body: untyped): Sync =
   for entry in body:
     if entry.kind == nnkCommentStmt: continue
     if entry.kind notin {nnkCall, nnkCommand}:
-      error("glenSync: top-level entries must be `peer \"name\": <opts>`", entry)
+      error("sync: top-level entries must be `peer \"name\": <opts>`", entry)
     if entry.len < 2 or entry[0].kind notin {nnkIdent, nnkSym} or ($entry[0]).toLowerAscii != "peer":
-      error("glenSync: only `peer` entries are supported at the top level", entry)
+      error("sync: only `peer` entries are supported at the top level", entry)
     let nameArg = entry[1]
     let optsBody = if entry.len >= 3: entry[2] else: newStmtList()
     stmts.add(newTree(nnkDiscardStmt,

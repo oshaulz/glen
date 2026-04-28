@@ -20,7 +20,7 @@ import glen/glen
 let db = newGlenDB("./mydb")
 
 # Schema, validator, and indexes in one block
-glenSchema users:
+schema users:
   fields:
     name:  zString().trim().minLen(2).maxLen(64)
     age:   zInt().gte(0).lte(150)
@@ -37,7 +37,7 @@ let users = db["users"]
 users.put("u1", %*{"name": "Alice", "age": 30, "email": "alice@example.com"})
 
 # Block query with native operators
-let admins = glenQuery(db, "users"):
+let admins = query(db, "users"):
   where:
     role == "admin"
     age >= 30
@@ -45,12 +45,12 @@ let admins = glenQuery(db, "users"):
   limit: 10
 
 # Transaction with auto-retry on conflict
-let res = glenTxn(db, retries = 3):
+let res = txn(db, retries = 3):
   let acc = txn.get("accounts", srcId)
   txn.put("accounts", srcId, %*{"balance": acc["balance"].i - amount})
 
 # Reactive subscriptions, all closed together
-let scope = glenWatch(db):
+let scope = watch(db):
   doc "users", "u1":
     echo $id, " -> ", $newValue
   collection "users":
@@ -114,13 +114,13 @@ users.createIndex("byEmail", "email")
 The proxy is value-typed, so `let users = db["users"]` is essentially free
 — it's just a `(GlenDB, string)` pair.
 
-## `glenQuery:` — query block
+## `query:` — query block
 
 Block syntax over the `query / whereEq / orderByField / limitN` builder.
 Predicates use natural Nim operators on dotted-path identifiers.
 
 ```nim
-let active = glenQuery(db, "users"):
+let active = query(db, "users"):
   where:
     status == "active"
     age >= 30
@@ -157,7 +157,7 @@ let active = glenQuery(db, "users"):
 ### Returning a builder instead of running
 
 ```nim
-var q = glenQueryBuilder(db, "users"):
+var q = queryBuilder(db, "users"):
   where:
     age >= 30
 for id, doc in q.runStream():
@@ -186,10 +186,10 @@ let bbox = db.inBBox("stores", "byLoc",
 let similar = db.nearestVector("docs", "byEmbedding", queryVec, k = 10)
 ```
 
-## `glenTxn:` — transactions with retries
+## `txn:` — transactions with retries
 
 ```nim
-let res = glenTxn(db, retries = 3):
+let res = txn(db, retries = 3):
   let src = txn.get("accounts", srcId)
   let dst = txn.get("accounts", dstId)
   txn.put("accounts", srcId, %*{"balance": src["balance"].i - amount})
@@ -218,12 +218,12 @@ The `txn` helper is injected into the body and exposes:
 | `csInvalid`            | Loop exits, returns the result                    |
 | Exception in body      | Caught; surfaces as `csInvalid` with the message  |
 
-A bare `glenTxn(db): body` form runs once with no retries.
+A bare `txn(db): body` form runs once with no retries.
 
-## `glenSchema:` — collection schema, validator, and indexes
+## `schema:` — collection schema, validator, and indexes
 
 ```nim
-glenSchema users:
+schema users:
   fields:
     name:  zString().trim().minLen(2).maxLen(64)
     age:   zInt().gte(0).lte(150)
@@ -259,10 +259,10 @@ Index kinds:
 `registerUsersSchema(db)` is idempotent: indexes that already exist (per
 the on-disk manifest) are not rebuilt.
 
-## `glenWatch:` — declarative subscriptions
+## `watch:` — declarative subscriptions
 
 ```nim
-let scope = glenWatch(db):
+let scope = watch(db):
   doc "users", "u1":
     echo $id, " -> ", $newValue
 
@@ -293,13 +293,13 @@ data, and stats counters.
 The returned `WatchScope` collects every handle. `scope.close()` is
 idempotent.
 
-## `glenSync:` — replication supervisor
+## `sync:` — replication supervisor
 
 A small wrapper over `exportChanges` / `applyChanges` / `setPeerCursor`
 that lets you declare your replication topology in one place.
 
 ```nim
-let sync = glenSync(db):
+let sync = sync(db):
   peer "node-b":
     transport: httpTransport          # SyncTransport ref you provide
     intervalMs: 5000
@@ -341,11 +341,11 @@ calls into the existing API, so:
 * You can use `%*` literals everywhere `Value` is expected — including
   inside `db.put`, `txn.put`, vector queries, etc.
 * You can chain `db.query(...).whereEq(...).run()` next to a
-  `glenQuery:` block in the same module.
+  `query:` block in the same module.
 * You can register schema indexes via `registerUsersSchema(db)` and
   still call `db.dropIndex` / `db.createIndex` directly.
 
-Run `expandMacros: glenQuery(db, "users"): ...` to see the desugared
+Run `expandMacros: query(db, "users"): ...` to see the desugared
 form when debugging.
 
 ## Versioning

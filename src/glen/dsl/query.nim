@@ -1,10 +1,10 @@
-## glenQuery — block DSL over the Glen query builder.
+## query — block DSL over the Glen query builder.
 ##
 ## Rewrites natural Nim operator expressions into `whereEq` / `whereGte` /
 ## `whereIn` / etc. calls, and dispatches geo / vector helpers when their
 ## section names appear.
 ##
-##   let active = glenQuery(db, "users"):
+##   let active = query(db, "users"):
 ##     where:
 ##       status == "active"
 ##       age >= 30
@@ -15,13 +15,13 @@
 ##
 ## Geo (point index already created on the collection):
 ##
-##   let nearby = glenQuery(db, "stores"):
+##   let nearby = query(db, "stores"):
 ##     near: ("byLoc", -73.98, 40.75, 2000.0)   # (indexName, lon, lat, radiusMeters)
 ##     limit: 20
 ##
 ## Vector (HNSW index already created):
 ##
-##   let similar = glenQuery(db, "docs"):
+##   let similar = query(db, "docs"):
 ##     nearestVector: ("byEmbedding", queryVec, 10)
 ##
 ## All bare values inside `where:` are wrapped through `toValue` (see
@@ -49,7 +49,7 @@ proc fieldExprToString(node: NimNode): string =
   of nnkStrLit, nnkRStrLit, nnkTripleStrLit:
     result = node.strVal
   else:
-    error("glenQuery: expected field path (ident or dotted ident), got " & $node.kind, node)
+    error("query: expected field path (ident or dotted ident), got " & $node.kind, node)
 
 # ---- Predicate rewriting ----
 
@@ -88,7 +88,7 @@ proc rewritePredicate(qSym: NimNode; stmt: NimNode): NimNode =
     of "in":
       # `field in [a, b, c]` — wrap each rhs element through toValue.
       if rhs.kind != nnkBracket:
-        error("glenQuery: `in` expects an array literal on the right", rhs)
+        error("query: `in` expects an array literal on the right", rhs)
       var arr = newTree(nnkBracket)
       for el in rhs:
         arr.add(newCall(bindSym"toValue", el))
@@ -97,7 +97,7 @@ proc rewritePredicate(qSym: NimNode; stmt: NimNode): NimNode =
                        newLit(fieldExprToString(lhs)),
                        valuesExpr)
     else:
-      error("glenQuery: unsupported predicate operator `" & op & "`", stmt)
+      error("query: unsupported predicate operator `" & op & "`", stmt)
   of nnkCall:
     # `field.contains("xyz")`
     if stmt.len == 2 and stmt[0].kind == nnkDotExpr and $stmt[0][1] == "contains":
@@ -107,11 +107,11 @@ proc rewritePredicate(qSym: NimNode; stmt: NimNode): NimNode =
                        newLit(fieldExprToString(fieldNode)),
                        needle)
     else:
-      error("glenQuery: unsupported predicate call (only .contains supported here)", stmt)
+      error("query: unsupported predicate call (only .contains supported here)", stmt)
   of nnkDotExpr:
-    error("glenQuery: bare field reference is not a predicate. Did you mean `field == value`?", stmt)
+    error("query: bare field reference is not a predicate. Did you mean `field == value`?", stmt)
   else:
-    error("glenQuery: unsupported predicate shape: " & $stmt.kind, stmt)
+    error("query: unsupported predicate shape: " & $stmt.kind, stmt)
 
 # ---- Section dispatch ----
 
@@ -160,11 +160,11 @@ proc rewriteOrderBy(qSym: NimNode; body: NimNode): NimNode =
         let dir = ($s[1]).toLowerAscii
         if dir == "asc": asc = true
         elif dir == "desc": asc = false
-        else: error("glenQuery: orderBy direction must be `asc` or `desc`", s[1])
+        else: error("query: orderBy direction must be `asc` or `desc`", s[1])
       else:
-        error("glenQuery: orderBy entry must be `field [asc|desc]`", s)
+        error("query: orderBy entry must be `field [asc|desc]`", s)
     else:
-      error("glenQuery: orderBy entry must be `field [asc|desc]`", s)
+      error("query: orderBy entry must be `field [asc|desc]`", s)
     result.add(newTree(nnkDiscardStmt,
       newCall(bindSym"orderByField", qSym,
               newLit(fieldExprToString(fieldNode)),
@@ -172,7 +172,7 @@ proc rewriteOrderBy(qSym: NimNode; body: NimNode): NimNode =
 
 # ---- Top-level macro ----
 
-macro glenQuery*(db: glendb.GlenDB; collection: static[string]; body: untyped): seq[(string, Value)] =
+macro query*(db: glendb.GlenDB; collection: static[string]; body: untyped): seq[(string, Value)] =
   ## Block DSL over the Glen query builder. Supported sections:
   ##   * `where:`        — predicates (==, !=, <, <=, >, >=, in, .contains)
   ##   * `orderBy:`      — `field asc|desc`, multiple lines OK
@@ -180,7 +180,7 @@ macro glenQuery*(db: glendb.GlenDB; collection: static[string]; body: untyped): 
   ##   * `after: cursor` — opaque cursor from `nextCursor(rows)`
   ##
   ## Returns the materialised result of `q.run()`. For streaming use
-  ## `glenQueryBuilder` (returns a `var GlenQuery` you can pass to
+  ## `queryBuilder` (returns a `var GlenQuery` you can pass to
   ## `runStream`).
   let qSym = genSym(nskVar, "q")
   var pre = newStmtList()
@@ -208,15 +208,15 @@ macro glenQuery*(db: glendb.GlenDB; collection: static[string]; body: untyped): 
         pre.add(newTree(nnkDiscardStmt,
           newCall(bindSym"afterCursor", qSym, bodyArg)))
       else:
-        error("glenQuery: unknown section `" & label & "`. Expected one of: where, orderBy, limit, after", s)
+        error("query: unknown section `" & label & "`. Expected one of: where, orderBy, limit, after", s)
     else:
-      error("glenQuery: top-level entries must be sections (e.g. `where:` block)", s)
+      error("query: top-level entries must be sections (e.g. `where:` block)", s)
 
   pre.add(newCall(bindSym"run", qSym))
   result = newBlockStmt(pre)
 
-macro glenQueryBuilder*(db: glendb.GlenDB; collection: static[string]; body: untyped): glendb.GlenQuery =
-  ## Same DSL as `glenQuery`, but returns the unrun builder so callers can
+macro queryBuilder*(db: glendb.GlenDB; collection: static[string]; body: untyped): glendb.GlenQuery =
+  ## Same DSL as `query`, but returns the unrun builder so callers can
   ## `runStream` it or extend it further.
   let qSym = genSym(nskVar, "q")
   var pre = newStmtList()
@@ -237,9 +237,9 @@ macro glenQueryBuilder*(db: glendb.GlenDB; collection: static[string]; body: unt
       of "orderby": pre.add(rewriteOrderBy(qSym, bodyArg))
       of "limit":   pre.add(newTree(nnkDiscardStmt, newCall(bindSym"limitN", qSym, bodyArg)))
       of "after":   pre.add(newTree(nnkDiscardStmt, newCall(bindSym"afterCursor", qSym, bodyArg)))
-      else: error("glenQueryBuilder: unknown section `" & label & "`", s)
+      else: error("queryBuilder: unknown section `" & label & "`", s)
     else:
-      error("glenQueryBuilder: top-level entries must be sections", s)
+      error("queryBuilder: top-level entries must be sections", s)
   pre.add(qSym)
   result = newBlockStmt(pre)
 

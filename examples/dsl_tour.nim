@@ -9,9 +9,9 @@ let dir = getCurrentDir() / "dsl_tour_db"
 removeDir(dir)
 let db = newGlenDB(dir)
 
-# ---------- glenSchema -----------------------------------------------------
+# ---------- schema -----------------------------------------------------
 
-glenSchema users:
+schema users:
   fields:
     name:  zString().trim().minLen(2).maxLen(64)
     age:   zInt().gte(0).lte(150)
@@ -45,9 +45,9 @@ echo &"validate u1 ok={res.ok}"
 for id, doc in users:
   echo &"  {id}: {doc[\"name\"].s} ({doc[\"role\"].s})"
 
-# ---------- glenQuery ------------------------------------------------------
+# ---------- query ------------------------------------------------------
 
-let admins = glenQuery(db, "users"):
+let admins = query(db, "users"):
   where:
     role == "admin"
     age >= 30
@@ -58,10 +58,10 @@ echo "admins >=30:"
 for (id, doc) in admins:
   echo &"  {id} {doc[\"name\"].s}"
 
-# ---------- glenWatch ------------------------------------------------------
+# ---------- watch ------------------------------------------------------
 
 var changeCount = 0
-let scope = glenWatch(db):
+let scope = watch(db):
   collection "users":
     inc changeCount
 
@@ -72,16 +72,16 @@ users.delete("u4")
 echo &"observed {changeCount} user changes"
 scope.close()
 
-# ---------- glenTxn --------------------------------------------------------
+# ---------- txn --------------------------------------------------------
 
 users.put("counter", %*{"n": 0})
-let txnRes = glenTxn(db, retries = 3):
+let txnRes = txn(db, retries = 3):
   let cur = txn.get("users", "counter")
   txn.put("users", "counter", %*{"n": cur["n"].i + 1})
 
 echo &"counter txn: status={txnRes.status} n={users.get(\"counter\")[\"n\"].i}"
 
-# ---------- glenSync (in-memory pair) --------------------------------------
+# ---------- sync (in-memory pair) --------------------------------------
 
 let dirB = getCurrentDir() / "dsl_tour_db_b"
 removeDir(dirB)
@@ -91,12 +91,12 @@ let tA = InMemoryTransport()
 let tB = InMemoryTransport()
 tA.peerOf = tB; tB.peerOf = tA
 
-let syncA = glenSync(db):
+let syncA = sync(db):
   peer "B":
     transport: tA
     intervalMs: 0
 
-let syncB = glenSync(dbB):
+let syncB = sync(dbB):
   peer "A":
     transport: tB
     intervalMs: 0

@@ -14,7 +14,7 @@ db.put("users", "u1", %*{"name": "Alice", "age": 30})
 echo db.get("users", "u1")
 
 # Declarative schema, validator, and indexes in one block
-glenSchema users:
+schema users:
   fields:
     name:  zString().trim().minLen(2)
     age:   zInt().gte(0).lte(150)
@@ -25,7 +25,7 @@ glenSchema users:
 registerUsersSchema(db)
 
 # Block query DSL with native Nim operators
-let admins = glenQuery(db, "users"):
+let admins = query(db, "users"):
   where:
     role == "admin"
     age >= 30
@@ -33,7 +33,7 @@ let admins = glenQuery(db, "users"):
   limit: 10
 
 # Transactions with automatic conflict retry
-let res = glenTxn(db, retries = 3):
+let res = txn(db, retries = 3):
   let acc = txn.get("accounts", srcId)
   txn.put("accounts", srcId, %*{"balance": acc["balance"].i - amount})
 ```
@@ -87,7 +87,7 @@ geography, and vectors.
 | **Math** | Vectors, matrices, basic linear algebra; raster meshes pinned to a geographic bounding box |
 | **Sync** | Multi-master replication with conflict resolution. Each device has a stable identity; cursors track per-peer progress |
 | **Scale** | Datasets larger than RAM via memory-mapped storage. Streaming iterators for bulk reads that don't blow up memory |
-| **DSL** | `%*` value literals, `glenQuery` / `glenTxn` / `glenSchema` / `glenWatch` / `glenSync` blocks, and a `db["users"]` collection proxy that supports `for id, doc in users` iteration |
+| **DSL** | `%*` value literals, `query` / `txn` / `schema` / `watch` / `sync` blocks, and a `db["users"]` collection proxy that supports `for id, doc in users` iteration |
 
 Pure Nim ≥ 1.6. No external runtime dependencies.
 
@@ -123,8 +123,8 @@ Going deeper:
 
 API reference (you'll want these once you start writing code):
 
-- **[DSL guide](docs/dsl.md)** — `%*` literals, `glenQuery`, `glenTxn`,
-  `glenSchema`, `glenWatch`, `glenSync`, `Collection` proxy
+- **[DSL guide](docs/dsl.md)** — `%*` literals, `query`, `txn`,
+  `schema`, `watch`, `sync`, `Collection` proxy
 - **[Core](docs/api/core.md)** — basic CRUD, transactions, indexes,
   queries, subscriptions, replication
 - **[Spatial](docs/api/spatial.md)** — geographic points and polygons

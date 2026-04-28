@@ -1,7 +1,7 @@
-## glenSchema — combines a Zod-style validator with index declarations so
+## schema — combines a Zod-style validator with index declarations so
 ## every collection is described in one place.
 ##
-##   glenSchema users:
+##   schema users:
 ##     fields:
 ##       name:  zString().trim().minLen(2).maxLen(64)
 ##       age:   zInt().gte(0).lte(150)
@@ -78,13 +78,13 @@ proc parseIndexSpec(name: string; rhs: NimNode): NimNode =
   case rhs.kind
   of nnkCommand, nnkCall:
     if rhs.len < 2 or rhs[0].kind notin {nnkIdent, nnkSym}:
-      error("glenSchema: index entry must be `name: <kind> <args>`", rhs)
+      error("schema: index entry must be `name: <kind> <args>`", rhs)
     kindIdent = rhs[0]
     for i in 1 ..< rhs.len: args.add(rhs[i])
   of nnkIdent, nnkSym:
     kindIdent = rhs
   else:
-    error("glenSchema: index entry must be `name: <kind> <args>`", rhs)
+    error("schema: index entry must be `name: <kind> <args>`", rhs)
 
   let kind = ($kindIdent).toLowerAscii
   let nameLit = newLit(name)
@@ -92,21 +92,21 @@ proc parseIndexSpec(name: string; rhs: NimNode): NimNode =
   case kind
   of "equality", "eq":
     if args.len != 1:
-      error("glenSchema: `equality` index needs one field path string", rhs)
+      error("schema: `equality` index needs one field path string", rhs)
     result = newTree(nnkObjConstr, specSym,
       newTree(nnkExprColonExpr, ident"kind", bindSym"gikEquality"),
       newTree(nnkExprColonExpr, ident"name", nameLit),
       newTree(nnkExprColonExpr, ident"fieldPath", args[0]))
   of "range":
     if args.len != 1:
-      error("glenSchema: `range` index needs one field path string", rhs)
+      error("schema: `range` index needs one field path string", rhs)
     result = newTree(nnkObjConstr, specSym,
       newTree(nnkExprColonExpr, ident"kind", bindSym"gikRange"),
       newTree(nnkExprColonExpr, ident"name", nameLit),
       newTree(nnkExprColonExpr, ident"fieldPath", args[0]))
   of "geo":
     if args.len != 2:
-      error("glenSchema: `geo` index needs (lonField, latField) — two strings", rhs)
+      error("schema: `geo` index needs (lonField, latField) — two strings", rhs)
     result = newTree(nnkObjConstr, specSym,
       newTree(nnkExprColonExpr, ident"kind", bindSym"gikGeo"),
       newTree(nnkExprColonExpr, ident"name", nameLit),
@@ -114,14 +114,14 @@ proc parseIndexSpec(name: string; rhs: NimNode): NimNode =
       newTree(nnkExprColonExpr, ident"latField", args[1]))
   of "polygon", "poly":
     if args.len != 1:
-      error("glenSchema: `polygon` index needs one field name string", rhs)
+      error("schema: `polygon` index needs one field name string", rhs)
     result = newTree(nnkObjConstr, specSym,
       newTree(nnkExprColonExpr, ident"kind", bindSym"gikPolygon"),
       newTree(nnkExprColonExpr, ident"name", nameLit),
       newTree(nnkExprColonExpr, ident"polygonField", args[0]))
   of "vector":
     if args.len < 2 or args.len > 3:
-      error("glenSchema: `vector` index needs (embeddingField, dim [, metricExpr])", rhs)
+      error("schema: `vector` index needs (embeddingField, dim [, metricExpr])", rhs)
     let metricExpr =
       if args.len == 3: args[2]
       else: bindSym"vmCosine"
@@ -132,26 +132,26 @@ proc parseIndexSpec(name: string; rhs: NimNode): NimNode =
       newTree(nnkExprColonExpr, ident"dim", args[1]),
       newTree(nnkExprColonExpr, ident"metric", metricExpr))
   else:
-    error("glenSchema: unknown index kind `" & kind & "`. Expected one of: equality, range, geo, polygon, vector", kindIdent)
+    error("schema: unknown index kind `" & kind & "`. Expected one of: equality, range, geo, polygon, vector", kindIdent)
 
 proc cap(s: string): string =
   if s.len == 0: s
   else: toUpperAscii(s[0]) & s[1 ..^ 1]
 
-macro glenSchema*(name: untyped; body: untyped): untyped =
+macro schema*(name: untyped; body: untyped): untyped =
   ## Declare a Glen collection's schema and indexes in one block.
   ##
   ## `name` is an identifier or string literal; the macro generates symbols
   ## prefixed with that name (e.g. `usersSchema`, `registerUsersSchema`,
   ## `validateUsers`).
   if body.kind != nnkStmtList:
-    error("glenSchema: expected a block body", body)
+    error("schema: expected a block body", body)
 
   var nameStr = ""
   case name.kind
   of nnkIdent, nnkSym: nameStr = $name
   of nnkStrLit, nnkRStrLit, nnkTripleStrLit: nameStr = name.strVal
-  else: error("glenSchema: name must be ident or string literal", name)
+  else: error("schema: name must be ident or string literal", name)
   let baseCap = cap(nameStr)
 
   var fieldsBlock: NimNode = nil
@@ -160,17 +160,17 @@ macro glenSchema*(name: untyped; body: untyped): untyped =
   for s in body:
     if s.kind == nnkCommentStmt: continue
     if s.kind notin {nnkCall, nnkCommand}:
-      error("glenSchema: expected `fields:` / `indexes:` sections", s)
+      error("schema: expected `fields:` / `indexes:` sections", s)
     let label = ($s[0]).toLowerAscii
     let sectionBody = s[1]
     case label
     of "fields":
       if sectionBody.kind != nnkStmtList:
-        error("glenSchema: `fields:` must be a block", sectionBody)
+        error("schema: `fields:` must be a block", sectionBody)
       fieldsBlock = sectionBody
     of "indexes":
       if sectionBody.kind != nnkStmtList:
-        error("glenSchema: `indexes:` must be a block", sectionBody)
+        error("schema: `indexes:` must be a block", sectionBody)
       for entry in sectionBody:
         if entry.kind == nnkCommentStmt: continue
         case entry.kind
@@ -182,23 +182,23 @@ macro glenSchema*(name: untyped; body: untyped): untyped =
             # `name: kind args` parses as nnkCall(name, stmtList(<inner>))
             if rhs.kind == nnkStmtList:
               if rhs.len != 1:
-                error("glenSchema: index entry must have a single rhs", rhs)
+                error("schema: index entry must have a single rhs", rhs)
               rhs = rhs[0]
             indexLines.add((idxName, rhs))
           else:
-            error("glenSchema: malformed index entry", entry)
+            error("schema: malformed index entry", entry)
         of nnkExprColonExpr:
           if entry.len == 2 and entry[0].kind in {nnkIdent, nnkSym}:
             indexLines.add(($entry[0], entry[1]))
           else:
-            error("glenSchema: malformed index entry", entry)
+            error("schema: malformed index entry", entry)
         else:
-          error("glenSchema: index entries must be `name: <kind> <args>`", entry)
+          error("schema: index entries must be `name: <kind> <args>`", entry)
     else:
-      error("glenSchema: unknown section `" & label & "`. Expected `fields:` and/or `indexes:`", s)
+      error("schema: unknown section `" & label & "`. Expected `fields:` and/or `indexes:`", s)
 
   if fieldsBlock.isNil:
-    error("glenSchema: `fields:` section is required", body)
+    error("schema: `fields:` section is required", body)
 
   let schemaSym  = ident(nameStr & "Schema")
   let collConst  = ident(nameStr & "Collection")

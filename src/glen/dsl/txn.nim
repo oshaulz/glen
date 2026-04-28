@@ -1,6 +1,6 @@
-## glenTxn — transaction block with automatic conflict retries.
+## txn — transaction block with automatic conflict retries.
 ##
-##   let res = glenTxn(db, retries = 3):
+##   let res = txn(db, retries = 3):
 ##     let acc = txn.get("accounts", srcId)
 ##     acc["balance"] = %*(acc["balance"].i - amount)
 ##     txn.put("accounts", srcId, acc)
@@ -48,35 +48,35 @@ proc put*(h: TxnHelper; collection, docId: string; value: Value) {.inline.} =
 proc delete*(h: TxnHelper; collection, docId: string) {.inline.} =
   h.t.stageDelete(collection, docId)
 
-template glenTxn*(db: glendb.GlenDB; retries: int; body: untyped): glentxn.CommitResult =
+template txn*(db: glendb.GlenDB; retries: int; body: untyped): glentxn.CommitResult =
   ## Run `body` inside a Glen transaction. Retries on `csConflict` up to
   ## `retries` times (so the body executes 1 + retries times in the worst
   ## case). Returns the final `CommitResult`.
   ##
-  ## A bare `glenTxn(db): body` form (no retries) is also available below.
+  ## A bare `txn(db): body` form (no retries) is also available below.
   block:
-    var glenTxnRes: glentxn.CommitResult =
+    var txnRes: glentxn.CommitResult =
       glentxn.CommitResult(status: glentxn.csConflict, message: "no attempt")
-    var glenTxnDone = false
-    var glenTxnAttempt = 0
-    while not glenTxnDone and glenTxnAttempt <= retries:
-      let glenTxnT = db.beginTxn()
-      let txn {.inject.} = TxnHelper(db: db, t: glenTxnT)
-      var glenTxnAborted = false
+    var txnDone = false
+    var txnAttempt = 0
+    while not txnDone and txnAttempt <= retries:
+      let txnT = db.beginTxn()
+      let txn {.inject.} = TxnHelper(db: db, t: txnT)
+      var txnAborted = false
       try:
         body
       except CatchableError as e:
-        glenTxnRes = glentxn.CommitResult(
+        txnRes = glentxn.CommitResult(
           status: glentxn.csInvalid, message: e.msg)
-        glenTxnAborted = true
-        glenTxnDone = true
-      if not glenTxnAborted:
-        glenTxnRes = db.commit(glenTxnT)
-        if glenTxnRes.status != glentxn.csConflict:
-          glenTxnDone = true
-      inc glenTxnAttempt
-    glenTxnRes
+        txnAborted = true
+        txnDone = true
+      if not txnAborted:
+        txnRes = db.commit(txnT)
+        if txnRes.status != glentxn.csConflict:
+          txnDone = true
+      inc txnAttempt
+    txnRes
 
-template glenTxn*(db: glendb.GlenDB; body: untyped): glentxn.CommitResult =
-  ## No-retry variant. Equivalent to `glenTxn(db, retries = 0): body`.
-  glenTxn(db, 0, body)
+template txn*(db: glendb.GlenDB; body: untyped): glentxn.CommitResult =
+  ## No-retry variant. Equivalent to `txn(db, retries = 0): body`.
+  txn(db, 0, body)

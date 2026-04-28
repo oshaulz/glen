@@ -463,7 +463,4 @@ macro zobject*(body: untyped): untyped =
       )
     `builderSym`()
 
-# Convenience alias for readability
-template schema*(body: typed): untyped =
-  zobject(body)
 
