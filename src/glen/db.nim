@@ -1216,6 +1216,14 @@ proc unsubscribeFieldDelta*(db: GlenDB; h: FieldDeltaSubscriptionHandle) =
 proc subscribeFieldDeltaStream*(db: GlenDB; collection, docId: string; fieldPath: string; s: Stream): FieldDeltaSubscriptionHandle =
   result = db.subs.subscribeFieldDeltaStream(collection, docId, fieldPath, s)
 
+## Subscribe to every put/delete in a collection. Fires for any docId.
+proc subscribeCollection*(db: GlenDB; collection: string;
+                          cb: SubscriberCallback): CollectionSubscriptionHandle =
+  result = db.subs.subscribeCollection(collection, cb)
+
+proc unsubscribeCollection*(db: GlenDB; h: CollectionSubscriptionHandle) =
+  db.subs.unsubscribeCollection(h)
+
 ## Batch put: apply multiple upserts under one write lock, batch WAL appends, update indexes and cache.
 proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)]) =
   if items.len == 0: return

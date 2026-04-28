@@ -49,7 +49,8 @@ const testFiles = @[
   "tests/test_query.nim",
   "tests/test_codec_keydict.nim",
   "tests/test_codec_valuedict.nim",
-  "tests/test_snapshot_v4.nim"
+  "tests/test_snapshot_v4.nim",
+  "tests/test_dsl.nim"
 ]
 
 task test, "Run test suite":

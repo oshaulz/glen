@@ -18,11 +18,18 @@ type
     subs: Table[string, SubEntry]
     fieldSubs: Table[string, FieldSubEntry]
     fieldDeltaSubs: Table[string, FieldDeltaSubEntry]
+    ## Collection-wide ("wildcard") subscriptions. Key is the collection
+    ## name; callbacks fire for every put/delete in that collection.
+    collectionSubs: Table[string, SubEntry]
     ## Cache of split field paths per (key -> path -> parts)
     pathPartsCache: Table[string, Table[string, seq[string]]]
 
   SubscriptionHandle* = object
     key*: string
+    index*: int
+
+  CollectionSubscriptionHandle* = object
+    collection*: string
     index*: int
 
   FieldCallback* = proc (id: Id; path: string; oldValue: Value; newValue: Value) {.closure.}
@@ -52,6 +59,7 @@ proc newSubscriptionManager*(): SubscriptionManager =
     subs: initTable[string, SubEntry](),
     fieldSubs: initTable[string, FieldSubEntry](),
     fieldDeltaSubs: initTable[string, FieldDeltaSubEntry](),
+    collectionSubs: initTable[string, SubEntry](),
     pathPartsCache: initTable[string, Table[string, seq[string]]]()
   )
   initLock(result.lock)
@@ -94,9 +102,39 @@ proc notify*(sm: SubscriptionManager; id: Id; newValue: Value) =
     for cb in sm.subs[key].callbacks:
       if cb != nil:
         callbacks.add(cb)
+  if id.collection in sm.collectionSubs:
+    for cb in sm.collectionSubs[id.collection].callbacks:
+      if cb != nil:
+        callbacks.add(cb)
   release(sm.lock)
   for cb in callbacks:
     cb(id, newValue)
+
+proc subscribeCollection*(sm: SubscriptionManager; collection: string;
+                          cb: SubscriberCallback): CollectionSubscriptionHandle =
+  ## Subscribe to every put/delete inside a collection. Fires after the
+  ## same per-doc callbacks `subscribe` already runs.
+  acquire(sm.lock)
+  if collection notin sm.collectionSubs:
+    sm.collectionSubs[collection] = SubEntry(key: collection, callbacks: @[])
+  sm.collectionSubs[collection].callbacks.add(cb)
+  let idx = sm.collectionSubs[collection].callbacks.len - 1
+  release(sm.lock)
+  result = CollectionSubscriptionHandle(collection: collection, index: idx)
+
+proc unsubscribeCollection*(sm: SubscriptionManager; h: CollectionSubscriptionHandle) =
+  acquire(sm.lock)
+  if h.collection in sm.collectionSubs:
+    var entry = sm.collectionSubs[h.collection]
+    if h.index >= 0 and h.index < entry.callbacks.len:
+      entry.callbacks[h.index] = nil
+      var newCbs: seq[SubscriberCallback] = @[]
+      for cb in entry.callbacks:
+        if cb != nil: newCbs.add(cb)
+      entry.callbacks = newCbs
+      if entry.callbacks.len == 0:
+        sm.collectionSubs.del(h.collection)
+  release(sm.lock)
 
 ## Subscribe and stream updates as framed events into the provided Stream.
 ## Each event is a Value object encoded via encodeTo with fields:

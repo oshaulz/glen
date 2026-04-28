@@ -7,14 +7,40 @@ embedded databases punt on: time-series, geographic data, raster grids,
 and vector search.
 
 ```nim
-import glen/db, glen/types
+import glen/glen
 
 let db = newGlenDB("./mydb")
-var alice = VObject()
-alice["name"] = VString("Alice")
-db.put("users", "u1", alice)
+db.put("users", "u1", %*{"name": "Alice", "age": 30})
 echo db.get("users", "u1")
+
+# Declarative schema, validator, and indexes in one block
+glenSchema users:
+  fields:
+    name:  zString().trim().minLen(2)
+    age:   zInt().gte(0).lte(150)
+    email: zString().trim().minLen(3)
+  indexes:
+    byEmail: equality "email"
+
+registerUsersSchema(db)
+
+# Block query DSL with native Nim operators
+let admins = glenQuery(db, "users"):
+  where:
+    role == "admin"
+    age >= 30
+  orderBy: name asc
+  limit: 10
+
+# Transactions with automatic conflict retry
+let res = glenTxn(db, retries = 3):
+  let acc = txn.get("accounts", srcId)
+  txn.put("accounts", srcId, %*{"balance": acc["balance"].i - amount})
 ```
+
+The verbose procedural API (`VObject() / v["k"] = VString(..)`,
+`q.whereEq(..).run()`) is still available for fine-grained control — see
+**[DSL guide](docs/dsl.md)** for the full mapping.
 
 > **Status:** beta (0.5.0). All on-disk formats are versioned and
 > backwards-compatible — old data keeps working when you upgrade.
@@ -61,6 +87,7 @@ geography, and vectors.
 | **Math** | Vectors, matrices, basic linear algebra; raster meshes pinned to a geographic bounding box |
 | **Sync** | Multi-master replication with conflict resolution. Each device has a stable identity; cursors track per-peer progress |
 | **Scale** | Datasets larger than RAM via memory-mapped storage. Streaming iterators for bulk reads that don't blow up memory |
+| **DSL** | `%*` value literals, `glenQuery` / `glenTxn` / `glenSchema` / `glenWatch` / `glenSync` blocks, and a `db["users"]` collection proxy that supports `for id, doc in users` iteration |
 
 Pure Nim ≥ 1.6. No external runtime dependencies.
 
@@ -96,6 +123,8 @@ Going deeper:
 
 API reference (you'll want these once you start writing code):
 
+- **[DSL guide](docs/dsl.md)** — `%*` literals, `glenQuery`, `glenTxn`,
+  `glenSchema`, `glenWatch`, `glenSync`, `Collection` proxy
 - **[Core](docs/api/core.md)** — basic CRUD, transactions, indexes,
   queries, subscriptions, replication
 - **[Spatial](docs/api/spatial.md)** — geographic points and polygons
