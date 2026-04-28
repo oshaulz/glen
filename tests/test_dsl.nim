@@ -288,6 +288,184 @@ suite "dsl: schema migrations":
     check a2["_v"].i == 2
     db.close()
 
+# ---- query: select / count / first / exists -------------------------------
+
+suite "dsl: query projections + reductions":
+  test "select: projects each row to listed fields":
+    let dir = freshDir("glen_dsl_select")
+    let db = newGlenDB(dir)
+    db.put("u", "1", %*{"name": "alice", "age": 30, "secret": "x"})
+    db.put("u", "2", %*{"name": "bob",   "age": 25, "secret": "y"})
+    let projected = query(db, "u"):
+      select:
+        name
+        age
+    check projected.len == 2
+    for (id, doc) in projected:
+      check not doc["name"].isNil
+      check not doc["age"].isNil
+      check doc["secret"].isNil   # stripped
+    db.close()
+
+  test "select: dotted path uses leaf as key":
+    let dir = freshDir("glen_dsl_select_dot")
+    let db = newGlenDB(dir)
+    db.put("u", "1", %*{"name": "alice", "addr": {"city": "NYC", "zip": 10001}})
+    let r = query(db, "u"):
+      select:
+        name
+        addr.city
+    check r.len == 1
+    check r[0][1]["name"].s == "alice"
+    check r[0][1]["city"].s == "NYC"
+    db.close()
+
+  test "count: returns int":
+    let dir = freshDir("glen_dsl_count")
+    let db = newGlenDB(dir)
+    db.put("u", "1", %*{"role": "admin"})
+    db.put("u", "2", %*{"role": "guest"})
+    db.put("u", "3", %*{"role": "admin"})
+    let n = query(db, "u"):
+      where: role == "admin"
+      count: ()
+    check n == 2
+    db.close()
+
+  test "first: returns ok=true with row, ok=false on empty":
+    let dir = freshDir("glen_dsl_first")
+    let db = newGlenDB(dir)
+    db.put("u", "1", %*{"name": "alice", "age": 30})
+    db.put("u", "2", %*{"name": "bob",   "age": 25})
+    let hit = query(db, "u"):
+      where: age >= 30
+      orderBy: age desc
+      first: ()
+    check hit.ok and hit.id == "1" and hit.value["name"].s == "alice"
+    let miss = query(db, "u"):
+      where: age >= 100
+      first: ()
+    check not miss.ok
+    db.close()
+
+  test "exists: returns bool":
+    let dir = freshDir("glen_dsl_exists")
+    let db = newGlenDB(dir)
+    db.put("u", "1", %*{"role": "admin"})
+    let yes = query(db, "u"):
+      where: role == "admin"
+      exists: ()
+    check yes
+    let no = query(db, "u"):
+      where: role == "godmode"
+      exists: ()
+    check not no
+    db.close()
+
+# ---- query: geo / vector prefilter ----------------------------------------
+
+suite "dsl: query near / similar prefilters":
+  test "near: filters by haversine radius then post-filters predicates":
+    let dir = freshDir("glen_dsl_near")
+    let db = newGlenDB(dir)
+    db.put("p", "nyc",    %*{"name": "NYC",    "lon": -73.98, "lat": 40.75, "open": true})
+    db.put("p", "philly", %*{"name": "Philly", "lon": -75.16, "lat": 39.95, "open": true})
+    db.put("p", "boston", %*{"name": "Boston", "lon": -71.06, "lat": 42.36, "open": false})
+    db.put("p", "la",     %*{"name": "LA",     "lon": -118.24, "lat": 34.05, "open": true})
+    db.createGeoIndex("p", "byLoc", "lon", "lat")
+
+    # Within ~200km of NYC, only NYC + Philly qualify
+    let near200 = query(db, "p"):
+      near: ("byLoc", -73.98, 40.75, 200_000.0)
+    check near200.len == 2
+    var ids: seq[string] = @[]
+    for (id, _) in near200: ids.add(id)
+    check "nyc" in ids and "philly" in ids
+
+    # Same prefilter, post-filter to open=true → drops Boston (out of range
+    # anyway) but importantly keeps where: working alongside near:
+    let openNear = query(db, "p"):
+      near: ("byLoc", -73.98, 40.75, 500_000.0)
+      where: open == true
+    var openIds: seq[string] = @[]
+    for (id, _) in openNear: openIds.add(id)
+    check "boston" notin openIds   # filtered out by `open == true`
+    check "nyc" in openIds and "philly" in openIds
+    db.close()
+
+  test "near: composes with select and count":
+    let dir = freshDir("glen_dsl_near_select")
+    let db = newGlenDB(dir)
+    db.put("p", "a", %*{"name": "A", "lon": -73.0, "lat": 40.0})
+    db.put("p", "b", %*{"name": "B", "lon": -73.5, "lat": 40.5})
+    db.createGeoIndex("p", "byLoc", "lon", "lat")
+    let n = query(db, "p"):
+      near: ("byLoc", -73.0, 40.0, 500_000.0)
+      count: ()
+    check n == 2
+    let projected = query(db, "p"):
+      near: ("byLoc", -73.0, 40.0, 500_000.0)
+      select:
+        name
+    check projected.len == 2
+    check not projected[0][1]["name"].isNil
+    check projected[0][1]["lon"].isNil   # stripped
+    db.close()
+
+# ---- engines: series + tiles ---------------------------------------------
+
+suite "dsl: engine proxies":
+  test "db.series writes to <db.dir>/series/<name>.gts and round-trips":
+    let dir = freshDir("glen_dsl_series")
+    let db = newGlenDB(dir)
+    let s = db.series("temp.s1")
+    s.append(1000, 22.5)
+    s.append(2000, 22.7)
+    s.append(3000, 23.0)
+    s.flush()
+    check fileExists(seriesPath(db, "temp.s1"))
+    check seriesExists(db, "temp.s1")
+    let rng = s.range(0, 3500)
+    check rng.len == 3
+    check rng[0] == (1000'i64, 22.5)
+    s.close()
+    db.close()
+
+  test "withSeries auto-closes":
+    let dir = freshDir("glen_dsl_with_series")
+    let db = newGlenDB(dir)
+    withSeries(db, "metrics") do:
+      s.append(100, 1.0)
+      s.append(200, 2.0)
+      s.flush()
+    # After the template exits, file is closed and we can re-open it.
+    let s2 = db.series("metrics")
+    let r = s2.range(0, 500)
+    check r.len == 2
+    s2.close()
+    db.close()
+
+  test "db.tiles creates a stack under <db.dir>/tiles/<name>/ and openTiles attaches":
+    let dir = freshDir("glen_dsl_tiles")
+    let db = newGlenDB(dir)
+    let bb = bbox(0.0, 0.0, 10.0, 10.0)
+    let stack = db.tiles("radar", bb, rows = 4, cols = 4, channels = 1)
+    var mesh = newGeoMesh(bb, 4, 4, 1)
+    for r in 0 ..< 4:
+      for c in 0 ..< 4:
+        mesh[r, c, 0] = float64(r * 4 + c)
+    stack.appendFrame(1000, mesh)
+    stack.flush()
+    stack.close()
+
+    check tilesExists(db, "radar")
+    let again = db.openTiles("radar")
+    check again.rows == 4 and again.cols == 4
+    let history = again.readPointHistory(5.0, 5.0, 0, 2000)
+    check history.len == 1
+    again.close()
+    db.close()
+
 # ---- liveQuery -------------------------------------------------------------
 
 suite "dsl: liveQuery":

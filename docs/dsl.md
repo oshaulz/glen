@@ -114,6 +114,50 @@ users.createIndex("byEmail", "email")
 The proxy is value-typed, so `let users = db["users"]` is essentially free
 — it's just a `(GlenDB, string)` pair.
 
+## Engine proxies — `db.series` / `db.tiles`
+
+The same `db`-rooted shape extends to Glen's specialised engines, so
+they don't feel like a separate library. Each one opens or creates a
+file/dir under conventional paths inside `<db.dir>`.
+
+```nim
+# Time-series — Gorilla-encoded (timestamp, value) streams
+let s = db.series("temp.sensor1")          # <db.dir>/series/temp.sensor1.gts
+s.append(nowMillis(), 22.5)
+for (ts, v) in s.range(t0, t1): plot(ts, v)
+s.close()
+
+# Auto-close form
+withSeries(db, "temp.sensor1") do:
+  for (ts, v) in s.range(t0, t1): plot(ts, v)
+
+# Tile-stacks — rasters evolving over time
+let stack = db.tiles("radar", bbox(-180.0, -90.0, 180.0, 90.0),
+                     rows = 360, cols = 720, channels = 1)
+stack.appendFrame(nowMillis(), mesh)
+let history = stack.readPointHistory(-73.98, 40.75, t0, t1)
+stack.close()
+
+# Or attach to an existing stack with auto-close
+withTiles(db, "radar") do:
+  let frames = s.readFrameRange(t0, t1)
+```
+
+| Helper                          | Path                                       |
+|---------------------------------|--------------------------------------------|
+| `db.series(name, ...)`          | `<db.dir>/series/<name>.gts`               |
+| `db.tiles(name, bbox, ...)`     | `<db.dir>/tiles/<name>/` (creates manifest)|
+| `db.openTiles(name)`            | `<db.dir>/tiles/<name>/` (must exist)      |
+| `seriesExists(db, name)` / `tilesExists(db, name)` | filesystem probe         |
+| `withSeries(db, name): body`    | binds `s` in body, closes on exit          |
+| `withTiles(db, name): body`     | binds `s` in body, closes on exit          |
+
+Names may contain dots (`"temp.sensor1"`) — they're treated as filename
+components, not directory separators. Lifetime is the caller's
+responsibility: `withSeries` / `withTiles` cover the common scoped-use
+case; for long-lived handles, hold the returned ref and call `.close()`.
+Don't open the same series twice concurrently.
+
 ## `query:` — query block
 
 Block syntax over the `query / whereEq / orderByField / limitN` builder.
@@ -147,12 +191,24 @@ let active = query(db, "users"):
 
 ### Sections
 
-| Section    | Meaning                                                        |
-|------------|----------------------------------------------------------------|
-| `where:`   | Conjunction of predicates (one per line)                       |
-| `orderBy:` | One or more `field [asc|desc]` lines (default `asc`)           |
-| `limit: N` | Page size (`0` = unlimited)                                    |
-| `after: c` | Resume from opaque cursor returned by `nextCursor(rows)`       |
+| Section     | Meaning                                                                  |
+|-------------|--------------------------------------------------------------------------|
+| `where:`    | Conjunction of predicates (one per line)                                 |
+| `orderBy:`  | One or more `field [asc|desc]` lines (default `asc`)                     |
+| `limit: N`  | Page size (`0` = unlimited)                                              |
+| `after: c`  | Resume from opaque cursor returned by `nextCursor(rows)`                 |
+| `select:`   | Project each row to listed fields (one per line)                         |
+| `near:`     | Geo-radius prefilter against a named index (replaces the candidate set)  |
+| `similar:`  | Vector kNN prefilter against an HNSW index                               |
+| `count: ()` | Reduction → `int`                                                        |
+| `first: ()` | Reduction → `(ok: bool, id: string, value: Value)`                       |
+| `exists: ()`| Reduction → `bool`                                                       |
+
+`count:` / `first:` / `exists:` are mutually exclusive with each other
+but compose with `where:` / `orderBy:` / `limit:` / `near:` / `similar:`.
+`near:` and `similar:` are mutually exclusive (both replace the candidate
+set), and they're incompatible with `orderBy:` / `after:` (results come
+back sorted by distance from the index).
 
 ### Returning a builder instead of running
 
@@ -164,26 +220,79 @@ for id, doc in q.runStream():
   process(doc)
 ```
 
-### Geo and vector
+### Projections — `select:`
 
-Index-aware searches don't fit the predicate algebra cleanly — they
-depend on a named index, not a field comparison — so they're exposed as
-direct procs, not sections inside `where:`:
+Each row is rewritten to a `VObject` that contains only the listed
+field paths. Dotted paths are flattened to their leaf segment as the key
+(`addr.city` ends up under `"city"`); to keep the nested shape, project
+the parent (`addr`) instead. Missing fields are skipped, not stored as
+`VNull`.
 
 ```nim
-# point index "byLoc" already created with createGeoIndex(...)
-for (id, distMeters, doc) in db.near("stores", "byLoc",
-                                     lon = -73.98, lat = 40.75,
-                                     radiusMeters = 2000.0):
+let names = query(db, "users"):
+  where: role == "admin"
+  select:
+    name
+    age
+    addr.city
+# names: seq[(string, Value)] where each Value is { "name": ..., "age": ..., "city": ... }
+```
+
+### Reductions — `count:` / `first:` / `exists:`
+
+Terminal sections that change the macro's return type. Each takes an
+empty `()` arg list to disambiguate from a section header.
+
+```nim
+let n = query(db, "users"):
+  where: status == "active"
+  count: ()                        # n: int
+
+let hit = query(db, "users"):
+  where: age >= 30
+  orderBy: age desc
+  first: ()                        # hit: (ok: bool, id: string, value: Value)
+if hit.ok: echo hit.value["name"].s
+
+let any = query(db, "users"):
+  where: role == "godmode"
+  exists: ()                       # any: bool
+```
+
+### Geo and vector — `near:` and `similar:`
+
+Index-aware searches sit alongside `where:`, not inside it: they replace
+the candidate set with the index's k-NN / radius results, then `where:`
+post-filters those candidates. Both take a paren-tuple of args because
+Nim's grammar doesn't allow a comma-list after a colon.
+
+```nim
+# Point index "byLoc" already created with createGeoIndex(...)
+let nearby = query(db, "stores"):
+  near: ("byLoc", -73.98, 40.75, 2000.0)   # (indexName, lon, lat, radiusMeters)
+  where: open == true                       # post-filter
+  limit: 20
+
+# Vector index "byEmbed" already created with createVectorIndex(...)
+let similar = query(db, "docs"):
+  similar: ("byEmbed", queryVec, 10)        # (indexName, queryVector, k)
+  where: published == true
+```
+
+`near:` returns docs sorted by haversine distance ascending. `similar:`
+returns docs in HNSW's approximate-nearest order. Both compose with
+`select:` and reductions.
+
+If you want raw lookups (no post-filter, no DSL), the underlying procs
+are still exposed:
+
+```nim
+for (id, distMeters, doc) in db.near("stores", "byLoc", -73.98, 40.75, 2000.0):
   echo id, " is ", distMeters, " m away"
 
-let knn = db.nearest("stores", "byLoc", -73.98, 40.75, k = 10)
-
-let bbox = db.inBBox("stores", "byLoc",
-                     -74.0, 40.7, -73.9, 40.8)
-
-# vector index "byEmbedding" already created with createVectorIndex(...)
-let similar = db.nearestVector("docs", "byEmbedding", queryVec, k = 10)
+let knn   = db.nearest("stores", "byLoc", -73.98, 40.75, k = 10)
+let bbox  = db.inBBox("stores", "byLoc", -74.0, 40.7, -73.9, 40.8)
+let pairs = db.nearestVector("docs", "byEmbed", queryVec, k = 10)
 ```
 
 ## `txn:` — transactions with retries
