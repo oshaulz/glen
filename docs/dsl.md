@@ -257,6 +257,7 @@ let active = query(db, "users"):
 | `count: ()` | Reduction → `int`                                                        |
 | `first: ()` | Reduction → `(ok: bool, id: string, value: Value)`                       |
 | `exists: ()`| Reduction → `bool`                                                       |
+| `page: ()`  | Reduction → `Page[(string, Value)]` (rows + cursor + hasMore)             |
 
 `count:` / `first:` / `exists:` are mutually exclusive with each other
 but compose with `where:` / `orderBy:` / `limit:` / `near:` / `similar:`.
@@ -292,7 +293,7 @@ let names = query(db, "users"):
 # names: seq[(string, Value)] where each Value is { "name": ..., "age": ..., "city": ... }
 ```
 
-### Reductions — `count:` / `first:` / `exists:`
+### Reductions — `count:` / `first:` / `exists:` / `page:`
 
 Terminal sections that change the macro's return type. Each takes an
 empty `()` arg list to disambiguate from a section header.
@@ -311,6 +312,21 @@ if hit.ok: echo hit.value["name"].s
 let any = query(db, "users"):
   where: role == "godmode"
   exists: ()                       # any: bool
+
+# Pagination: page: () bundles rows + cursor + hasMore so loops are
+# trivial. `hasMore` is true when the underlying `limit: N` returned
+# exactly N rows.
+let p1 = query(db, "users"):
+  orderBy: createdAt desc
+  limit: 25
+  page: ()
+echo p1.rows.len, " rows; more? ", p1.hasMore
+if p1.hasMore:
+  let p2 = query(db, "users"):
+    orderBy: createdAt desc
+    limit: 25
+    after: p1.cursor
+    page: ()
 ```
 
 ### Geo and vector — `near:` and `similar:`
@@ -424,6 +440,8 @@ schema name:
 | `toValue(u: Users) -> Value`          | Encode a typed record back into a `Value`                     |
 | `getUsers(db, id) -> (bool, Users)`   | Typed read; `ok=false` for missing / invalid docs             |
 | `putUsers(db, id, u: Users)`          | Typed write (calls `toValue` and `db.put`)                    |
+| `putUsersMany(db, items): seq[string]`| Bulk write. `items` is `openArray[(string, Users)]` (or just `openArray[Users]` when `key:` is set). Returns the docIds in order. |
+| `getUsersMany(db, ids): seq[(string, Users)]` | Bulk read. Missing or invalid rows are silently dropped — matches `db.getMany` semantics. Use a `getUsers` loop when you need per-id status. |
 | `registerUsersSchema(db)`             | Creates every declared index on `db`                          |
 | `migrateUsers(db)`                    | Walks the collection and replays every declared migration up to `usersSchemaVersion` |
 
@@ -546,22 +564,93 @@ typed gate. Practical implications:
   same time read untyped (`db.get`) when you need the full document.
   They see the same bytes on disk.
 
-There is no "strict mode" today that errors on unknown keys; if you
-need that, run `parseUsers` for validation but check the input
-`Value`'s `obj` table for unexpected keys yourself.
+### Strict mode — `strict: true`
+
+Add `strict: true` to a schema to reject unknown fields at parse time
+instead of silently stripping them:
+
+```nim
+schema items:
+  strict: true
+  fields:
+    name: zString()
+    qty:  zInt()
+
+let r = parseItems(%*{"name": "w", "qty": 3, "rogue": 1})
+# r.ok = false; one issue per unknown key with message
+# "Unknown field `rogue` (schema is strict)"
+```
+
+Strict mode only affects the typed parsing gate (`parseItems` /
+`validateItems` / `getItems` / `putItems`). Storage is unchanged —
+`db.put` of a value with extras still preserves them, and a raw
+`db.get` returns the full doc. So you can use strict mode for
+application-level validation without losing internal metadata you
+intentionally store outside the schema.
 
 ### Index kinds
 
 | Kind                              | Notes                                                |
 |-----------------------------------|------------------------------------------------------|
-| `equality "field"`                | Equality + range scans (single-field indexes are rangeable in current Glen) |
-| `range "field"`                   | Same engine as `equality`; intent marker             |
-| `geo "lonField", "latField"`      | R-tree over a (lon, lat) pair                         |
-| `polygon "field"`                 | R-tree over polygon MBRs                              |
-| `vector "field", dim [, metric]`  | HNSW; `metric` defaults to `vmCosine`                 |
+| `equality <field>`                | Equality + range scans (single-field indexes are rangeable in current Glen) |
+| `range <field>`                   | Same engine as `equality`; intent marker             |
+| `geo <lonField>, <latField>`      | R-tree over a (lon, lat) pair                         |
+| `polygon <field>`                 | R-tree over polygon MBRs                              |
+| `vector <field>, dim [, metric]`  | HNSW; `metric` defaults to `vmCosine`                 |
+
+Field arguments accept three forms — pick whichever reads best:
+
+```nim
+indexes:
+  byName:    equality name              # bare ident
+  byCity:    equality "addr.city"       # string literal (dotted paths)
+  byAddr:    equality addr.city         # dotted ident
+  byNameAge: equality (name, age)       # tuple → composite "name,age"
+  byLoc:     geo (addr.lon, addr.lat)   # tuple of dotted idents
+```
+
+The ident / tuple forms desugar to the same comma-separated string the
+underlying engine has always taken. Their advantage is **compile-time
+typo detection**: the macro validates the top-level segment of each
+ident or dotted-ident against the declared `fields:` and errors with a
+helpful message if you reference an undeclared field. String literals
+remain opaque — same lax behaviour the underlying engine has always had
+— so use idents when you want the safety, strings when you need
+something the schema doesn't see (e.g. an index on a virtual field
+maintained by migrations).
 
 `registerUsersSchema(db)` is idempotent: indexes that already exist (per
 the on-disk manifest) are not rebuilt.
+
+### Soft delete — `softDelete: <field>`
+
+Mark rows as deleted instead of removing them physically. The schema
+declares which optional int field acts as the tombstone, and the macro
+generates `softDeleteUsers(db, id)` and `restoreUsers(db, id)` for you:
+
+```nim
+schema posts:
+  softDelete: deletedAt
+  fields:
+    title:     zString()
+    body:      zString()
+    deletedAt: optional(zInt())     # must be declared, optional(zInt())
+
+softDeletePosts(db, "p1")           # stamps deletedAt = nowMillis()
+restorePosts(db, "p1")              # removes the field — row is "active" again
+```
+
+The procs operate on the raw `Value` (no validator round-trip), so
+soft-deletion never fails because the schema later picked up new
+required fields. Storage is unchanged: a soft-deleted row is just one
+where `deletedAt` is non-null. Filtering is your responsibility — add
+`where: deletedAt == nil` to your queries when you want only the
+active rows.
+
+The named field must be declared in `fields:` (the macro errors at
+compile time otherwise) and should be `optional(zInt())` so the
+"absent" state means "not deleted." Calling `softDeleteUsers` /
+`restoreUsers` on a missing row is a no-op.
 
 ### Migrations
 
@@ -630,6 +719,31 @@ state, build it on top of the diff stream.
 | `lqAdded`    | Doc newly enters the result set                           | nil        | new        |
 | `lqUpdated`  | Doc was in the set, still matches, value changed          | previous   | new        |
 | `lqRemoved`  | Doc left the set (no longer matches, or was deleted)      | previous   | nil        |
+
+### Aggregations — `liveCount` / `liveExists`
+
+When the UI only needs a number or a boolean (unread badge, "any
+admins?", etc.), use the dedicated aggregation forms. They build on the
+same `subscribeCollection` plumbing as `liveQuery` but only fire when
+the summary value actually changes.
+
+```nim
+let unread = liveCount(db, "messages"):
+  where: read == false
+
+unread.onChange(proc (n: int) = badge.set(n))
+echo unread.value     # current count
+
+let anyAdmins = liveExists(db, "users"):
+  where: role == "admin"
+anyAdmins.onChange(proc (b: bool) = ui.adminPanel.toggle(b))
+```
+
+`liveExists` only fires on true↔false transitions — adding a second
+admin to a collection that already had one is a no-op for the callback.
+`liveCount` fires once per change (any add / remove / cross-boundary
+update). Both `onChange` callbacks run once immediately with the
+current value so callers can hydrate state in one place.
 
 ## `watch:` — declarative subscriptions
 

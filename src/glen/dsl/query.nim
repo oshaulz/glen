@@ -213,6 +213,26 @@ proc firstQuery*(q: GlenQuery): tuple[ok: bool; id: string; value: Value] =
 proc existsQuery*(q: GlenQuery): bool {.inline.} =
   q.run().len > 0
 
+# ---- Page pagination helper ----------------------------------------------
+
+type
+  Page*[T] = object
+    ## Bundle of `rows`, the opaque cursor that points after the last row,
+    ## and a `hasMore` hint. `hasMore` is true when the underlying query
+    ## had `limit: N` set and exactly N rows came back — meaning there
+    ## might be more on the next page. With no limit, `hasMore` is false.
+    rows*: seq[T]
+    cursor*: string
+    hasMore*: bool
+
+proc pageOf*(rows: seq[(string, Value)];
+             limitN: int): Page[(string, Value)] =
+  ## Wrap a result set as a `Page`. Returns the same rows, the cursor
+  ## from `nextCursor(rows)`, and `hasMore = (limitN > 0 and rows.len >= limitN)`.
+  result.rows = rows
+  result.cursor = nextCursor(rows)
+  result.hasMore = limitN > 0 and rows.len >= limitN
+
 # ---- Geo / vector prefilter -----------------------------------------------
 #
 # `near:` / `similar:` declared at the query top level run an index lookup
@@ -435,9 +455,9 @@ macro query*(db: glendb.GlenDB; collection: static[string]; body: untyped): unty
     of "select":  selectBody = bodyArg
     of "near":    nearBody = bodyArg
     of "similar": similarBody = bodyArg
-    of "count", "first", "exists":
+    of "count", "first", "exists", "page":
       if reduction.len > 0:
-        error("query: only one reduction (count/first/exists) per query", s)
+        error("query: only one reduction (count/first/exists/page) per query", s)
       reduction = label
     else:
       error("query: unknown section `" & label & "`", s)
@@ -497,6 +517,9 @@ macro query*(db: glendb.GlenDB; collection: static[string]; body: untyped): unty
           else: (ok: true, id: `firstSym`[0][0], value: `firstSym`[0][1])
       )
     of "exists": pre.add(infix(newDotExpr(resultExpr, ident"len"), ">", newLit(0)))
+    of "page":
+      let limitForPage = if limitArg.isNil: newLit(0) else: limitArg
+      pre.add(newCall(bindSym"pageOf", resultExpr, limitForPage))
     else:        pre.add(resultExpr)
 
     result = newBlockStmt(pre)
@@ -522,6 +545,18 @@ macro query*(db: glendb.GlenDB; collection: static[string]; body: untyped): unty
     pre.add(newCall(bindSym"firstQuery", qSym))
   of "exists":
     pre.add(newCall(bindSym"existsQuery", qSym))
+  of "page":
+    let runCall = newCall(bindSym"run", qSym)
+    let projected =
+      if selectBody.isNil: runCall
+      else:
+        let fieldsLit = parseSelectFields(selectBody)
+        var arr = newTree(nnkBracket)
+        for f in fieldsLit: arr.add(newLit(f))
+        newCall(bindSym"projectFields", runCall,
+                newTree(nnkPrefix, ident"@", arr))
+    let limitForPage = if limitArg.isNil: newLit(0) else: limitArg
+    pre.add(newCall(bindSym"pageOf", projected, limitForPage))
   else:
     let runCall = newCall(bindSym"run", qSym)
     if not selectBody.isNil:
@@ -637,3 +672,50 @@ macro liveQuery*(db: glendb.GlenDB; collection: static[string]; body: untyped): 
   discard predSeqType
   pre.add(newCall(bindSym"newLiveQuery", db, newLit(collection), predsSym))
   result = newBlockStmt(pre)
+
+# ---- liveCount / liveExists — reactive aggregations -----------------------
+
+proc buildLivePredsAndCall(db, collection, body: NimNode;
+                           target: string;
+                           ctorSym: NimNode): NimNode =
+  ## Shared predicate-collection logic for liveCount / liveExists. Both
+  ## take the same `where:`-only block as `liveQuery` and just call a
+  ## different constructor.
+  let predsSym = genSym(nskVar, "preds")
+  var pre = newStmtList()
+  pre.add(newVarStmt(predsSym,
+    newCall(newTree(nnkBracketExpr, bindSym"newSeqOfCap", bindSym"QueryPredicate"),
+            newLit(4))))
+  if body.kind != nnkStmtList:
+    error(target & ": expected a block body", body)
+  for s in body:
+    case s.kind
+    of nnkCommentStmt: continue
+    of nnkCall, nnkCommand:
+      let label = sectionLabel(s)
+      let bodyArg = sectionBody(s)
+      case label
+      of "where":
+        let stmts =
+          if bodyArg.kind == nnkStmtList: bodyArg
+          else: newStmtList(bodyArg)
+        for p in stmts:
+          if p.kind == nnkCommentStmt: continue
+          pre.add(newCall(newDotExpr(predsSym, ident"add"),
+                          rewritePredicateToConstr(p)))
+      else:
+        error(target & ": only `where:` is supported", s)
+    else:
+      error(target & ": top-level entries must be sections", s)
+  pre.add(newCall(ctorSym, db, collection, predsSym))
+  result = newBlockStmt(pre)
+
+macro liveCount*(db: glendb.GlenDB; collection: static[string]; body: untyped): LiveCount =
+  ## Reactive count: `lc.value` returns the current count, `lc.onChange`
+  ## fires whenever the count changes. Same predicate grammar as `liveQuery`.
+  buildLivePredsAndCall(db, newLit(collection), body, "liveCount", bindSym"newLiveCount")
+
+macro liveExists*(db: glendb.GlenDB; collection: static[string]; body: untyped): LiveExists =
+  ## Reactive bool: `le.value` returns whether any matching row exists,
+  ## `le.onChange` fires only on transition between true ↔ false.
+  buildLivePredsAndCall(db, newLit(collection), body, "liveExists", bindSym"newLiveExists")

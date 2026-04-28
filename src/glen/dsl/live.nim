@@ -182,3 +182,96 @@ proc close*(lq: LiveQuery) =
   lq.callbacks.setLen(0)
   lq.matched.clear()
   release(lq.lock)
+
+# ---- Live aggregations ----------------------------------------------------
+#
+# Reactive int / bool that tracks `liveQuery.len` for a `where:` block.
+# Layered on LiveQuery — same matching engine, just summarised. Use these
+# when the UI only needs a number ("3 unread") rather than a full row list.
+
+type
+  LiveCountCallback* = proc (n: int) {.closure.}
+  LiveCount* = ref object
+    inner: LiveQuery
+    cbs: seq[LiveCountCallback]
+    cbHandle: LiveQueryCallbackHandle
+    lock: Lock
+
+  LiveExistsCallback* = proc (b: bool) {.closure.}
+  LiveExists* = ref object
+    inner: LiveQuery
+    cbs: seq[LiveExistsCallback]
+    cbHandle: LiveQueryCallbackHandle
+    lock: Lock
+    lastBool: bool
+
+proc newLiveCount*(db: glendb.GlenDB; collection: string;
+                   predicates: seq[QueryPredicate]): LiveCount =
+  let lq = newLiveQuery(db, collection, predicates)
+  result = LiveCount(inner: lq, cbs: @[])
+  initLock(result.lock)
+  let lc = result
+  lc.cbHandle = lq.onChange(proc (ev: LiveQueryEvent) =
+    # Refilled events fire once per matching doc on registration. They
+    # don't change the count *after* registration, so skip them — the
+    # baseline count is already what the user just observed via `.value`.
+    if ev.kind == lqRefilled: return
+    let n = lc.inner.len
+    var snapshot: seq[LiveCountCallback] = @[]
+    acquire(lc.lock)
+    for cb in lc.cbs:
+      if cb != nil: snapshot.add(cb)
+    release(lc.lock)
+    for cb in snapshot: cb(n))
+
+proc value*(lc: LiveCount): int {.inline.} =
+  lc.inner.len
+
+proc onChange*(lc: LiveCount; cb: LiveCountCallback) =
+  ## Register a callback fired whenever the count changes. Runs once
+  ## immediately with the current value so callers can hydrate state.
+  acquire(lc.lock)
+  lc.cbs.add(cb)
+  release(lc.lock)
+  cb(lc.inner.len)
+
+proc close*(lc: LiveCount) =
+  lc.inner.offChange(lc.cbHandle)
+  lc.inner.close()
+  acquire(lc.lock)
+  lc.cbs.setLen(0)
+  release(lc.lock)
+
+proc newLiveExists*(db: glendb.GlenDB; collection: string;
+                    predicates: seq[QueryPredicate]): LiveExists =
+  let lq = newLiveQuery(db, collection, predicates)
+  result = LiveExists(inner: lq, cbs: @[], lastBool: lq.len > 0)
+  initLock(result.lock)
+  let le = result
+  le.cbHandle = lq.onChange(proc (ev: LiveQueryEvent) =
+    if ev.kind == lqRefilled: return
+    let now = le.inner.len > 0
+    if now == le.lastBool: return         # collapsed: no transition
+    le.lastBool = now
+    var snapshot: seq[LiveExistsCallback] = @[]
+    acquire(le.lock)
+    for cb in le.cbs:
+      if cb != nil: snapshot.add(cb)
+    release(le.lock)
+    for cb in snapshot: cb(now))
+
+proc value*(le: LiveExists): bool {.inline.} =
+  le.inner.len > 0
+
+proc onChange*(le: LiveExists; cb: LiveExistsCallback) =
+  acquire(le.lock)
+  le.cbs.add(cb)
+  release(le.lock)
+  cb(le.inner.len > 0)
+
+proc close*(le: LiveExists) =
+  le.inner.offChange(le.cbHandle)
+  le.inner.close()
+  acquire(le.lock)
+  le.cbs.setLen(0)
+  release(le.lock)

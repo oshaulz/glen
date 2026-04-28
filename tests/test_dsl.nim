@@ -197,6 +197,22 @@ suite "dsl: schema":
     check v["age"].i == 25
     check v["email"].s == "bob@x.io"
 
+  test "putUsersMany / getUsersMany — schemaless-key form":
+    let dir = freshDir("glen_dsl_bulk_typed")
+    let db = newGlenDB(dir)
+    let written = putUsersMany(db, [
+      ("u1", Users(name: "Alice", age: 30'i64, email: "a@x.io")),
+      ("u2", Users(name: "Bob",   age: 25'i64, email: "b@x.io")),
+      ("u3", Users(name: "Carol", age: 41'i64, email: "c@x.io"))
+    ])
+    check written == @["u1", "u2", "u3"]
+    let rows = getUsersMany(db, ["u1", "u3", "u404"])
+    check rows.len == 2   # u404 missing → silently dropped
+    var names: seq[string] = @[]
+    for (id, u) in rows: names.add(u.name)
+    check "Alice" in names and "Carol" in names
+    db.close()
+
 # ---- add() — auto-generated ids -------------------------------------------
 
 suite "dsl: add (auto-generated ULID-style ids)":
@@ -349,6 +365,97 @@ suite "dsl: schema key: <field>":
     check ok and fetched.sku == "BOLT"
     db.close()
 
+  test "putOrdersMany — keyed bulk form derives ids":
+    let dir = freshDir("glen_dsl_bulk_keyed")
+    let db = newGlenDB(dir)
+    let written = putOrdersMany(db, [
+      Orders(orderNum: 1'i64, sku: "A", qty: 2),
+      Orders(orderNum: 2'i64, sku: "B", qty: 5),
+      Orders(orderNum: 3'i64, sku: "C", qty: 1)
+    ])
+    check written == @["1", "2", "3"]
+    let rows = getOrdersMany(db, ["1", "3"])
+    check rows.len == 2
+    db.close()
+
+# ---- softDelete: <field> --------------------------------------------------
+
+schema posts2:
+  softDelete: deletedAt
+  fields:
+    title:     zString()
+    body:      zString()
+    deletedAt: optional(zInt())
+
+suite "dsl: schema softDelete":
+  test "softDeletePosts2 stamps the tombstone; restorePosts2 clears it":
+    let dir = freshDir("glen_dsl_soft_delete")
+    let db = newGlenDB(dir)
+    db.put(posts2Collection, "p1",
+           %*{"title": "hello", "body": "world"})
+    softDeletePosts2(db, "p1")
+    let raw = db.get(posts2Collection, "p1")
+    check raw["deletedAt"].kind == vkInt
+    check raw["deletedAt"].i > 0
+
+    # Typed read still works (deletedAt is optional, so it parses).
+    let (ok, fetched) = getPosts2(db, "p1")
+    check ok
+    check fetched.deletedAt.isSome
+
+    restorePosts2(db, "p1")
+    let raw2 = db.get(posts2Collection, "p1")
+    check raw2["deletedAt"].isNil
+    let (_, fetched2) = getPosts2(db, "p1")
+    check fetched2.deletedAt.isNone
+    db.close()
+
+  test "softDelete on missing row is a no-op":
+    let dir = freshDir("glen_dsl_soft_delete_missing")
+    let db = newGlenDB(dir)
+    softDeletePosts2(db, "ghost")    # must not raise
+    restorePosts2(db, "ghost")       # must not raise
+    check db.get(posts2Collection, "ghost").isNil
+    db.close()
+
+# ---- index field forms (ident, tuple, string) ----------------------------
+
+schema people:
+  fields:
+    name: zString()
+    age:  zInt()
+    city: zString()
+  indexes:
+    byName:    equality name              # bare ident
+    byAge:     range    age               # bare ident
+    byNameAge: equality (name, age)       # tuple → composite
+    byCity:    equality "city"            # string literal still works
+
+suite "dsl: schema index field syntax":
+  test "ident, tuple, and string forms all register correctly":
+    let dir = freshDir("glen_dsl_index_forms")
+    let db = newGlenDB(dir)
+    registerPeopleSchema(db)
+    db.put(peopleCollection, "p1",
+           %*{"name": "Alice", "age": 30, "city": "NYC"})
+    db.put(peopleCollection, "p2",
+           %*{"name": "Alice", "age": 25, "city": "LA"})
+    db.put(peopleCollection, "p3",
+           %*{"name": "Bob",   "age": 30, "city": "NYC"})
+
+    # Single-field equality (ident form)
+    check db.findBy(peopleCollection, "byName", VString("Alice")).len == 2
+
+    # Single-field equality (string form)
+    check db.findBy(peopleCollection, "byCity", VString("NYC")).len == 2
+
+    # Composite equality on (name, age) — Alice@30 picks p1 only
+    let composite = db.findBy(peopleCollection, "byNameAge",
+      VArray(@[VString("Alice"), VInt(30)]))
+    check composite.len == 1
+    check composite[0][0] == "p1"
+    db.close()
+
 # ---- optional/nullable/default semantics --------------------------------
 # Pinning down the documented contract from docs/dsl.md so the typed
 # round-trip and missing-key behaviour can't regress silently.
@@ -401,6 +508,42 @@ suite "dsl: schema extras (strip vs preserve)":
     let fetched = db.get(postsCollection, "p1")
     check fetched["extra"].s == "survives"
     check fetched["nested"]["deep"].i == 1
+    db.close()
+
+# ---- strict: true — error on undeclared fields ---------------------------
+
+schema strictItems:
+  strict: true
+  fields:
+    name: zString()
+    qty:  zInt()
+
+suite "dsl: schema strict mode":
+  test "strict: parses ok when only declared fields are present":
+    let r = parseStrictItems(%*{"name": "widget", "qty": 3})
+    check r.ok
+    check r.value.name == "widget"
+    check r.value.qty == 3
+
+  test "strict: rejects an unknown field with a clear issue":
+    let r = parseStrictItems(%*{"name": "widget", "qty": 3, "rogue": 1})
+    check not r.ok
+    var sawRogueIssue = false
+    for issue in r.issues:
+      if issue.message.contains("rogue"):
+        sawRogueIssue = true
+    check sawRogueIssue
+
+  test "strict: still loaded raw doc keeps the extras (storage is unchanged)":
+    let dir = freshDir("glen_dsl_strict_storage")
+    let db = newGlenDB(dir)
+    db.put(strictItemsCollection, "x1",
+           %*{"name": "w", "qty": 1, "rogue": 99})
+    # Raw read retains the rogue field — strict mode only affects parsing.
+    check db.get(strictItemsCollection, "x1")["rogue"].i == 99
+    # But typed read fails because of the strict check.
+    let r = parseStrictItems(db.get(strictItemsCollection, "x1"))
+    check not r.ok
     db.close()
 
 # ---- schema migrations -----------------------------------------------------
@@ -513,6 +656,51 @@ suite "dsl: query projections + reductions":
       exists: ()
     check not no
     db.close()
+
+  test "page: bundles rows + cursor + hasMore":
+    let dir = freshDir("glen_dsl_page")
+    let db = newGlenDB(dir)
+    for i in 0 ..< 25:
+      let id = (if i < 10: "0" & $i else: $i)   # zero-pad for sortability
+      db.put("u", id, %*{"i": i})
+    # First page of 10 — should be hasMore=true.
+    let p1 = query(db, "u"):
+      orderBy: i asc
+      limit: 10
+      page: ()
+    check p1.rows.len == 10
+    check p1.hasMore
+    check p1.cursor.len > 0
+    check p1.rows[0][1]["i"].i == 0
+    check p1.rows[9][1]["i"].i == 9
+    # Second page — start after the previous cursor.
+    let p2 = query(db, "u"):
+      orderBy: i asc
+      limit: 10
+      after: p1.cursor
+      page: ()
+    check p2.rows.len == 10
+    check p2.hasMore
+    check p2.rows[0][1]["i"].i == 10
+    # Third page — only 5 left, hasMore must be false.
+    let p3 = query(db, "u"):
+      orderBy: i asc
+      limit: 10
+      after: p2.cursor
+      page: ()
+    check p3.rows.len == 5
+    check not p3.hasMore
+    db.close()
+
+  test "page: with no limit — hasMore is always false":
+    let dir = freshDir("glen_dsl_page_unlim")
+    let db = newGlenDB(dir)
+    for i in 0 ..< 5:
+      db.put("u", $i, %*{"i": i})
+    let p = query(db, "u"):
+      page: ()
+    check p.rows.len == 5
+    check not p.hasMore
 
 # ---- query: geo / vector prefilter ----------------------------------------
 
@@ -671,6 +859,45 @@ suite "dsl: liveQuery":
     live.close()
     db.put("u", "4", %*{"name": "dave", "age": 50, "role": "admin"})
     check added == 1   # unchanged
+    db.close()
+
+  test "liveCount: tracks current count and fires on change":
+    let dir = freshDir("glen_dsl_live_count")
+    let db = newGlenDB(dir)
+    db.put("u", "1", %*{"role": "admin"})
+    db.put("u", "2", %*{"role": "guest"})
+    let count = liveCount(db, "u"):
+      where: role == "admin"
+    check count.value == 1
+    var fired: seq[int] = @[]
+    count.onChange(proc (n: int) = fired.add(n))
+    check fired == @[1]   # immediate hydrate
+    db.put("u", "3", %*{"role": "admin"})    # +1 → 2
+    db.put("u", "1", %*{"role": "guest"})    # -1 → 1
+    db.put("u", "2", %*{"role": "guest"})    # no change
+    check count.value == 1
+    check fired == @[1, 2, 1]
+    count.close()
+    db.close()
+
+  test "liveExists: fires only on true ↔ false transitions":
+    let dir = freshDir("glen_dsl_live_exists")
+    let db = newGlenDB(dir)
+    let exists = liveExists(db, "u"):
+      where: role == "admin"
+    var fired: seq[bool] = @[]
+    exists.onChange(proc (b: bool) = fired.add(b))
+    check fired == @[false]   # initial state
+    check exists.value == false
+    db.put("u", "1", %*{"role": "admin"})       # false → true
+    db.put("u", "2", %*{"role": "admin"})       # true → true (no fire)
+    db.put("u", "3", %*{"role": "admin"})       # still true
+    check exists.value == true
+    db.delete("u", "1")
+    db.delete("u", "2")
+    db.delete("u", "3")                         # true → false
+    check fired == @[false, true, false]
+    exists.close()
     db.close()
 
   test "snapshot returns the current matched set":

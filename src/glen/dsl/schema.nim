@@ -34,11 +34,14 @@
 ##
 ## See `migrations:` and `version:` sections below for schema evolution.
 
-import std/[macros, strutils, options]
+import std/[macros, strutils, options, tables]
 import glen/types
 import glen/db as glendb
+import glen/util
 import glen/validators
 import glen/vectorindex
+
+export util.nowMillis
 
 # Re-exporting so users importing this DSL don't need to also import
 # glen/validators just to write `zString()` etc. inside the fields block.
@@ -63,6 +66,26 @@ type
       embeddingField*: string
       dim*: int
       metric*: VectorMetric
+
+proc checkStrictKeys*(input: Value; allowed: openArray[string];
+                      path: seq[string];
+                      issues: var seq[ValidationIssue]): bool =
+  ## Strict-mode helper: append an issue for every object key that isn't in
+  ## `allowed`. Returns `true` if any unknown key was found. No-ops on
+  ## non-object inputs (the regular parser will already reject those).
+  if input.isNil or input.kind != vkObject: return false
+  result = false
+  for key in input.obj.keys:
+    var ok = false
+    for name in allowed:
+      if name == key: ok = true; break
+    if not ok:
+      issues.add(ValidationIssue(
+        path: pushPath(path, key),
+        expected: "no field `" & key & "` (schema is strict)",
+        actual: "extra field",
+        message: "Unknown field `" & key & "` (schema is strict)"))
+      result = true
 
 proc applyIndex*(db: glendb.GlenDB; collection: string; spec: GlenIndexSpec) =
   case spec.kind
@@ -95,7 +118,62 @@ proc encodeField*[T](opt: Option[T]): Value =
 
 # ---- Macro implementation ----
 
-proc parseIndexSpec(name: string; rhs: NimNode): NimNode =
+proc dottedName(n: NimNode): string =
+  case n.kind
+  of nnkIdent, nnkSym: $n
+  of nnkDotExpr: dottedName(n[0]) & "." & dottedName(n[1])
+  else:
+    error("schema: expected ident or dotted ident, got " & $n.kind, n); ""
+
+proc validateFieldPrefix(path: string; declared: openArray[string];
+                         arg: NimNode) =
+  ## Validate that the top-level segment of a dotted path matches one of
+  ## the declared field names. Catches typos in ident / dotted-ident form
+  ## at compile time. (String literals stay opaque — same lax behaviour
+  ## the underlying engine has always had.)
+  if declared.len == 0: return
+  let head =
+    block:
+      let dot = path.find('.')
+      if dot < 0: path else: path[0 ..< dot]
+  for d in declared:
+    if d == head: return
+  error("schema: index references undeclared field `" & head &
+    "` (declared fields: " & declared.join(", ") & ")", arg)
+
+proc fieldArgToString(arg: NimNode; declared: openArray[string]): NimNode =
+  ## Convert an index `equality`/`range` field-arg into a string literal
+  ## NimNode. Accepts:
+  ##   * `"email"`              — string literal (current syntax, lax)
+  ##   * `email`                — bare ident → "email" (validated)
+  ##   * `addr.city`            — dotted ident → "addr.city" (prefix validated)
+  ##   * `(name, age)`          — tuple → "name,age" (each prefix validated)
+  ##   * `(addr.city, status)`  — tuple of dotted idents
+  case arg.kind
+  of nnkStrLit, nnkRStrLit, nnkTripleStrLit:
+    arg
+  of nnkIdent, nnkSym:
+    let s = $arg
+    validateFieldPrefix(s, declared, arg)
+    newLit(s)
+  of nnkDotExpr:
+    let s = dottedName(arg)
+    validateFieldPrefix(s, declared, arg)
+    newLit(s)
+  of nnkPar, nnkTupleConstr:
+    var parts: seq[string] = @[]
+    for child in arg:
+      let s = fieldArgToString(child, declared)
+      if s.kind notin {nnkStrLit, nnkRStrLit, nnkTripleStrLit}:
+        error("schema: composite index field must be ident / dotted ident / string", child)
+      parts.add(s.strVal)
+    newLit(parts.join(","))
+  else:
+    error("schema: index field must be ident, dotted ident, string, or tuple of those — got " & $arg.kind, arg)
+    newLit("")
+
+proc parseIndexSpec(name: string; rhs: NimNode;
+                    declared: openArray[string] = []): NimNode =
   ## Translates a single `name: <kind> <args...>` line into a
   ## `GlenIndexSpec(...)` constructor expression.
   var kindIdent: NimNode
@@ -117,33 +195,33 @@ proc parseIndexSpec(name: string; rhs: NimNode): NimNode =
   case kind
   of "equality", "eq":
     if args.len != 1:
-      error("schema: `equality` index needs one field path string", rhs)
+      error("schema: `equality` index needs one field path", rhs)
     result = newTree(nnkObjConstr, specSym,
       newTree(nnkExprColonExpr, ident"kind", bindSym"gikEquality"),
       newTree(nnkExprColonExpr, ident"name", nameLit),
-      newTree(nnkExprColonExpr, ident"fieldPath", args[0]))
+      newTree(nnkExprColonExpr, ident"fieldPath", fieldArgToString(args[0], declared)))
   of "range":
     if args.len != 1:
-      error("schema: `range` index needs one field path string", rhs)
+      error("schema: `range` index needs one field path", rhs)
     result = newTree(nnkObjConstr, specSym,
       newTree(nnkExprColonExpr, ident"kind", bindSym"gikRange"),
       newTree(nnkExprColonExpr, ident"name", nameLit),
-      newTree(nnkExprColonExpr, ident"fieldPath", args[0]))
+      newTree(nnkExprColonExpr, ident"fieldPath", fieldArgToString(args[0], declared)))
   of "geo":
     if args.len != 2:
-      error("schema: `geo` index needs (lonField, latField) — two strings", rhs)
+      error("schema: `geo` index needs (lonField, latField)", rhs)
     result = newTree(nnkObjConstr, specSym,
       newTree(nnkExprColonExpr, ident"kind", bindSym"gikGeo"),
       newTree(nnkExprColonExpr, ident"name", nameLit),
-      newTree(nnkExprColonExpr, ident"lonField", args[0]),
-      newTree(nnkExprColonExpr, ident"latField", args[1]))
+      newTree(nnkExprColonExpr, ident"lonField", fieldArgToString(args[0], declared)),
+      newTree(nnkExprColonExpr, ident"latField", fieldArgToString(args[1], declared)))
   of "polygon", "poly":
     if args.len != 1:
-      error("schema: `polygon` index needs one field name string", rhs)
+      error("schema: `polygon` index needs one field name", rhs)
     result = newTree(nnkObjConstr, specSym,
       newTree(nnkExprColonExpr, ident"kind", bindSym"gikPolygon"),
       newTree(nnkExprColonExpr, ident"name", nameLit),
-      newTree(nnkExprColonExpr, ident"polygonField", args[0]))
+      newTree(nnkExprColonExpr, ident"polygonField", fieldArgToString(args[0], declared)))
   of "vector":
     if args.len < 2 or args.len > 3:
       error("schema: `vector` index needs (embeddingField, dim [, metricExpr])", rhs)
@@ -153,7 +231,7 @@ proc parseIndexSpec(name: string; rhs: NimNode): NimNode =
     result = newTree(nnkObjConstr, specSym,
       newTree(nnkExprColonExpr, ident"kind", bindSym"gikVector"),
       newTree(nnkExprColonExpr, ident"name", nameLit),
-      newTree(nnkExprColonExpr, ident"embeddingField", args[0]),
+      newTree(nnkExprColonExpr, ident"embeddingField", fieldArgToString(args[0], declared)),
       newTree(nnkExprColonExpr, ident"dim", args[1]),
       newTree(nnkExprColonExpr, ident"metric", metricExpr))
   else:
@@ -204,11 +282,13 @@ macro schema*(name: untyped; body: untyped): untyped =
   var versionLit: NimNode = newLit(0)
   var migrationLines: seq[(int, int, NimNode)] = @[]   # (fromVer, toVer, body)
   var keyField: NimNode = nil   # `key: fieldName` — derives docId from field
+  var strictMode = false        # `strict: true` — error on unknown fields
+  var softDeleteField: NimNode = nil  # `softDelete: fieldName` — tombstone field
 
   for s in body:
     if s.kind == nnkCommentStmt: continue
     if s.kind notin {nnkCall, nnkCommand, nnkExprColonExpr}:
-      error("schema: expected `fields:` / `indexes:` / `version:` / `migrations:` / `key:` sections", s)
+      error("schema: expected `fields:` / `indexes:` / `version:` / `migrations:` / `key:` / `strict:` sections", s)
     let label = ($s[0]).toLowerAscii
     let sectionBody = s[1]
     case label
@@ -222,6 +302,19 @@ macro schema*(name: untyped; body: untyped): untyped =
       if v.kind notin {nnkIdent, nnkSym}:
         error("schema: `key:` must name a field declared in this schema (e.g. `key: email`)", v)
       keyField = v
+    of "strict":
+      var v = sectionBody
+      if v.kind == nnkStmtList and v.len == 1: v = v[0]
+      if v.kind == nnkIdent and $v == "true": strictMode = true
+      elif v.kind == nnkIdent and $v == "false": strictMode = false
+      else:
+        error("schema: `strict:` must be `true` or `false`", v)
+    of "softdelete":
+      var v = sectionBody
+      if v.kind == nnkStmtList and v.len == 1: v = v[0]
+      if v.kind notin {nnkIdent, nnkSym}:
+        error("schema: `softDelete:` must name a field declared in this schema (e.g. `softDelete: deletedAt`)", v)
+      softDeleteField = v
     of "version":
       var v = sectionBody
       if v.kind == nnkStmtList and v.len == 1: v = v[0]
@@ -294,10 +387,14 @@ macro schema*(name: untyped; body: untyped): untyped =
   let registerFn = ident("register" & baseCap & "Schema")
   let validateFn = ident("validate" & baseCap)
   let parseFn    = ident("parse" & baseCap)
-  let getFn      = ident("get" & baseCap)
-  let putFn      = ident("put" & baseCap)
-  let addFn      = ident("add" & baseCap)
-  let migrateFn  = ident("migrate" & baseCap)
+  let getFn         = ident("get" & baseCap)
+  let putFn         = ident("put" & baseCap)
+  let addFn         = ident("add" & baseCap)
+  let putManyFn     = ident("put" & baseCap & "Many")
+  let getManyFn     = ident("get" & baseCap & "Many")
+  let migrateFn     = ident("migrate" & baseCap)
+  let softDeleteFn  = ident("softDelete" & baseCap)
+  let restoreFn     = ident("restore" & baseCap)
 
   # ---- Walk the fields ---------------------------------------------------
   # For each `field: <expr>` we emit a `let usersFooSchema = <expr>` so the
@@ -332,6 +429,15 @@ macro schema*(name: untyped; body: untyped): untyped =
     if not found:
       error("schema: `key:` field `" & $keyField &
         "` is not declared in `fields:`", keyField)
+
+  # Same for `softDelete:`.
+  if not softDeleteField.isNil:
+    var found = false
+    for fn in fieldNames:
+      if $fn == $softDeleteField: found = true; break
+    if not found:
+      error("schema: `softDelete:` field `" & $softDeleteField &
+        "` is not declared in `fields:` (declare it as `optional(zInt())`)", softDeleteField)
 
   # ---- type Users* = object -------------------------------------
   var recList = newTree(nnkRecList)
@@ -369,6 +475,19 @@ macro schema*(name: untyped; body: untyped): untyped =
      body: newStmtList(returnNone))))
   parserBody.add(newVarStmt(accSym, newCall(typeIdent)))
   parserBody.add(newLetStmt(beforeSym, newDotExpr(issuesSym, ident"len")))
+
+  # Strict mode: reject undeclared fields. We emit an explicit array of
+  # allowed names rather than building a HashSet at runtime — n is small
+  # (typical schemas have <20 fields), and the linear scan keeps the
+  # generated code readable.
+  if strictMode:
+    var allowedArr = newTree(nnkBracket)
+    for fn in fieldNames:
+      allowedArr.add(newLit($fn))
+    let allowedSeq = newTree(nnkPrefix, ident"@", allowedArr)
+    parserBody.add(newTree(nnkDiscardStmt,
+      newCall(bindSym"checkStrictKeys",
+        inputSym, allowedSeq, pathSym, issuesSym)))
   for i in 0 ..< fieldNames.len:
     let fname = fieldNames[i]
     let fSchema = fieldSchemaSyms[i]
@@ -449,9 +568,11 @@ macro schema*(name: untyped; body: untyped): untyped =
 
   # ---- proc registerUsersSchema*(db: GlenDB) ----------------------------
   let dbParam = ident"db"
+  var declaredNames: seq[string] = @[]
+  for fn in fieldNames: declaredNames.add($fn)
   var registerBody = newStmtList()
   for (idxName, rhs) in indexLines:
-    let specExpr = parseIndexSpec(idxName, rhs)
+    let specExpr = parseIndexSpec(idxName, rhs, declaredNames)
     registerBody.add(newCall(bindSym"applyIndex",
       dbParam, newLit(nameStr), specExpr))
   if registerBody.len == 0:
@@ -537,6 +658,101 @@ macro schema*(name: untyped; body: untyped): untyped =
               newIdentDefs(idParam, bindSym"string")],
     body = getBody)
 
+  # ---- proc putUsersMany / getUsersMany --------------------------------
+  # Bulk variants. Without `key:`, the put form takes (id, value) pairs
+  # like `db.putMany`. With `key:`, the id is derived from each record's
+  # key field — fewer args, less to get wrong.
+  #
+  # `getUsersMany` takes a list of ids and returns only the rows that
+  # exist AND validate against the schema. Bad / missing rows are silently
+  # skipped — matches `db.getMany`'s lenient semantics. If you need
+  # per-id status, call `getUsers` in a loop.
+  let itemsParam = ident"items"
+  let idsParam = ident"ids"
+  var putManyProc: NimNode
+  let putManyResultType = newTree(nnkBracketExpr, bindSym"seq", bindSym"string")
+  if keyField.isNil:
+    # Without key: openArray[(string, Users)] — explicit ids
+    let pairType = newTree(nnkTupleConstr, bindSym"string", typeIdent)
+    let putManyBody = quote do:
+      var encoded: seq[(string, Value)] = newSeqOfCap[(string, Value)](`itemsParam`.len)
+      for it in `itemsParam`:
+        encoded.add((it[0], toValue(it[1])))
+      `dbParam`.putMany(`nameStr`, encoded)
+      result = newSeqOfCap[string](`itemsParam`.len)
+      for it in `itemsParam`: result.add(it[0])
+    putManyProc = newProc(
+      name = postfix(putManyFn, "*"),
+      params = [putManyResultType,
+                newIdentDefs(dbParam, glenDbType),
+                newIdentDefs(itemsParam,
+                  newTree(nnkBracketExpr, bindSym"openArray", pairType))],
+      body = putManyBody)
+  else:
+    # With key: openArray[Users] — ids derived from each record
+    let putManyBody = quote do:
+      var encoded: seq[(string, Value)] = newSeqOfCap[(string, Value)](`itemsParam`.len)
+      result = newSeqOfCap[string](`itemsParam`.len)
+      for it in `itemsParam`:
+        let derived = $it.`keyField`
+        encoded.add((derived, toValue(it)))
+        result.add(derived)
+      `dbParam`.putMany(`nameStr`, encoded)
+    putManyProc = newProc(
+      name = postfix(putManyFn, "*"),
+      params = [putManyResultType,
+                newIdentDefs(dbParam, glenDbType),
+                newIdentDefs(itemsParam,
+                  newTree(nnkBracketExpr, bindSym"openArray", typeIdent))],
+      body = putManyBody)
+
+  let getManyResType = newTree(nnkBracketExpr, bindSym"seq",
+    newTree(nnkTupleConstr, bindSym"string", typeIdent))
+  let getManyBody = quote do:
+    let raw = `dbParam`.getMany(`nameStr`, `idsParam`)
+    result = newSeqOfCap[(string, `typeIdent`)](raw.len)
+    for (id, doc) in raw:
+      if doc.isNil: continue
+      let parsed = `parseFn`(doc)
+      if parsed.ok:
+        result.add((id, parsed.value))
+  let getManyProc = newProc(
+    name = postfix(getManyFn, "*"),
+    params = [getManyResType,
+              newIdentDefs(dbParam, glenDbType),
+              newIdentDefs(idsParam,
+                newTree(nnkBracketExpr, bindSym"openArray", bindSym"string"))],
+    body = getManyBody)
+
+  # ---- soft-delete procs (generated only when `softDelete:` declared) ---
+  # `softDeleteUsers(db, id)` stamps the configured field with the current
+  # millis. `restoreUsers(db, id)` removes the field entirely so the
+  # `optional()` validator sees it as absent (none).
+  #
+  # The procs operate on the raw Value, not the typed record, so they
+  # don't trip the strict-mode check or run the full validator pipeline
+  # — soft-deletion shouldn't fail just because the schema later picked
+  # up new mandatory fields.
+  var softDeleteProc, restoreProc: NimNode = nil
+  if not softDeleteField.isNil:
+    let fieldNameLit = newLit($softDeleteField)
+    softDeleteProc = quote do:
+      proc `softDeleteFn`*(`dbParam`: glendb.GlenDB; `idParam`: string) =
+        ## Mark the named row as soft-deleted by setting the schema's
+        ## tombstone field to `nowMillis()`. No-op if the row is missing.
+        let doc = `dbParam`.get(`nameStr`, `idParam`)
+        if doc.isNil: return
+        doc[`fieldNameLit`] = VInt(nowMillis())
+        `dbParam`.put(`nameStr`, `idParam`, doc)
+    restoreProc = quote do:
+      proc `restoreFn`*(`dbParam`: glendb.GlenDB; `idParam`: string) =
+        ## Clear the tombstone field, restoring a previously soft-deleted row.
+        let doc = `dbParam`.get(`nameStr`, `idParam`)
+        if doc.isNil: return
+        if doc.hasKey(`fieldNameLit`):
+          doc.obj.del(`fieldNameLit`)
+          `dbParam`.put(`nameStr`, `idParam`, doc)
+
   # ---- proc migrateUsers*(db: GlenDB) -----------------------------------
   # Each doc carries a `_v` int field (default 0 if missing). For every
   # declared `from -> to: <body>` pair (sorted), if the doc's current
@@ -598,4 +814,9 @@ macro schema*(name: untyped; body: untyped): untyped =
     putProc,
     addProc,
     getProc,
+    putManyProc,
+    getManyProc,
     migrateProc)
+  if not softDeleteProc.isNil:
+    result.add(softDeleteProc)
+    result.add(restoreProc)
