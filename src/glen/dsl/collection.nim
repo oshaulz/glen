@@ -29,6 +29,10 @@ proc `[]`*(db: glendb.GlenDB; name: string): Collection {.inline.} =
 proc put*(c: Collection; id: string; value: Value) {.inline.} =
   c.db.put(c.name, id, value)
 
+proc add*(c: Collection; value: Value): string {.inline.} =
+  ## Insert under a fresh ULID-style id and return it. See `db.add`.
+  c.db.add(c.name, value)
+
 proc get*(c: Collection; id: string): Value {.inline.} =
   c.db.get(c.name, id)
 

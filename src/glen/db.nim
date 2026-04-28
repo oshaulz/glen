@@ -1004,6 +1004,18 @@ proc put*(db: GlenDB; collection, docId: string; value: Value) =
     db.subs.notifyFieldChanges(it[0], it[1], it[2])
   db.maybeAutoCompact()
 
+## Insert a fresh document under a generated ULID-style id and return that id.
+##
+## Equivalent to `let id = newId(); db.put(collection, id, value); id` but
+## one call. Use this when you don't have a natural key for the row —
+## standard pattern for "just throw it in" inserts. The generated id is
+## lexicographically sortable (so listing the collection yields rows in
+## insert order) and globally unique without coordination — multi-master
+## inserts on disjoint nodes never clash.
+proc add*(db: GlenDB; collection: string; value: Value): string =
+  result = newId()
+  db.put(collection, result, value)
+
 ## Delete a document if it exists. Appends a delete to WAL, removes from
 ## in-memory state and cache, bumps the version, and notifies subscribers.
 proc delete*(db: GlenDB; collection, docId: string) =

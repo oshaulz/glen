@@ -45,6 +45,15 @@ proc put*(h: TxnHelper; collection, docId: string; value: Value) {.inline.} =
   ## version field on the staged Id is unused.
   h.t.stagePut(Id(collection: collection, docId: docId, version: 0'u64), value)
 
+# Note: there is intentionally no `txn.add` helper. Inside a `txn:` block
+# the identifier `txn` is ambiguous between the template name and the
+# injected helper, and Nim's overload resolution surfaces that ambiguity
+# whenever the method has many stdlib overloads (`add` in particular).
+# The explicit form is one extra line and reads better:
+#   let id = newId()
+#   txn.put("notes", id, value)
+# Use `db.add(...)` outside the txn block when you don't need rollback.
+
 proc delete*(h: TxnHelper; collection, docId: string) {.inline.} =
   h.t.stageDelete(collection, docId)
 

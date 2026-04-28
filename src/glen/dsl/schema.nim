@@ -203,11 +203,12 @@ macro schema*(name: untyped; body: untyped): untyped =
   var indexLines: seq[(string, NimNode)] = @[]
   var versionLit: NimNode = newLit(0)
   var migrationLines: seq[(int, int, NimNode)] = @[]   # (fromVer, toVer, body)
+  var keyField: NimNode = nil   # `key: fieldName` — derives docId from field
 
   for s in body:
     if s.kind == nnkCommentStmt: continue
     if s.kind notin {nnkCall, nnkCommand, nnkExprColonExpr}:
-      error("schema: expected `fields:` / `indexes:` / `version:` / `migrations:` sections", s)
+      error("schema: expected `fields:` / `indexes:` / `version:` / `migrations:` / `key:` sections", s)
     let label = ($s[0]).toLowerAscii
     let sectionBody = s[1]
     case label
@@ -215,6 +216,12 @@ macro schema*(name: untyped; body: untyped): untyped =
       if sectionBody.kind != nnkStmtList:
         error("schema: `fields:` must be a block", sectionBody)
       fieldsBlock = sectionBody
+    of "key":
+      var v = sectionBody
+      if v.kind == nnkStmtList and v.len == 1: v = v[0]
+      if v.kind notin {nnkIdent, nnkSym}:
+        error("schema: `key:` must name a field declared in this schema (e.g. `key: email`)", v)
+      keyField = v
     of "version":
       var v = sectionBody
       if v.kind == nnkStmtList and v.len == 1: v = v[0]
@@ -289,6 +296,7 @@ macro schema*(name: untyped; body: untyped): untyped =
   let parseFn    = ident("parse" & baseCap)
   let getFn      = ident("get" & baseCap)
   let putFn      = ident("put" & baseCap)
+  let addFn      = ident("add" & baseCap)
   let migrateFn  = ident("migrate" & baseCap)
 
   # ---- Walk the fields ---------------------------------------------------
@@ -314,6 +322,16 @@ macro schema*(name: untyped; body: untyped): untyped =
 
   if fieldNames.len == 0:
     error("schema: `fields:` block must declare at least one field", fieldsBlock)
+
+  # Validate `key:` names a declared field. If absent, the schema falls
+  # back to the explicit-id-on-put behaviour (callers supply docIds).
+  if not keyField.isNil:
+    var found = false
+    for fn in fieldNames:
+      if $fn == $keyField: found = true; break
+    if not found:
+      error("schema: `key:` field `" & $keyField &
+        "` is not declared in `fields:`", keyField)
 
   # ---- type Users* = object -------------------------------------
   var recList = newTree(nnkRecList)
@@ -445,19 +463,59 @@ macro schema*(name: untyped; body: untyped): untyped =
     body = registerBody)
 
   # ---- proc getUsers / putUsers ----------------------------------------
-  # putUsers: db.put(coll, id, u.toValue)
-  # getUsers: returns (ok, value); ok=false on missing or invalid doc.
+  # When `key:` is declared, putUsers takes only (db, u) and derives the
+  # docId from the key field via stringification (`$u.<key>`). Otherwise
+  # the caller supplies the id explicitly, matching the rest of CRUD.
   let idParam = ident"id"
-  let putBody = newCall(newDotExpr(dbParam, ident"put"),
-                        newLit(nameStr), idParam,
-                        newCall(ident"toValue", uParam))
-  let putProc = newProc(
-    name = postfix(putFn, "*"),
-    params = [newEmptyNode(),
-              newIdentDefs(dbParam, glenDbType),
-              newIdentDefs(idParam, bindSym"string"),
-              newIdentDefs(uParam, typeIdent)],
-    body = putBody)
+  var putProc, addProc: NimNode
+  if keyField.isNil:
+    # No key: classic two-arg form.
+    let putBody = newCall(newDotExpr(dbParam, ident"put"),
+                          newLit(nameStr), idParam,
+                          newCall(ident"toValue", uParam))
+    putProc = newProc(
+      name = postfix(putFn, "*"),
+      params = [newEmptyNode(),
+                newIdentDefs(dbParam, glenDbType),
+                newIdentDefs(idParam, bindSym"string"),
+                newIdentDefs(uParam, typeIdent)],
+      body = putBody)
+    # addUsers returns a fresh ULID.
+    let addBody = newCall(newDotExpr(dbParam, ident"add"),
+                          newLit(nameStr),
+                          newCall(ident"toValue", uParam))
+    addProc = newProc(
+      name = postfix(addFn, "*"),
+      params = [bindSym"string",
+                newIdentDefs(dbParam, glenDbType),
+                newIdentDefs(uParam, typeIdent)],
+      body = addBody)
+  else:
+    # `key: <field>` — derive docId from the field. `$` so non-string
+    # field types still work (int, char, etc.); strings pass through.
+    let keyAccess = newDotExpr(uParam, keyField)
+    let keyExpr   = newTree(nnkPrefix, ident"$", keyAccess)
+    # putUsers(db, u: Users) — no id arg.
+    let putBody = quote do:
+      `dbParam`.put(`nameStr`, `keyExpr`, toValue(`uParam`))
+    putProc = newProc(
+      name = postfix(putFn, "*"),
+      params = [newEmptyNode(),
+                newIdentDefs(dbParam, glenDbType),
+                newIdentDefs(uParam, typeIdent)],
+      body = putBody)
+    # addUsers(db, u): string — same as put, but returns the key value
+    # so callers don't have to fish it back out of the record.
+    let addBody = quote do:
+      let derivedId = `keyExpr`
+      `dbParam`.put(`nameStr`, derivedId, toValue(`uParam`))
+      derivedId
+    addProc = newProc(
+      name = postfix(addFn, "*"),
+      params = [bindSym"string",
+                newIdentDefs(dbParam, glenDbType),
+                newIdentDefs(uParam, typeIdent)],
+      body = addBody)
 
   # Return type is `(bool, Users)` — using ParTy/TupleTy node so it's valid
   # in a proc signature.
@@ -538,5 +596,6 @@ macro schema*(name: untyped; body: untyped): untyped =
     versionDecl,
     registerProc,
     putProc,
+    addProc,
     getProc,
     migrateProc)

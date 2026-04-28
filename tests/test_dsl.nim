@@ -1,7 +1,7 @@
 ## Tests for the Glen DSL surface (literal, query, txn, schema, watch,
 ## sync, collection proxy).
 
-import std/[unittest, os, strutils, options]
+import std/[unittest, os, strutils, options, sets]
 import glen/glen
 import glen/types, glen/db as glendb, glen/txn as glentxn
 import glen/dsl
@@ -196,6 +196,158 @@ suite "dsl: schema":
     check v["name"].s == "Bob"
     check v["age"].i == 25
     check v["email"].s == "bob@x.io"
+
+# ---- add() — auto-generated ids -------------------------------------------
+
+suite "dsl: add (auto-generated ULID-style ids)":
+  test "db.add inserts and returns a fresh sortable id":
+    let dir = freshDir("glen_dsl_add_db")
+    let db = newGlenDB(dir)
+    let id1 = db.add("notes", %*{"text": "first"})
+    let id2 = db.add("notes", %*{"text": "second"})
+    check id1.len == 26
+    check id2.len == 26
+    check id1 != id2
+    # Lexicographic order ≈ insert order (ULID timestamp prefix).
+    check id1 < id2
+    check db.get("notes", id1)["text"].s == "first"
+    check db.get("notes", id2)["text"].s == "second"
+    db.close()
+
+  test "Collection.add forwards through the proxy":
+    let dir = freshDir("glen_dsl_add_coll")
+    let db = newGlenDB(dir)
+    let notes = db["notes"]
+    let id = notes.add(%*{"text": "from collection"})
+    check notes.get(id)["text"].s == "from collection"
+    db.close()
+
+  test "newId() before a txn enables cross-doc references":
+    # `txn.add` is intentionally NOT provided (Nim's overload resolution
+    # surfaces a template/helper ambiguity when `add`'s many stdlib
+    # overloads enter the picture). Generate the ids before the txn block
+    # — they're in scope inside the body and after for assertions.
+    let dir = freshDir("glen_dsl_add_txn_explicit")
+    let db = newGlenDB(dir)
+    let firstId = newId()
+    let secondId = newId()
+    let res = txn(db, retries = 0):
+      txn.put("links", firstId, %*{"linksTo": secondId})
+      txn.put("links", secondId, %*{"linksTo": firstId})
+    check res.status == glentxn.csOk
+    check db.get("links", firstId)["linksTo"].s == secondId
+    check db.get("links", secondId)["linksTo"].s == firstId
+    db.close()
+
+  test "addUsers (typed) round-trips through getUsers":
+    let dir = freshDir("glen_dsl_add_typed")
+    let db = newGlenDB(dir)
+    let id = addUsers(db, Users(
+      name: "Alice", age: 30'i64, email: "alice@example.com"))
+    check id.len == 26
+    let (ok, fetched) = getUsers(db, id)
+    check ok
+    check fetched.name == "Alice"
+    db.close()
+
+  test "ids generated rapidly stay unique":
+    let dir = freshDir("glen_dsl_add_unique")
+    let db = newGlenDB(dir)
+    var seen = initHashSet[string]()
+    for i in 0 ..< 200:
+      let id = db.add("k", %*{"i": i})
+      check id notin seen
+      seen.incl(id)
+    db.close()
+
+  test "newId() entropy: 100k ids fit a strict-monotone, fully-unique set":
+    # Belt-and-suspenders: stress the same-ms path heavily. Within a single
+    # thread the suffix is incremented monotonically, so there must be no
+    # duplicates AND every successive id must be > the last.
+    var seen = initHashSet[string]()
+    var prev = ""
+    for _ in 0 ..< 100_000:
+      let id = newId()
+      check id.len == 26
+      check id notin seen
+      check id > prev   # strict monotonicity
+      seen.incl(id)
+      prev = id
+
+  test "newId() suffix entropy: distinct suffixes across ms boundaries":
+    # When the ms ticks, the suffix is re-drawn from the OS RNG. Across
+    # many ms-tick events we should see effectively unique suffixes.
+    # Sleep ~1ms between calls to force a re-randomise each time, then
+    # check the 16-char suffixes (chars 10..25) have no duplicates.
+    var suffixes = initHashSet[string]()
+    for _ in 0 ..< 50:
+      let id = newId()
+      let suffix = id[10 .. 25]
+      check suffix notin suffixes
+      suffixes.incl(suffix)
+      sleep(2)   # cross a ms boundary
+
+# ---- schema with key: <field> --------------------------------------------
+
+schema sessions:
+  key: token       # use the `token` string field as the docId
+  fields:
+    token: zString().minLen(8)
+    user:  zString()
+    role:  zString().default("member")
+
+schema orders:
+  key: orderNum    # non-string key — `int64` here, stringified via $
+  fields:
+    orderNum: zInt()
+    sku:      zString()
+    qty:      zInt().default(1)
+
+suite "dsl: schema key: <field>":
+  test "string key — putSessions / addSessions derive docId from token":
+    let dir = freshDir("glen_dsl_key_string")
+    let db = newGlenDB(dir)
+    let s = Sessions(
+      token: "T-abcdef123", user: "alice", role: "admin")
+    putSessions(db, s)
+    # Doc is stored under the token, not a generated ULID.
+    let raw = db.get(sessionsCollection, "T-abcdef123")
+    check raw["user"].s == "alice"
+    let (ok, fetched) = getSessions(db, "T-abcdef123")
+    check ok and fetched.token == "T-abcdef123"
+
+    # addSessions returns the derived id (= token), not a fresh ULID.
+    let s2 = Sessions(token: "T-xyz9876543", user: "bob", role: "member")
+    let returnedId = addSessions(db, s2)
+    check returnedId == "T-xyz9876543"
+    db.close()
+
+  test "string key — repeated put is idempotent (single row)":
+    let dir = freshDir("glen_dsl_key_idempotent")
+    let db = newGlenDB(dir)
+    putSessions(db, Sessions(token: "T-sameToken", user: "v1", role: "member"))
+    putSessions(db, Sessions(token: "T-sameToken", user: "v2", role: "admin"))
+    check db.getAll(sessionsCollection).len == 1
+    let (ok, fetched) = getSessions(db, "T-sameToken")
+    check ok
+    check fetched.user == "v2"
+    check fetched.role == "admin"
+    db.close()
+
+  test "non-string key — int64 stringified via $":
+    let dir = freshDir("glen_dsl_key_int")
+    let db = newGlenDB(dir)
+    let returnedId = addOrders(db, Orders(
+      orderNum: 42'i64, sku: "WIDGET-1", qty: 3))
+    check returnedId == "42"
+    let raw = db.get(ordersCollection, "42")
+    check raw["sku"].s == "WIDGET-1"
+    check raw["qty"].i == 3
+
+    putOrders(db, Orders(orderNum: 7'i64, sku: "BOLT", qty: 1))
+    let (ok, fetched) = getOrders(db, "7")
+    check ok and fetched.sku == "BOLT"
+    db.close()
 
 # ---- optional/nullable/default semantics --------------------------------
 # Pinning down the documented contract from docs/dsl.md so the typed
