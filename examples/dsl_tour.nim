@@ -9,9 +9,10 @@ let dir = getCurrentDir() / "dsl_tour_db"
 removeDir(dir)
 let db = newGlenDB(dir)
 
-# ---------- schema -----------------------------------------------------
+# ---------- schema (typed records + migrations) ----------------------------
 
 schema users:
+  version: 1
   fields:
     name:  zString().trim().minLen(2).maxLen(64)
     age:   zInt().gte(0).lte(150)
@@ -21,21 +22,31 @@ schema users:
     byEmail: equality "email"
     byRole:  equality "role"
     byAge:   range    "age"
+  migrations:
+    0 -> 1:
+      if doc["role"].isNil:
+        doc["role"] = VString("member")
 
 registerUsersSchema(db)
 
-# ---------- %* literals + Collection proxy ---------------------------------
+# ---------- typed put/get with the generated `Users` record ---------------
 
+putUsers(db, "u1", Users(
+  name: "Alice", age: 30'i64, email: "alice@example.com", role: "admin"))
+putUsers(db, "u2", Users(
+  name: "Bob", age: 25'i64, email: "bob@example.com", role: "member"))
+
+# Mix typed and untyped CRUD freely.
 let users = db["users"]
-users.put("u1", %*{
-  "name": "Alice", "age": 30, "email": "alice@example.com", "role": "admin"
-})
-users.put("u2", %*{
-  "name": "Bob", "age": 25, "email": "bob@example.com", "role": "member"
-})
 users.put("u3", %*{
   "name": "Carol", "age": 41, "email": "carol@example.com", "role": "admin"
 })
+
+# Migrate any pre-existing rows that lacked `role`.
+migrateUsers(db)
+
+let (ok, fetched) = getUsers(db, "u1")
+if ok: echo &"typed read u1: {fetched.name} ({fetched.role})"
 
 # Validation:
 let res = validateUsers(users.get("u1"))
@@ -57,6 +68,31 @@ let admins = query(db, "users"):
 echo "admins >=30:"
 for (id, doc) in admins:
   echo &"  {id} {doc[\"name\"].s}"
+
+# ---------- liveQuery (reactive) ------------------------------------------
+
+var liveAdds = 0
+var liveRemoves = 0
+let liveAdmins = liveQuery(db, "users"):
+  where:
+    role == "admin"
+
+discard liveAdmins.onChange(proc (ev: LiveQueryEvent) =
+  case ev.kind
+  of lqAdded:    inc liveAdds
+  of lqRemoved:  inc liveRemoves
+  else: discard
+)
+
+echo &"liveAdmins seeded with {liveAdmins.len} admins"
+users.put("u5", %*{
+  "name": "Erin", "age": 33, "email": "erin@example.com", "role": "admin"
+})
+users.put("u3", %*{
+  "name": "Carol", "age": 41, "email": "carol@example.com", "role": "guest"
+})
+echo &"after edits: live count={liveAdmins.len}, +{liveAdds} -{liveRemoves}"
+liveAdmins.close()
 
 # ---------- watch ------------------------------------------------------
 

@@ -10,10 +10,11 @@
 
 import glen/dsl/literal
 import glen/dsl/collection
+import glen/dsl/live
 import glen/dsl/query
 import glen/dsl/txn
 import glen/dsl/schema
 import glen/dsl/watch
 import glen/dsl/sync
 
-export literal, collection, query, txn, schema, watch, sync
+export literal, collection, live, query, txn, schema, watch, sync

@@ -1,5 +1,5 @@
-## schema — combines a Zod-style validator with index declarations so
-## every collection is described in one place.
+## schema — typed-record schema, validator, indexes, and migrations in one
+## block.
 ##
 ##   schema users:
 ##     fields:
@@ -12,21 +12,29 @@
 ##       byAge:    range    "age"
 ##       byLoc:    geo      "addr.lon", "addr.lat"
 ##
-## Generates:
-##   * `let usersSchema*: Schema[...] = zobject: ...`
-##   * `const usersCollection* = "users"`
-##   * `proc registerUsersSchema*(db: GlenDB)` — creates indexes (idempotent
-##     re-creation is the existing semantics; the manifest dedupes on disk)
-##   * `proc validateUsers*(v: Value): ValidationResult[...]` — a thin alias
-##     over `parse`
+## For the example above the macro generates:
 ##
-## The `equality` / `range` index kinds use the same underlying engine and
-## differ only in whether the planner treats them as range-scannable. Glen's
-## current index engine is rangeable for any single-field index, so the
-## distinction is currently informational; we keep both keywords so callers
-## can document intent and stay forward-compatible.
+##   * `type Users* = object`
+##       `name*: string`, `age*: int64`, `email*: string`, `role*: string`
+##     (each field's static type is extracted from its schema expression
+##     via `schemaValueType` — `zString()` → `string`, `zInt()` → `int64`,
+##     `zArray(zInt())` → `seq[int64]`, etc.)
+##   * `const usersCollection* = "users"`
+##   * `let usersSchema*: Schema[Users]` — a parser closure that fills in
+##     a `var Users` field by field
+##   * `proc toValue*(u: Users): Value` — Glen Value codec
+##   * `proc parseUsers*(v: Value): ValidationResult[Users]`
+##   * `proc validateUsers*(v: Value): ValidationResult[Users]` (alias)
+##   * `proc registerUsersSchema*(db: GlenDB)` — creates declared indexes
+##   * `proc getUsers*(db: GlenDB; id: string): (bool, Users)` — typed read
+##   * `proc putUsers*(db: GlenDB; id: string; u: Users)` — typed write
+##
+## Untyped CRUD via `db.put` / `db.get` / `Collection` proxy still works;
+## the typed accessors are convenience wrappers.
+##
+## See `migrations:` and `version:` sections below for schema evolution.
 
-import std/[macros, strutils]
+import std/[macros, strutils, options]
 import glen/types
 import glen/db as glendb
 import glen/validators
@@ -67,6 +75,23 @@ proc applyIndex*(db: glendb.GlenDB; collection: string; spec: GlenIndexSpec) =
   of gikVector:
     db.createVectorIndex(collection, spec.name, spec.embeddingField,
                          spec.dim, spec.metric)
+
+# ---- Field encode helpers used by generated `toValue` ----
+
+proc encodeField*(s: string): Value {.inline.} = VString(s)
+proc encodeField*(b: bool): Value {.inline.} = VBool(b)
+proc encodeField*[T: SomeInteger](i: T): Value {.inline.} = VInt(int64(i))
+proc encodeField*[T: SomeFloat](f: T): Value {.inline.} = VFloat(float64(f))
+proc encodeField*(v: Value): Value {.inline.} =
+  if v.isNil: VNull() else: v
+
+proc encodeField*[T](items: seq[T]): Value =
+  var arr: seq[Value] = newSeqOfCap[Value](items.len)
+  for it in items: arr.add(encodeField(it))
+  VArray(arr)
+
+proc encodeField*[T](opt: Option[T]): Value =
+  if opt.isNone: VNull() else: encodeField(opt.get)
 
 # ---- Macro implementation ----
 
@@ -138,12 +163,32 @@ proc cap(s: string): string =
   if s.len == 0: s
   else: toUpperAscii(s[0]) & s[1 ..^ 1]
 
+proc parseFieldEntry(stmt: NimNode): (NimNode, NimNode) =
+  ## Field entries take the same shape as `zobject`: `name: <expr>`. For
+  ## indented chains like `name: zString()\n  .minLen(2)` Nim wraps the
+  ## RHS in a stmt list; we unwrap a single-statement list to get the
+  ## inner expression.
+  case stmt.kind
+  of nnkExprColonExpr:
+    if stmt[0].kind notin {nnkIdent, nnkSym}:
+      error("schema: field name must be identifier", stmt[0])
+    var rhs = stmt[1]
+    if rhs.kind == nnkStmtList and rhs.len == 1:
+      rhs = rhs[0]
+    return (stmt[0], rhs)
+  of nnkCall:
+    if stmt.len == 2 and stmt[0].kind in {nnkIdent, nnkSym}:
+      var rhs = stmt[1]
+      if rhs.kind == nnkStmtList and rhs.len == 1:
+        rhs = rhs[0]
+      return (stmt[0], rhs)
+    error("schema: malformed field entry", stmt)
+  else:
+    error("schema: field entry must be `name: <schemaExpr>`", stmt)
+
 macro schema*(name: untyped; body: untyped): untyped =
-  ## Declare a Glen collection's schema and indexes in one block.
-  ##
-  ## `name` is an identifier or string literal; the macro generates symbols
-  ## prefixed with that name (e.g. `usersSchema`, `registerUsersSchema`,
-  ## `validateUsers`).
+  ## Declare a Glen collection's typed schema, validator, indexes, and
+  ## migrations in one block. See module doc for the generated surface.
   if body.kind != nnkStmtList:
     error("schema: expected a block body", body)
 
@@ -156,11 +201,13 @@ macro schema*(name: untyped; body: untyped): untyped =
 
   var fieldsBlock: NimNode = nil
   var indexLines: seq[(string, NimNode)] = @[]
+  var versionLit: NimNode = newLit(0)
+  var migrationLines: seq[(int, int, NimNode)] = @[]   # (fromVer, toVer, body)
 
   for s in body:
     if s.kind == nnkCommentStmt: continue
-    if s.kind notin {nnkCall, nnkCommand}:
-      error("schema: expected `fields:` / `indexes:` sections", s)
+    if s.kind notin {nnkCall, nnkCommand, nnkExprColonExpr}:
+      error("schema: expected `fields:` / `indexes:` / `version:` / `migrations:` sections", s)
     let label = ($s[0]).toLowerAscii
     let sectionBody = s[1]
     case label
@@ -168,6 +215,39 @@ macro schema*(name: untyped; body: untyped): untyped =
       if sectionBody.kind != nnkStmtList:
         error("schema: `fields:` must be a block", sectionBody)
       fieldsBlock = sectionBody
+    of "version":
+      var v = sectionBody
+      if v.kind == nnkStmtList and v.len == 1: v = v[0]
+      if v.kind notin nnkIntLit..nnkUInt64Lit:
+        error("schema: `version:` must be an integer literal", v)
+      versionLit = v
+    of "migrations":
+      if sectionBody.kind != nnkStmtList:
+        error("schema: `migrations:` must be a block", sectionBody)
+      for entry in sectionBody:
+        if entry.kind == nnkCommentStmt: continue
+        # `fromVer -> toVer: body` parses to nnkInfix with 4 children:
+        # [op, fromVer, toVer, bodyStmtList]. The 4th child is the colon
+        # block attached during command-style parsing.
+        var fromN, toN, bodyN: NimNode = nil
+        if entry.kind == nnkInfix and entry.len >= 4 and $entry[0] == "->":
+          fromN = entry[1]
+          toN   = entry[2]
+          bodyN = entry[3]
+        elif entry.kind == nnkCall and entry.len == 2 and
+             entry[0].kind == nnkInfix and $entry[0][0] == "->":
+          fromN = entry[0][1]
+          toN   = entry[0][2]
+          bodyN = entry[1]
+        else:
+          error("schema: migration must be `fromVer -> toVer: <body>`", entry)
+        if fromN.kind notin nnkIntLit..nnkUInt64Lit:
+          error("schema: migration fromVer must be int literal", fromN)
+        if toN.kind notin nnkIntLit..nnkUInt64Lit:
+          error("schema: migration toVer must be int literal", toN)
+        if bodyN.isNil:
+          error("schema: migration body missing", entry)
+        migrationLines.add((int(fromN.intVal), int(toN.intVal), bodyN))
     of "indexes":
       if sectionBody.kind != nnkStmtList:
         error("schema: `indexes:` must be a block", sectionBody)
@@ -175,11 +255,9 @@ macro schema*(name: untyped; body: untyped): untyped =
         if entry.kind == nnkCommentStmt: continue
         case entry.kind
         of nnkCall:
-          # `byEmail: equality "email"` — nnkCall(name, sectionBody[stmtList[expr]])
           if entry.len == 2 and entry[0].kind in {nnkIdent, nnkSym}:
             let idxName = $entry[0]
             var rhs = entry[1]
-            # `name: kind args` parses as nnkCall(name, stmtList(<inner>))
             if rhs.kind == nnkStmtList:
               if rhs.len != 1:
                 error("schema: index entry must have a single rhs", rhs)
@@ -195,32 +273,163 @@ macro schema*(name: untyped; body: untyped): untyped =
         else:
           error("schema: index entries must be `name: <kind> <args>`", entry)
     else:
-      error("schema: unknown section `" & label & "`. Expected `fields:` and/or `indexes:`", s)
+      error("schema: unknown section `" & label &
+        "`. Expected `fields:`, `indexes:`, `version:`, or `migrations:`", s)
 
   if fieldsBlock.isNil:
     error("schema: `fields:` section is required", body)
 
+  # Generated symbol names
+  let typeIdent  = ident(baseCap)                       # `Users`
   let schemaSym  = ident(nameStr & "Schema")
   let collConst  = ident(nameStr & "Collection")
+  let versionConst = ident(nameStr & "SchemaVersion")
   let registerFn = ident("register" & baseCap & "Schema")
   let validateFn = ident("validate" & baseCap)
+  let parseFn    = ident("parse" & baseCap)
+  let getFn      = ident("get" & baseCap)
+  let putFn      = ident("put" & baseCap)
+  let migrateFn  = ident("migrate" & baseCap)
 
-  # let usersSchema* = zobject: ...fields...
+  # ---- Walk the fields ---------------------------------------------------
+  # For each `field: <expr>` we emit a `let usersFooSchema = <expr>` so the
+  # schema is evaluated once. `schemaValueType` extracts the static type
+  # from that schema, which we then use in:
+  #   * the `type Users` declaration, for the field type
+  #   * the parser closure, where each parsed value is assigned into the
+  #     accumulator
+  #   * the `toValue` proc, where each field is encoded back into a Value.
+
+  var fieldNames: seq[NimNode] = @[]
+  var fieldSchemaSyms: seq[NimNode] = @[]
+  var schemaLets = newStmtList()
+
+  for raw in fieldsBlock:
+    if raw.kind == nnkCommentStmt: continue
+    let (fname, fexpr) = parseFieldEntry(raw)
+    let fSchemaSym = ident(nameStr & cap($fname) & "Schema")
+    schemaLets.add(newLetStmt(fSchemaSym, fexpr))
+    fieldNames.add(fname)
+    fieldSchemaSyms.add(fSchemaSym)
+
+  if fieldNames.len == 0:
+    error("schema: `fields:` block must declare at least one field", fieldsBlock)
+
+  # ---- type Users* = object -------------------------------------
+  var recList = newTree(nnkRecList)
+  for i in 0 ..< fieldNames.len:
+    let typeExpr = newCall(bindSym"schemaValueType", fieldSchemaSyms[i])
+    recList.add(newIdentDefs(postfix(fieldNames[i], "*"),
+                             typeExpr, newEmptyNode()))
+  let typeSection = newTree(nnkTypeSection,
+    newTree(nnkTypeDef,
+      postfix(typeIdent, "*"),
+      newEmptyNode(),
+      newTree(nnkObjectTy, newEmptyNode(), newEmptyNode(), recList)))
+
+  # ---- let usersSchema*: Schema[Users] = newSchema("users", ...) ---------
+  # Parser closure:
+  #   if not ensureObject(input, path, issues): return none(Users)
+  #   var acc: Users
+  #   let before = issues.len
+  #   for each field:
+  #     let fv = getObjectField(input, "field")
+  #     let parsed = runSchema(fooSchema, fv, pushPath(path, "field"), issues)
+  #     if parsed.isSome: acc.field = parsed.get
+  #   if issues.len > before: return none(Users)
+  #   some(acc)
+  let inputSym  = genSym(nskParam, "input")
+  let pathSym   = genSym(nskParam, "path")
+  let issuesSym = genSym(nskParam, "issues")
+  let accSym    = genSym(nskVar,   "acc")
+  let beforeSym = genSym(nskLet,   "before")
+  var parserBody = newStmtList()
+  let optTypeForResult = newTree(nnkBracketExpr, bindSym"Option", typeIdent)
+  let returnNone = newTree(nnkReturnStmt, newCall(bindSym"none", typeIdent))
+  parserBody.add(newIfStmt(
+    (cond: prefix(newCall(bindSym"ensureObject", inputSym, pathSym, issuesSym), "not"),
+     body: newStmtList(returnNone))))
+  parserBody.add(newVarStmt(accSym, newCall(typeIdent)))
+  parserBody.add(newLetStmt(beforeSym, newDotExpr(issuesSym, ident"len")))
+  for i in 0 ..< fieldNames.len:
+    let fname = fieldNames[i]
+    let fSchema = fieldSchemaSyms[i]
+    let keyLit = newLit($fname)
+    let parsedSym = genSym(nskLet, "parsed")
+    let fvSym = genSym(nskLet, "fv")
+    parserBody.add(quote do:
+      let `fvSym` = getObjectField(`inputSym`, `keyLit`)
+      let `parsedSym` = runSchema(`fSchema`, `fvSym`,
+                                  pushPath(`pathSym`, `keyLit`),
+                                  `issuesSym`)
+      if `parsedSym`.isSome:
+        `accSym`.`fname` = `parsedSym`.get
+    )
+  parserBody.add(newIfStmt(
+    (cond: infix(newDotExpr(issuesSym, ident"len"), ">", beforeSym),
+     body: newStmtList(returnNone))))
+  parserBody.add(newCall(bindSym"some", accSym))
+
+  let parserLambda = newTree(nnkLambda,
+    newEmptyNode(), newEmptyNode(), newEmptyNode(),
+    newTree(nnkFormalParams, optTypeForResult,
+      newIdentDefs(inputSym, bindSym"Value"),
+      newIdentDefs(pathSym, newTree(nnkBracketExpr, bindSym"seq", bindSym"string")),
+      newIdentDefs(issuesSym,
+                   newTree(nnkVarTy,
+                           newTree(nnkBracketExpr, bindSym"seq", bindSym"ValidationIssue")))),
+    newEmptyNode(), newEmptyNode(),
+    parserBody)
+
+  let schemaCall = newCall(
+    newTree(nnkBracketExpr, bindSym"newSchema", typeIdent),
+    newLit(nameStr),
+    parserLambda)
+  let schemaTypeAnnot = newTree(nnkBracketExpr, bindSym"Schema", typeIdent)
   let schemaLet = newTree(nnkLetSection,
     newTree(nnkIdentDefs,
       postfix(schemaSym, "*"),
-      newEmptyNode(),
-      newCall(bindSym"zobject", fieldsBlock)))
+      schemaTypeAnnot,
+      schemaCall))
 
-  # const usersCollection* = "users"
-  let constDecl = newTree(nnkConstSection,
+  # ---- proc toValue*(u: Users): Value -----------------------------------
+  let uParam = ident"u"
+  let resultSym = ident"result"
+  var encodeBody = newStmtList()
+  encodeBody.add(newAssignment(resultSym, newCall(bindSym"VObject")))
+  for fname in fieldNames:
+    let keyLit = newLit($fname)
+    let fieldVal = newDotExpr(uParam, fname)
+    encodeBody.add(newAssignment(
+      newTree(nnkBracketExpr, resultSym, keyLit),
+      newCall(bindSym"encodeField", fieldVal)))
+  let toValueProc = newProc(
+    name = postfix(ident"toValue", "*"),
+    params = [bindSym"Value", newIdentDefs(uParam, typeIdent)],
+    body = encodeBody)
+
+  # ---- proc parseUsers* / validateUsers* --------------------------------
+  let vParam = ident"v"
+  let parseProc = newProc(
+    name = postfix(parseFn, "*"),
+    params = [newTree(nnkBracketExpr, bindSym"ValidationResult", typeIdent),
+              newIdentDefs(vParam, bindSym"Value")],
+    body = newCall(bindSym"parse", schemaSym, vParam))
+  let validateProc = newProc(
+    name = postfix(validateFn, "*"),
+    params = [newTree(nnkBracketExpr, bindSym"ValidationResult", typeIdent),
+              newIdentDefs(vParam, bindSym"Value")],
+    body = newCall(bindSym"parse", schemaSym, vParam))
+
+  # ---- const usersCollection*, usersSchemaVersion* ----------------------
+  let collDecl = newTree(nnkConstSection,
     newTree(nnkConstDef,
-      postfix(collConst, "*"),
-      newEmptyNode(),
-      newLit(nameStr)))
+      postfix(collConst, "*"), newEmptyNode(), newLit(nameStr)))
+  let versionDecl = newTree(nnkConstSection,
+    newTree(nnkConstDef,
+      postfix(versionConst, "*"), newEmptyNode(), versionLit))
 
-  # proc registerUsersSchema*(db: GlenDB) =
-  #   applyIndex(db, "users", GlenIndexSpec(...))
+  # ---- proc registerUsersSchema*(db: GlenDB) ----------------------------
   let dbParam = ident"db"
   var registerBody = newStmtList()
   for (idxName, rhs) in indexLines:
@@ -229,21 +438,105 @@ macro schema*(name: untyped; body: untyped): untyped =
       dbParam, newLit(nameStr), specExpr))
   if registerBody.len == 0:
     registerBody.add(newTree(nnkDiscardStmt, newEmptyNode()))
-
   let glenDbType = bindSym"GlenDB"
   let registerProc = newProc(
     name = postfix(registerFn, "*"),
-    params = [newEmptyNode(),
-              newIdentDefs(dbParam, glenDbType)],
+    params = [newEmptyNode(), newIdentDefs(dbParam, glenDbType)],
     body = registerBody)
 
-  # proc validateUsers*(v: Value): auto = usersSchema.parse(v)
-  let vParam = ident"v"
-  let validateBody = newCall(bindSym"parse", schemaSym, vParam)
-  let validateProc = newProc(
-    name = postfix(validateFn, "*"),
-    params = [ident"auto",
-              newIdentDefs(vParam, bindSym"Value")],
-    body = validateBody)
+  # ---- proc getUsers / putUsers ----------------------------------------
+  # putUsers: db.put(coll, id, u.toValue)
+  # getUsers: returns (ok, value); ok=false on missing or invalid doc.
+  let idParam = ident"id"
+  let putBody = newCall(newDotExpr(dbParam, ident"put"),
+                        newLit(nameStr), idParam,
+                        newCall(ident"toValue", uParam))
+  let putProc = newProc(
+    name = postfix(putFn, "*"),
+    params = [newEmptyNode(),
+              newIdentDefs(dbParam, glenDbType),
+              newIdentDefs(idParam, bindSym"string"),
+              newIdentDefs(uParam, typeIdent)],
+    body = putBody)
 
-  result = newStmtList(constDecl, schemaLet, registerProc, validateProc)
+  # Return type is `(bool, Users)` — using ParTy/TupleTy node so it's valid
+  # in a proc signature.
+  let resTupleType = newTree(nnkTupleConstr, bindSym"bool", typeIdent)
+  let getBody = quote do:
+    let doc = `dbParam`.get(`nameStr`, `idParam`)
+    if doc.isNil:
+      result = (false, `typeIdent`())
+    else:
+      let parsed = `parseFn`(doc)
+      if parsed.ok:
+        result = (true, parsed.value)
+      else:
+        result = (false, `typeIdent`())
+  let getProc = newProc(
+    name = postfix(getFn, "*"),
+    params = [resTupleType,
+              newIdentDefs(dbParam, glenDbType),
+              newIdentDefs(idParam, bindSym"string")],
+    body = getBody)
+
+  # ---- proc migrateUsers*(db: GlenDB) -----------------------------------
+  # Each doc carries a `_v` int field (default 0 if missing). For every
+  # declared `from -> to: <body>` pair (sorted), if the doc's current
+  # version equals `from`, run the body to mutate the doc in place, then
+  # bump the local version to `to`. After all steps, stamp `_v` to the
+  # target schema version and write the doc back.
+  var sorted = migrationLines
+  for i in 0 ..< sorted.len:
+    for j in 0 ..< sorted.len - i - 1:
+      if sorted[j][0] > sorted[j+1][0] or
+         (sorted[j][0] == sorted[j+1][0] and sorted[j][1] > sorted[j+1][1]):
+        let tmp = sorted[j]
+        sorted[j] = sorted[j+1]
+        sorted[j+1] = tmp
+
+  var migrationSteps = newStmtList()
+  for (fromVer, toVer, mbody) in sorted:
+    let fromLit = newLit(fromVer)
+    let toLit = newLit(toVer)
+    migrationSteps.add(quote do:
+      if curVer == `fromLit`:
+        `mbody`
+        curVer = `toLit`
+    )
+
+  let targetVerLit = versionLit
+  let migrateBody = quote do:
+    for entry in `dbParam`.getAll(`nameStr`):
+      let id {.inject.} = entry[0]
+      let doc {.inject.} = entry[1]
+      if doc.isNil: continue
+      let rawVer = doc["_v"]
+      let origVer = (if rawVer.isNil or rawVer.kind != vkInt: 0
+                     else: int(rawVer.i))
+      var curVer {.inject.} = origVer
+      `migrationSteps`
+      # Write back whenever any migration ran (curVer advanced) or the
+      # stamped version is missing/stale. This is idempotent: re-running
+      # migrate on already-current docs is a no-op.
+      if curVer != origVer or origVer != `targetVerLit`:
+        doc["_v"] = VInt(int64(`targetVerLit`))
+        `dbParam`.put(`nameStr`, id, doc)
+
+  let migrateProc = newProc(
+    name = postfix(migrateFn, "*"),
+    params = [newEmptyNode(), newIdentDefs(dbParam, glenDbType)],
+    body = migrateBody)
+
+  result = newStmtList(
+    schemaLets,
+    typeSection,
+    schemaLet,
+    toValueProc,
+    parseProc,
+    validateProc,
+    collDecl,
+    versionDecl,
+    registerProc,
+    putProc,
+    getProc,
+    migrateProc)

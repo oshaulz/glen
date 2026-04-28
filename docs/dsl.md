@@ -220,10 +220,11 @@ The `txn` helper is injected into the body and exposes:
 
 A bare `txn(db): body` form runs once with no retries.
 
-## `schema:` — collection schema, validator, and indexes
+## `schema:` — typed records, validator, indexes, migrations
 
 ```nim
 schema users:
+  version: 2
   fields:
     name:  zString().trim().minLen(2).maxLen(64)
     age:   zInt().gte(0).lte(150)
@@ -235,18 +236,114 @@ schema users:
     byLoc:    geo      "addr.lon", "addr.lat"
     region:   polygon  "regionShape"
     byEmbed:  vector   "embedding", 384, vmCosine
+  migrations:
+    0 -> 1:
+      if doc["role"].isNil:
+        doc["role"] = VString("member")
+    1 -> 2:
+      let legacy = doc["fullName"]
+      if not legacy.isNil:
+        doc["name"] = legacy
 ```
 
-Generates four symbols, all prefixed with the schema name:
+The example above generates the following symbols, all prefixed with the
+schema name:
 
-| Symbol                      | Purpose                                   |
-|-----------------------------|-------------------------------------------|
-| `usersCollection: string`   | The collection name (`"users"` here)      |
-| `usersSchema: Schema[…]`    | The validator (uses the existing `zobject`) |
-| `registerUsersSchema(db)`   | Creates every declared index on `db`       |
-| `validateUsers(v) -> ValidationResult[…]` | Thin alias over `usersSchema.parse(v)` |
+| Symbol                                | Purpose                                                       |
+|---------------------------------------|---------------------------------------------------------------|
+| `type Users* = object`                | Typed record. Each field's static type comes from its schema (`zString()` → `string`, `zInt()` → `int64`, `zArray(zInt())` → `seq[int64]`, `zBool()` → `bool`, etc.) |
+| `usersCollection: string`             | The collection name (`"users"` here)                          |
+| `usersSchemaVersion: int`             | Current declared version (`2`)                                |
+| `usersSchema: Schema[Users]`          | Validator that parses a `Value` into a `Users`                |
+| `parseUsers(v) -> ValidationResult[Users]` | Run the validator                                        |
+| `validateUsers(v)`                    | Alias for `parseUsers` (compat with non-typed code)           |
+| `toValue(u: Users) -> Value`          | Encode a typed record back into a `Value`                     |
+| `getUsers(db, id) -> (bool, Users)`   | Typed read; `ok=false` for missing / invalid docs             |
+| `putUsers(db, id, u: Users)`          | Typed write (calls `toValue` and `db.put`)                    |
+| `registerUsersSchema(db)`             | Creates every declared index on `db`                          |
+| `migrateUsers(db)`                    | Walks the collection and replays every declared migration up to `usersSchemaVersion` |
 
-Index kinds:
+### Typed records
+
+```nim
+let alice = Users(name: "Alice", age: 30, email: "alice@example.com",
+                  role: "admin")
+putUsers(db, "u1", alice)
+
+let (ok, fetched) = getUsers(db, "u1")
+if ok: echo fetched.name
+
+# Untyped CRUD still works on the same docs:
+db.put(usersCollection, "u2", %*{"name": "Bob", "age": 25,
+                                  "email": "bob@x.io", "role": "member"})
+
+# Validate an arbitrary Value before storing it:
+let res = parseUsers(someUntypedValue)
+if not res.ok:
+  for issue in res.issues:
+    echo describePath(issue.path), ": ", issue.message
+```
+
+Field types are inferred via `schemaValueType` on each schema expression,
+so adding refinements (`.minLen(2)`, `.gte(0)`) doesn't change the field
+type. `Option[T]` falls out of `optional()` / `nullable()` automatically.
+
+### Optional fields
+
+Three builders cover the "may not be there" cases. Pick by intent:
+
+| Builder                | Static type   | **Field absent**             | **Explicit `null`**         |
+|------------------------|---------------|------------------------------|-----------------------------|
+| `optional(zX())`       | `Option[X]`   | ✅ parses to `none(X)`        | ✅ parses to `none(X)`       |
+| `nullable(zX())`       | `Option[X]`   | ❌ validation error           | ✅ parses to `none(X)`       |
+| `zX().default(v)`      | `X`           | ✅ parses to `v`              | ✅ parses to `v`             |
+| `zX()` (bare)          | `X`           | ❌ validation error           | ❌ validation error          |
+
+`optional` and `nullable` differ only on absence: `optional` is
+"the key may be missing", `nullable` is "the key must be present but
+the value may be `null`". Use whichever matches your wire format.
+
+```nim
+schema posts:
+  fields:
+    title: zString()                          # required, non-null
+    body:  optional(zString())                # may be missing → none
+    draft: zBool().default(false)             # missing → false
+    tags:  zArray(zString()).default(@[])     # missing → []
+```
+
+### Extra fields not declared in the schema
+
+Glen's schema is **strip-on-parse, preserve-on-store**:
+
+| Path                                                        | Extra fields            |
+|-------------------------------------------------------------|-------------------------|
+| `db.put` / `db.get` / `Collection` / `%*` (untyped)         | **preserved** as-is     |
+| `parseUsers` → `Users` → `toValue` (typed round-trip)       | **dropped** silently    |
+| `putUsers(db, id, u: Users)` (typed write)                  | **dropped** (only schema fields are written) |
+| `getUsers(db, id) -> (bool, Users)` (typed read)            | dropped *from the typed view*; the on-disk doc still has them |
+
+Glen stores the whole `Value` blob untouched, so the database itself
+never loses extras. They only get filtered out when you go through the
+typed gate. Practical implications:
+
+- **Internal metadata, caches, third-party annotations** — write them
+  via `db.put` of a `%*{...}` literal that includes both the schema
+  fields and the extras. The schema validator can still verify the
+  schema fields without touching the rest.
+- **Typed-mutate-write loops** — `getUsers` → mutate → `putUsers`
+  silently drops extras. If you need to preserve them, use the
+  untyped path: `let v = db.get(...)`; mutate fields on `v`; `db.put`
+  it back.
+- **Mix freely** — read typed for app logic (`getUsers`), and at the
+  same time read untyped (`db.get`) when you need the full document.
+  They see the same bytes on disk.
+
+There is no "strict mode" today that errors on unknown keys; if you
+need that, run `parseUsers` for validation but check the input
+`Value`'s `obj` table for unexpected keys yourself.
+
+### Index kinds
 
 | Kind                              | Notes                                                |
 |-----------------------------------|------------------------------------------------------|
@@ -258,6 +355,74 @@ Index kinds:
 
 `registerUsersSchema(db)` is idempotent: indexes that already exist (per
 the on-disk manifest) are not rebuilt.
+
+### Migrations
+
+`version: N` declares the schema's current version. `migrations:` is a
+block of `from -> to: <body>` steps. Inside each body the `doc: Value`
+is mutated in place; you can read fields, set new ones, delete others,
+and so on. The macro stamps the doc with `_v: int` so re-running
+`migrateUsers(db)` is idempotent.
+
+```nim
+schema accounts:
+  version: 2
+  fields:
+    name:    zString()
+    balance: zInt()
+    role:    zString()
+  migrations:
+    0 -> 1:
+      if doc["role"].isNil:
+        doc["role"] = VString("member")
+    1 -> 2:
+      let legacy = doc["credit"]
+      if not legacy.isNil:
+        doc["balance"] = legacy
+```
+
+Run `migrateAccounts(db)` once at startup (or after deployment).
+Documents already at the current version are left alone.
+
+## `liveQuery:` — reactive query
+
+A query whose result set updates as the underlying collection changes.
+Subscribes once at the collection level and emits diff events
+(added / updated / removed) to registered callbacks.
+
+```nim
+let live = liveQuery(db, "users"):
+  where:
+    role == "admin"
+    age >= 30
+
+let h = live.onChange(proc (ev: LiveQueryEvent) =
+  case ev.kind
+  of lqRefilled: ui.upsert(ev.id, ev.newValue)   # initial seed
+  of lqAdded:    ui.upsert(ev.id, ev.newValue)
+  of lqUpdated:  ui.upsert(ev.id, ev.newValue)
+  of lqRemoved:  ui.remove(ev.id)
+)
+
+echo live.len           # current matched count
+let snap = live.snapshot()   # one-shot read of the matched set
+
+live.offChange(h)
+live.close()
+```
+
+Predicate algebra is the same as `query:` — `==`, `!=`, `<`, `<=`, `>`,
+`>=`, `in`, `.contains`. `orderBy:` and `limit:` are not supported on
+live queries (they'd require maintaining a sorted heap and recomputing
+window membership on every change); if you need ordered/paged live
+state, build it on top of the diff stream.
+
+| Event kind   | When fired                                                | `oldValue` | `newValue` |
+|--------------|-----------------------------------------------------------|------------|------------|
+| `lqRefilled` | Once per matching doc when `onChange` is registered       | nil        | current    |
+| `lqAdded`    | Doc newly enters the result set                           | nil        | new        |
+| `lqUpdated`  | Doc was in the set, still matches, value changed          | previous   | new        |
+| `lqRemoved`  | Doc left the set (no longer matches, or was deleted)      | previous   | nil        |
 
 ## `watch:` — declarative subscriptions
 

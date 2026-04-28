@@ -33,7 +33,11 @@ import std/[macros, strutils]
 import glen/types
 import glen/db as glendb
 import glen/geo
+import glen/query as glenquery
 import glen/dsl/literal
+import glen/dsl/live
+
+export live
 
 # ---- Path helpers ----
 
@@ -274,3 +278,95 @@ proc nearestVector*(db: glendb.GlenDB; collection, indexName: string;
                     query: openArray[float32]; k: int): seq[(string, float32)] {.inline.} =
   ## Approximate k-NN against an HNSW vector index. Wraps `findNearestVector`.
   db.findNearestVector(collection, indexName, query, k)
+
+# ---- liveQuery — reactive query block --------------------------------------
+
+proc rewritePredicateToConstr(stmt: NimNode): NimNode =
+  ## Map a single predicate statement to a `QueryPredicate(...)` literal,
+  ## suitable for accumulating into a `seq[QueryPredicate]` for a live
+  ## query. Mirrors `rewritePredicate` but emits a constructor instead of
+  ## a builder method call.
+  let predSym = bindSym"QueryPredicate"
+  template mkPred(opSym: NimNode; fieldStr: string; valExpr: NimNode): NimNode =
+    newTree(nnkObjConstr, predSym,
+      newTree(nnkExprColonExpr, ident"op", opSym),
+      newTree(nnkExprColonExpr, ident"field", newLit(fieldStr)),
+      newTree(nnkExprColonExpr, ident"value", valExpr))
+  case stmt.kind
+  of nnkInfix:
+    let op  = $stmt[0]
+    let lhs = stmt[1]
+    let rhs = stmt[2]
+    let field = fieldExprToString(lhs)
+    let toV = newCall(bindSym"toValue", rhs)
+    case op
+    of "==": result = mkPred(bindSym"qoEq",  field, toV)
+    of "!=": result = mkPred(bindSym"qoNe",  field, toV)
+    of "<":  result = mkPred(bindSym"qoLt",  field, toV)
+    of "<=": result = mkPred(bindSym"qoLte", field, toV)
+    of ">":  result = mkPred(bindSym"qoGt",  field, toV)
+    of ">=": result = mkPred(bindSym"qoGte", field, toV)
+    of "in":
+      if rhs.kind != nnkBracket:
+        error("liveQuery: `in` expects an array literal on the right", rhs)
+      var arr = newTree(nnkBracket)
+      for el in rhs:
+        arr.add(newCall(bindSym"toValue", el))
+      let valuesExpr = newTree(nnkPrefix, ident"@", arr)
+      result = newTree(nnkObjConstr, predSym,
+        newTree(nnkExprColonExpr, ident"op", bindSym"qoIn"),
+        newTree(nnkExprColonExpr, ident"field", newLit(field)),
+        newTree(nnkExprColonExpr, ident"values", valuesExpr))
+    else:
+      error("liveQuery: unsupported predicate operator `" & op & "`", stmt)
+  of nnkCall:
+    if stmt.len == 2 and stmt[0].kind == nnkDotExpr and $stmt[0][1] == "contains":
+      let field = fieldExprToString(stmt[0][0])
+      let needle = stmt[1]
+      result = mkPred(bindSym"qoContains", field,
+                      newCall(bindSym"VString", needle))
+    else:
+      error("liveQuery: unsupported predicate call (only .contains supported)", stmt)
+  else:
+    error("liveQuery: unsupported predicate shape: " & $stmt.kind, stmt)
+
+macro liveQuery*(db: glendb.GlenDB; collection: static[string]; body: untyped): LiveQuery =
+  ## Block DSL for a reactive query. Same predicate algebra as `query:`
+  ## (`==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `.contains`) under a
+  ## `where:` section. `orderBy` / `limit` are not supported here — see
+  ## the `LiveQuery` doc.
+  let predsSym = genSym(nskVar, "preds")
+  let predSeqType = newTree(nnkBracketExpr, bindSym"seq", bindSym"QueryPredicate")
+  var pre = newStmtList()
+  pre.add(newVarStmt(predsSym,
+    newCall(newTree(nnkBracketExpr, bindSym"newSeqOfCap", bindSym"QueryPredicate"),
+            newLit(4))))
+
+  if body.kind != nnkStmtList:
+    error("liveQuery: expected a block body", body)
+
+  for s in body:
+    case s.kind
+    of nnkCommentStmt: continue
+    of nnkCall, nnkCommand:
+      let label = sectionLabel(s)
+      let bodyArg = sectionBody(s)
+      case label
+      of "where":
+        let stmts =
+          if bodyArg.kind == nnkStmtList: bodyArg
+          else: newStmtList(bodyArg)
+        for p in stmts:
+          if p.kind == nnkCommentStmt: continue
+          pre.add(newCall(newDotExpr(predsSym, ident"add"),
+                          rewritePredicateToConstr(p)))
+      of "orderby", "limit", "after":
+        error("liveQuery: `" & label & ":` is not supported on live queries — see the LiveQuery docs", s)
+      else:
+        error("liveQuery: unknown section `" & label & "`. Only `where:` is supported.", s)
+    else:
+      error("liveQuery: top-level entries must be sections", s)
+
+  discard predSeqType
+  pre.add(newCall(bindSym"newLiveQuery", db, newLit(collection), predsSym))
+  result = newBlockStmt(pre)
