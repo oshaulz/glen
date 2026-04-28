@@ -42,11 +42,14 @@ tests/test_*
 /examples/basic
 /examples/crud_validated
 /examples/todo_sync
+/examples/dsl_tour
 
 # Glen on-disk databases created by examples & ad-hoc usage at the repo root.
 # Layout: glen.wal.<n>, <collection>.snap, node.id, peers.state.
 /exampledb/
 /crud_example_db/
+/dsl_tour_db/
+/dsl_tour_db_b/
 /glen.wal.*
 /*.snap
 /node.id

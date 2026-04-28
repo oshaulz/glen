@@ -1,3 +1,0 @@
-eq	users	byEmail	email
-eq	users	byRole	role
-eq	users	byAge	age
