@@ -72,6 +72,9 @@ type
   GlenDB* = ref object
     dir*: string
     wal*: WriteAheadLog
+    readOnly*: bool   ## When true, all write entry points raise; the
+                      ## WAL handle is nil; multiple processes can open
+                      ## the same directory concurrently.
     collections: Table[string, CollectionStore]
     structLock: RwLock           # protects ONLY the outer 'collections' map
     cache: LruCache
@@ -307,6 +310,13 @@ proc bytesToHex(bytes: openArray[byte]): string =
     result[j] = hexdigits[v and 0xF]
     inc j
 
+proc isReadOnly*(db: GlenDB): bool {.inline.} = db.readOnly
+
+proc assertWritable(db: GlenDB) {.inline.} =
+  if db.readOnly:
+    raise newException(IOError,
+      "Glen database is open in read-only mode (use newGlenDB(dir, readOnly = false) for writes)")
+
 proc generateStableNodeId(): string =
   ## Uses wall-clock millis and 16 random bytes hex-encoded.
   ## Randomness is seeded from time to avoid duplicate IDs across processes.
@@ -329,7 +339,8 @@ proc newGlenDB*(dir: string;
                 maxDirtyDocs = 0;
                 compactWalBytes = 0;
                 compactIntervalMs = 0;
-                compactDirtyCount = 0): GlenDB =
+                compactDirtyCount = 0;
+                readOnly = false): GlenDB =
   ## `spillableMode = true` opens any existing snapshot v2 file via mmap and
   ## defers loading docs until they're touched. Combined with `hotDocCap > 0`,
   ## cold non-dirty docs are evicted from RAM under pressure and faulted back
@@ -342,9 +353,19 @@ proc newGlenDB*(dir: string;
   ## set; multi-doc operations (commit, applyChanges, putMany, deleteMany)
   ## that would exceed the cap raise ValueError with a clear message asking
   ## you to compact or chunk.
+  ##
+  ## `readOnly = true` opens the database in a no-write mode: the WAL is
+  ## replayed without holding a writable handle, no lockfile is taken,
+  ## and every mutating entry point (`put`, `delete`, `commit`,
+  ## `applyChanges`, `compact`, `createIndex`, etc.) raises
+  ## `IOError`. Suitable for compute-platform-style workloads where many
+  ## ephemeral readers attach to the same shared dataset directory.
   result = GlenDB(
     dir: dir,
-    wal: openWriteAheadLog(dir, syncMode = walSync, flushEveryBytes = walFlushEveryBytes),
+    wal: (if readOnly: nil
+          else: openWriteAheadLog(dir, syncMode = walSync,
+                                  flushEveryBytes = walFlushEveryBytes)),
+    readOnly: readOnly,
     collections: initTable[string, CollectionStore](),
     cache: newLruCache(cacheCapacity, numShards = cacheShards),
     subs: newSubscriptionManager(),
@@ -364,9 +385,18 @@ proc newGlenDB*(dir: string;
   result.indexManifestPath = dir / IndexManifestFile
   # derive nodeId if provided
   let cfg = loadConfig()
-  # Persisted/stable node id
+  # Persisted/stable node id. In read-only mode we just read whatever is
+  # there (or generate an ephemeral one); never write.
   let nodeIdPath = dir / "node.id"
-  if cfg.nodeId.len > 0:
+  if readOnly:
+    if fileExists(nodeIdPath):
+      try: result.nodeId = readFile(nodeIdPath).strip()
+      except IOError: result.nodeId = generateStableNodeId()
+      if result.nodeId.len == 0:
+        result.nodeId = generateStableNodeId()
+    else:
+      result.nodeId = generateStableNodeId()
+  elif cfg.nodeId.len > 0:
     result.nodeId = cfg.nodeId
     # if no file exists, persist
     if not fileExists(nodeIdPath): writeFile(nodeIdPath, result.nodeId)
@@ -593,6 +623,7 @@ proc setPeerCursor*(db: GlenDB; peerId: string; seq: uint64) =
   ## Records a peer's acknowledged cursor and opportunistically trims the
   ## per-collection replication logs up to the new minimum cursor across
   ## peers — keeps memory bounded for long-running multi-peer setups.
+  db.assertWritable()
   acquire(db.replLock)
   db.peersCursors[peerId] = seq
   db.peersDirty = true
@@ -634,6 +665,7 @@ proc gcReplLog*(db: GlenDB) =
   ## Trim in-memory replication log up to the minimum acknowledged cursor across peers.
   ## Holds peers state under replLock; trims each collection's log under its
   ## own stripe write-lock so concurrent reads/writes elsewhere keep moving.
+  db.assertWritable()
   acquire(db.replLock)
   if db.peersCursors.len == 0:
     release(db.replLock)
@@ -698,6 +730,7 @@ proc ensureCollection*(db: GlenDB; collection: string) =
   ## all create lazily and are safe under arbitrary concurrent first-writes.
   ## Useful as a hint, e.g. when bulk-loading and you want to materialise the
   ## indexes table before fanning out.
+  db.assertWritable()
   discard db.getOrCreateCollection(collection)
 
 # ---- Stripe locking helpers ----
@@ -962,6 +995,7 @@ proc fetchOneBypass(db: GlenDB; cs: CollectionStore;
                     collection, docId: string): Value
 
 proc put*(db: GlenDB; collection, docId: string; value: Value) =
+  db.assertWritable()
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   let cs = db.getOrCreateCollection(collection)
@@ -1019,6 +1053,7 @@ proc add*(db: GlenDB; collection: string; value: Value): string =
 ## Delete a document if it exists. Appends a delete to WAL, removes from
 ## in-memory state and cache, bumps the version, and notifies subscribers.
 proc delete*(db: GlenDB; collection, docId: string) =
+  db.assertWritable()
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   let cs = db.tryGetCollection(collection)
@@ -1073,6 +1108,7 @@ proc currentVersion*(db: GlenDB; collection, docId: string): uint64 =
 ## Validates recorded read versions against current versions and applies staged
 ## writes on success. Returns a CommitResult with status and message.
 proc commit*(db: GlenDB; t: Txn): CommitResult =
+  db.assertWritable()
   var notifications: seq[(Id, Value)] = @[]
   var fieldNotifications: seq[(Id, Value, Value)] = @[]
   # Pre-flight: per-collection dirty budget check (spillable mode only).
@@ -1238,6 +1274,7 @@ proc unsubscribeCollection*(db: GlenDB; h: CollectionSubscriptionHandle) =
 
 ## Batch put: apply multiple upserts under one write lock, batch WAL appends, update indexes and cache.
 proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)]) =
+  db.assertWritable()
   if items.len == 0: return
   type PendingPut = object
     docId: string
@@ -1299,6 +1336,7 @@ proc putMany*(db: GlenDB; collection: string; items: openArray[(string, Value)])
 
 ## Batch delete: delete multiple documents under one write lock, batch WAL appends.
 proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
+  db.assertWritable()
   if docIds.len == 0: return
   type PendingDelete = object
     docId: string
@@ -1359,6 +1397,7 @@ proc deleteMany*(db: GlenDB; collection: string; docIds: openArray[string]) =
 # Snapshot trigger (simple: write all collections)
 ## Write snapshots for all collections to durable storage.
 proc snapshotAll*(db: GlenDB) =
+  db.assertWritable()
   db.acquireAllStripesWrite()
   defer: db.releaseAllStripesWrite()
   acquireRead(db.structLock)
@@ -1375,6 +1414,7 @@ proc snapshotAll*(db: GlenDB) =
 ## Create an equality index on a field path (e.g., "name" or "profile.age").
 ## Persisted in the manifest; auto-rebuilt on reopen.
 proc createIndex*(db: GlenDB; collection: string; name: string; fieldPath: string) =
+  db.assertWritable()
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
   let idx = newIndex(name, fieldPath)
@@ -1395,6 +1435,7 @@ proc createIndex*(db: GlenDB; collection: string; name: string; fieldPath: strin
 
 ## Drop an existing index by name.
 proc dropIndex*(db: GlenDB; collection: string; name: string) =
+  db.assertWritable()
   let cs = db.tryGetCollection(collection)
   if cs.isNil:
     db.removeManifestEntry(ikEq, collection, name); return
@@ -1409,6 +1450,7 @@ proc dropIndex*(db: GlenDB; collection: string; name: string) =
 ## Documents missing either field, or with non-numeric values there, are skipped.
 ## Persisted in the manifest; auto-rebuilt on reopen.
 proc createGeoIndex*(db: GlenDB; collection: string; name: string; lonField, latField: string) =
+  db.assertWritable()
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
   let gix = newGeoIndex(name, lonField, latField)
@@ -1431,6 +1473,7 @@ proc createGeoIndex*(db: GlenDB; collection: string; name: string; lonField, lat
 
 ## Drop a geospatial index by name.
 proc dropGeoIndex*(db: GlenDB; collection: string; name: string) =
+  db.assertWritable()
   let cs = db.tryGetCollection(collection)
   if cs.isNil:
     db.removeManifestEntry(ikGeo, collection, name); return
@@ -1527,6 +1570,7 @@ proc findWithinRadius*(db: GlenDB; collection, indexName: string;
 ## Persisted in the manifest; auto-rebuilt on reopen.
 proc createPolygonIndex*(db: GlenDB; collection: string; name: string;
                          polygonField: string) =
+  db.assertWritable()
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
   let pix = newPolygonIndex(name, polygonField)
@@ -1545,6 +1589,7 @@ proc createPolygonIndex*(db: GlenDB; collection: string; name: string;
 
 ## Drop a polygon index by name.
 proc dropPolygonIndex*(db: GlenDB; collection: string; name: string) =
+  db.assertWritable()
   let cs = db.tryGetCollection(collection)
   if cs.isNil:
     db.removeManifestEntry(ikPoly, collection, name); return
@@ -1562,6 +1607,7 @@ proc dropPolygonIndex*(db: GlenDB; collection: string; name: string) =
 proc createVectorIndex*(db: GlenDB; collection, name, embeddingField: string;
                        dim: int; metric: VectorMetric = vmCosine;
                        M = 16; efConstruction = 200; efSearch = 64) =
+  db.assertWritable()
   doAssert dim > 0
   let cs = db.getOrCreateCollection(collection)
   db.acquireStripeWrite(collection)
@@ -1590,6 +1636,7 @@ proc createVectorIndex*(db: GlenDB; collection, name, embeddingField: string;
 ## manifest entry; the on-disk `.vri` file is left in place (will be
 ## regenerated by the next compact() if the index is recreated).
 proc dropVectorIndex*(db: GlenDB; collection, name: string) =
+  db.assertWritable()
   let cs = db.tryGetCollection(collection)
   if cs.isNil:
     db.removeManifestEntry(ikVector, collection, name); return
@@ -1750,6 +1797,7 @@ proc countDirtyAcrossCollections(db: GlenDB): int =
     result += cs.dirty.len
 
 proc maybeAutoCompact*(db: GlenDB) =
+  if db.readOnly: return
   ## Check the configured auto-compact triggers and run compact() if any of
   ## them has crossed its threshold. Safe to call from any mutation site
   ## *after* the per-collection stripe locks have been released; calling it
@@ -1804,6 +1852,7 @@ proc maybeAutoCompact*(db: GlenDB) =
   db.lastCompactMs.store(nowMillis())
 
 proc compact*(db: GlenDB) =
+  db.assertWritable()
   db.acquireAllStripesWrite()
   defer: db.releaseAllStripesWrite()
   acquireRead(db.structLock)
@@ -1845,7 +1894,7 @@ proc compact*(db: GlenDB) =
 proc close*(db: GlenDB) =
   db.acquireAllStripesWrite()
   defer: db.releaseAllStripesWrite()
-  if db.peersDirty:
+  if not db.readOnly and db.peersDirty:
     db.flushPeersState(force = true)
   acquireRead(db.structLock)
   for _, cs in db.collections:
@@ -1860,6 +1909,7 @@ proc cacheStats*(db: GlenDB): CacheStats =
   db.cache.stats()
 
 proc setWalSync*(db: GlenDB; mode: WalSyncMode; flushEveryBytes = 0) =
+  db.assertWritable()
   db.acquireAllStripesWrite()
   defer: db.releaseAllStripesWrite()
   if db.wal != nil:
@@ -2201,6 +2251,7 @@ proc applyChanges*(db: GlenDB; changes: openArray[ReplChange]) =
   ## Apply a batch of changes from a remote node. Idempotent via changeId; resolves conflicts using HLC (LWW semantics).
   ## Raises ValueError in spillable mode if the batch would push any
   ## collection's dirty set past its maxDirtyDocs cap.
+  db.assertWritable()
   if changes.len == 0: return
   # Pre-flight per-collection dirty budget check
   block:

@@ -171,6 +171,7 @@ type
     dir*:       string
     manifest*:  TileStackManifest
     tiles:      Table[(int, int), TileFile]
+    readOnly*:  bool   ## When true, appendFrame / flush raise.
     lock:       Lock
 
 # Cells per tile — varies for edge tiles.
@@ -505,20 +506,30 @@ const DefaultTileChunkCacheSize* = 16
   ## decoded — 16 slots is ~64 MB worst-case per actively-queried tile.
 
 proc openTileFile(path: string;
-                  cacheSize = DefaultTileChunkCacheSize): TileFile =
+                  cacheSize = DefaultTileChunkCacheSize;
+                  readOnly = false): TileFile =
   ## Open or create a tile file. Scans existing chunk headers, tolerates
   ## torn tail (truncates back to last verified chunk).
+  ##
+  ## With `readOnly = true` the file is opened with `fmRead` only and
+  ## must already exist. The torn-tail truncation step is skipped (we
+  ## just stop scanning at the first bad chunk).
   result = TileFile(path: path, chunks: @[],
                     activeTs: @[], activeData: @[],
                     decodedCache: newChunkCache[int, (seq[int64], seq[seq[float64]])](cacheSize))
   let isNew = not fileExists(path)
-  if isNew:
+  if readOnly:
+    if isNew:
+      raise newException(IOError, "openTileFile(readOnly = true): file does not exist: " & path)
+    result.file = open(path, fmRead)
+  elif isNew:
     let parent = parentDir(path)
     if parent.len > 0 and not dirExists(parent): createDir(parent)
     result.file = open(path, fmReadWrite)
     writeFileHeader(result.file)
     return
-  result.file = open(path, fmReadWriteExisting)
+  else:
+    result.file = open(path, fmReadWriteExisting)
   if not readFileHeader(result.file):
     raise newException(IOError, "tile file " & path & ": bad header")
   var lastGoodEnd = int64(TileFileHdrBytes)
@@ -592,7 +603,15 @@ proc flushTile(s: TileStack; tr, tc: int; tf: TileFile) =
 
 proc getOrOpenTile(s: TileStack; tr, tc: int): TileFile =
   if (tr, tc) in s.tiles: return s.tiles[(tr, tc)]
-  let tf = openTileFile(tileFilePath(s.dir, tr, tc))
+  let path = tileFilePath(s.dir, tr, tc)
+  # In read-only mode, missing tile files (no frames written for that
+  # tile yet) are tolerated as empty.
+  if s.readOnly and not fileExists(path):
+    let tf = TileFile(path: path, chunks: @[], activeTs: @[], activeData: @[],
+                      decodedCache: newChunkCache[int, (seq[int64], seq[seq[float64]])](DefaultTileChunkCacheSize))
+    s.tiles[(tr, tc)] = tf
+    return tf
+  let tf = openTileFile(path, readOnly = s.readOnly)
   s.tiles[(tr, tc)] = tf
   tf
 
@@ -626,12 +645,16 @@ proc newTileStack*(dir: string;
     result = TileStack(dir: dir, manifest: m, tiles: initTable[(int,int), TileFile]())
   initLock(result.lock)
 
-proc openTileStack*(dir: string): TileStack =
+proc openTileStack*(dir: string; readOnly = false): TileStack =
   ## Attach to an existing TileStack. Raises if no manifest exists.
+  ## With `readOnly = true` every tile file is opened with `fmRead` and
+  ## any call to `appendFrame` / `flush` will raise.
   let (ok, m) = readManifest(dir)
   if not ok:
     raise newException(IOError, "TileStack: no valid manifest in " & dir)
-  result = TileStack(dir: dir, manifest: m, tiles: initTable[(int,int), TileFile]())
+  result = TileStack(dir: dir, manifest: m,
+                     tiles: initTable[(int,int), TileFile](),
+                     readOnly: readOnly)
   initLock(result.lock)
 
 proc channelIndex*(s: TileStack; label: string): int =
@@ -664,6 +687,8 @@ proc appendFrame*(s: TileStack; tsMillis: int64; mesh: GeoMesh) =
   ## buffer. Flushes any tile whose buffer reaches chunkSize.
   ##
   ## The mesh must match the TileStack's bbox / dimensions / channels exactly.
+  if s.readOnly:
+    raise newException(IOError, "TileStack is open in read-only mode")
   if mesh.rows != s.manifest.rows or mesh.cols != s.manifest.cols or
      mesh.channels != s.manifest.channels:
     raise newException(ValueError, "appendFrame: mesh shape mismatch")
@@ -812,6 +837,62 @@ proc readFrameRange*(s: TileStack; fromMs, toMs: int64): seq[(int64, GeoMesh)] =
     let (ok, m) = s.readFrame(t)
     if ok: result.add((t, m))
 
+proc sampleAt*(s: TileStack; tsMillis: int64;
+               lon, lat: float64;
+               channel = 0;
+               kind: InterpolationKind = imBilinear): float64 =
+  ## Sample the frame at `tsMillis` at a precise (lon, lat). Uses the
+  ## same `imNearest` / `imBilinear` semantics as `GeoMesh.sampleAt`.
+  ## Returns NaN if no frame exists at `tsMillis`, or if (lon, lat) is
+  ## outside the stack's bbox.
+  ##
+  ## Implementation: decodes the matching frame via `readFrame` then
+  ## delegates to `GeoMesh.sampleAt`. For sub-cell precision in the
+  ## time dimension, sample at two adjacent timestamps and weight; we
+  ## don't currently auto-interpolate across frames (timestamps in a
+  ## tile-stack are usually fixed-cadence model output, not continuous).
+  let (ok, mesh) = s.readFrame(tsMillis)
+  if not ok: return NaN
+  mesh.sampleAt(lon, lat, channel, kind)
+
+proc aggregateInPolygon*(s: TileStack; tsMillis: int64;
+                        polygon: Polygon;
+                        agg: AggregationKind;
+                        channel = 0;
+                        metric = gmPlanar): float64 =
+  ## Reduce all cells of frame `tsMillis` whose centres lie inside
+  ## `polygon` to a single scalar. Returns NaN on missing frame or
+  ## empty selection (returns 0 for `akCount`).
+  let (ok, mesh) = s.readFrame(tsMillis)
+  if not ok:
+    return (if agg == akCount: 0.0 else: NaN)
+  mesh.aggregateInPolygon(polygon, agg, channel, metric)
+
+proc aggregateInPolygonStats*(s: TileStack; tsMillis: int64;
+                              polygon: Polygon;
+                              channel = 0;
+                              metric = gmPlanar): AggregateResult =
+  ## Stats bundle (count, sum, min, max, mean) for the frame at
+  ## `tsMillis` inside `polygon`. Mirrors `GeoMesh.aggregateInPolygonStats`.
+  let (ok, mesh) = s.readFrame(tsMillis)
+  if not ok:
+    return AggregateResult(count: 0, sum: 0.0,
+                           minValue: NaN, maxValue: NaN, mean: NaN)
+  mesh.aggregateInPolygonStats(polygon, channel, metric)
+
+proc aggregateInPolygonRange*(s: TileStack;
+                              fromMs, toMs: int64;
+                              polygon: Polygon;
+                              agg: AggregationKind;
+                              channel = 0;
+                              metric = gmPlanar): seq[(int64, float64)] =
+  ## Time series of polygon aggregates: one (ts, scalar) pair per frame
+  ## in [fromMs, toMs]. The "average rainfall over this watershed,
+  ## hourly, for the last day" pattern.
+  result = @[]
+  for (ts, mesh) in s.readFrameRange(fromMs, toMs):
+    result.add((ts, mesh.aggregateInPolygon(polygon, agg, channel, metric)))
+
 proc readPointHistory*(s: TileStack;
                       lon, lat: float64;
                       fromMs, toMs: int64;
@@ -857,6 +938,7 @@ proc readPointHistory*(s: TileStack;
 
 proc flush*(s: TileStack) =
   ## Force any active per-tile buffers out to disk.
+  if s.readOnly: return
   acquire(s.lock)
   defer: release(s.lock)
   for k, tf in s.tiles:
@@ -869,7 +951,8 @@ proc close*(s: TileStack) =
   defer: release(s.lock)
   for k, tf in s.tiles:
     let (tr, tc) = k
-    flushTile(s, tr, tc, tf)
+    if not s.readOnly:
+      flushTile(s, tr, tc, tf)
     if not tf.file.isNil:
       tf.file.close()
       tf.file = nil

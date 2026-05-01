@@ -123,7 +123,9 @@ mydb/
 ```
 
 Plus when used:
-- `<dir>/<series>.gts` — Gorilla time-series files
+- `<dir>/series/<name>.gts` — Gorilla time-series files
+- `<dir>/series/<name>/<key>.gts` — sharded series; one file per
+  `<timeBucket>__<geoBucket>` key
 - `<stackDir>/manifest.tsm` + `<stackDir>/tile_<r>_<c>.tts` — tile time-stack
 
 See [storage.md](storage.md) for snapshot v3 layout details and
@@ -139,6 +141,7 @@ engines living in their own files but sharing the bit-packing primitives in
 graph TB
   GlenDB[GlenDB - documents]
   TS[glen/timeseries - Gorilla TSDB]
+  SH[glen/sharded - time + geo partitioned series]
   TST[glen/tilestack - tile time-stacks]
   GM[glen/geomesh - bbox-anchored raster]
   LA[glen/linalg - Vector / Matrix]
@@ -146,15 +149,21 @@ graph TB
   Bitpack[glen/bitpack - shared encode/decode]
   TS --> Bitpack
   TST --> Bitpack
+  SH --> TS
 
   GeoMod[glen/geo - R-tree + polygon helpers]
   GlenDB --> GeoMod
   GlenDB --> GM
   GlenDB --> LA
+  SH --> GeoMod
 ```
 
 - **`glen/timeseries`** — one file per series, append-only, Gorilla-encoded.
   See [api/timeseries.md](api/timeseries.md).
+- **`glen/sharded`** — partitions a logical series into many `glen/timeseries`
+  files keyed by time bucket and/or geohash prefix. Used when retention or
+  RAM cost on a single huge file becomes a problem. See
+  [api/timeseries.md#sharded-series--glensharded](api/timeseries.md#sharded-series--glensharded).
 - **`glen/tilestack`** — directory of per-tile files; each tile is an
   append-only Gorilla chunk log. See [api/timeseries.md](api/timeseries.md#tile-time-stacks).
 - **`glen/geomesh`** — value type only; rides inside ordinary documents.
@@ -177,6 +186,7 @@ graph TB
 | `glen/index` | Equality + range index (CritBitTree) |
 | `glen/geo` | R-tree (geo points + polygons), KNN, haversine |
 | `glen/timeseries` | Gorilla scalar TSDB (standalone engine) |
+| `glen/sharded` | Time- and geo-partitioned router over `glen/timeseries` |
 | `glen/tilestack` | Tile time-stack (raster-over-time) (standalone) |
 | `glen/geomesh` | Bbox-anchored raster value type |
 | `glen/linalg` | Vector + Matrix value types and ops |

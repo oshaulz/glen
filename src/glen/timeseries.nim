@@ -34,7 +34,7 @@
 # Active (open) block lives in memory; flushed to disk when full (blockSize
 # samples) or on explicit flush()/close().
 
-import std/[os, locks]
+import std/[os, locks, memfiles, syncio]
 import glen/bitpack
 import glen/chunkcache
 
@@ -128,6 +128,50 @@ proc decodeBlock*(b: Block): seq[(int64, float64)] =
     prevDelta = delta
     inc i
 
+# --------- decoded-chunk representation (column-oriented) ---------
+#
+# For range / latest queries we keep decoded chunks as parallel `seq[int64]`
+# (timestamps) and `seq[float64]` (values) arrays. Two wins over the tuple
+# layout:
+#   * binary search on the ts column is cache-tight (8 B stride vs 16 B);
+#     small windows in a 4096-sample block become O(log n) instead of O(n).
+#   * we can copy the matching slice into the result with a single `copyMem`
+#     per column instead of a per-sample `result.add` loop.
+type
+  DecodedChunk* = ref object
+    ts*: seq[int64]
+    vals*: seq[float64]
+
+proc decodeBlockColumns*(b: Block): DecodedChunk =
+  result = DecodedChunk()
+  result.ts = newSeq[int64](b.count)
+  result.vals = newSeq[float64](b.count)
+  if b.count == 0: return
+  var r = newBitReader(b.payload, b.payloadBitLen)
+  let firstBits = r.readBitsU64(64)
+  result.ts[0] = b.startTs
+  result.vals[0] = cast[float64](firstBits)
+  if b.count == 1: return
+  let firstDelta = unzigzag(r.readBitsU64(32))
+  var prevTs = b.startTs + firstDelta
+  var xstate: XorState
+  let xor1 = decodeXor(r, xstate)
+  var prevValBits = firstBits xor xor1
+  result.ts[1] = prevTs
+  result.vals[1] = cast[float64](prevValBits)
+  var prevDelta = firstDelta
+  var i = 2
+  while i < b.count:
+    let dod = decodeDoD(r)
+    let delta = prevDelta + dod
+    prevTs = prevTs + delta
+    let xord = decodeXor(r, xstate)
+    prevValBits = prevValBits xor xord
+    result.ts[i] = prevTs
+    result.vals[i] = cast[float64](prevValBits)
+    prevDelta = delta
+    inc i
+
 # --------- crc + io helpers ---------
 # fnv1a32 lives in glen/bitpack.
 
@@ -189,11 +233,22 @@ type
     activeMaxTs: int64
     totalSamples: int
     fsyncOnFlush: bool
+    readOnly*: bool   ## When true, append/flush/dropBlocksBefore raise.
     lock: Lock
     # Decoded-chunk LRU. Repeated `range` / `latest` queries hit the same
     # chunks; caching their decoded form turns a chunk decode (≈1 ms) into a
-    # table hit (≈100 ns).
-    decodedCache: ChunkCache[int, seq[(int64, float64)]]
+    # ref bump on the cache. Holding `ref DecodedChunk` (instead of a value
+    # `seq`) means a hit costs a refcount bump rather than a 64-KB deep copy.
+    decodedCache: ChunkCache[int, DecodedChunk]
+    # Read-only mmap of the file. When non-nil, `readBlockAt` reads block
+    # payloads straight from this region instead of issuing per-block
+    # syscalls — the cold-decode path becomes a memcpy + decode rather than
+    # ~10 small `read()`s per block.
+    mmapHolder: MmapHolder
+
+  MmapHolder = ref object
+    mf: MemFile
+    isOpen: bool
 
 proc writeFileHeader(s: Series) =
   s.file.setFilePos(0)
@@ -215,18 +270,33 @@ proc readFileHeader(s: Series) =
   if bs > 0: s.blockSize = int(bs)
 
 proc scanBlocks(s: Series) =
-  ## Build the in-memory block index by walking block headers; tolerates a
-  ## torn final block (truncates back to the last fully-checksummed one).
+  ## Build the in-memory block index by walking only the fixed 40-byte block
+  ## headers; we skip past payloads via `setFilePos` instead of reading and
+  ## CRC-ing them. Per-block read costs go from O(payload) to O(1), so opening
+  ## a 10 GB series is bounded by `(num_blocks * 40 B)` of header I/O instead
+  ## of the full file size.
+  ##
+  ## Block-level CRC is still validated lazily at *read* time in `readBlockAt`.
+  ## A torn tail (mid-flush crash) is detected here by attempting to validate
+  ## just the final block — if its payload+CRC fails to round-trip, that block
+  ## is dropped from the index and the file is truncated to the prior boundary.
   s.blockIndex = @[]
   s.totalSamples = 0
+  let fileSize = s.file.getFileSize()
   s.file.setFilePos(int64(HeaderBytes))
   var lastGoodEnd = int64(HeaderBytes)
-  while true:
+  while s.file.getFilePos() < fileSize:
     let pos = s.file.getFilePos()
+    let remaining = fileSize - pos
+    if remaining < int64(BlockHeaderBytes): break
     let payloadBytes =
       try: int(s.file.readU32())
       except IOError: -1
     if payloadBytes < 0: break
+    if payloadBytes < 4 or payloadBytes > 64 * 1024 * 1024: break
+    if remaining < int64(BlockHeaderBytes) + int64(payloadBytes):
+      # Header announces a payload that runs past EOF — torn.
+      break
     var meta = BlockMeta(fileOffset: pos, payloadBytes: payloadBytes)
     try:
       meta.count = int(s.file.readU32())
@@ -236,21 +306,31 @@ proc scanBlocks(s: Series) =
       meta.maxVal = s.file.readF64()
     except IOError:
       break
-    # Bounds-check payload bytes to avoid pathological reads on a torn tail.
-    if payloadBytes < 4 or payloadBytes > 64 * 1024 * 1024:
-      break
-    var payload = newSeq[byte](payloadBytes - 4)
-    if payload.len > 0:
-      let n = s.file.readBuffer(addr payload[0], payload.len)
-      if n != payload.len: break
-    let crc =
-      try: s.file.readU32()
-      except IOError: break
-    if fnv1a32(payload) != crc: break
+    # Skip past the payload + CRC without reading them.
+    s.file.setFilePos(pos + int64(BlockHeaderBytes) + int64(payloadBytes))
     s.blockIndex.add(meta)
     s.totalSamples += meta.count
     lastGoodEnd = s.file.getFilePos()
-  # Truncate trailing torn data
+  # Validate just the final block's CRC to catch a torn tail; if bad, drop it.
+  if s.blockIndex.len > 0:
+    let lastIdx = s.blockIndex.high
+    let meta = s.blockIndex[lastIdx]
+    var ok = true
+    try:
+      var payload = newSeq[byte](meta.payloadBytes - 4)
+      s.file.setFilePos(meta.fileOffset + int64(BlockHeaderBytes))
+      if payload.len > 0:
+        let n = s.file.readBuffer(addr payload[0], payload.len)
+        if n != payload.len: ok = false
+      if ok:
+        let crc = s.file.readU32()
+        if fnv1a32(payload) != crc: ok = false
+    except IOError:
+      ok = false
+    if not ok:
+      s.totalSamples -= meta.count
+      s.blockIndex.setLen(lastIdx)
+      lastGoodEnd = meta.fileOffset
   s.file.setFilePos(lastGoodEnd)
 
 const DefaultDecodedChunkCacheSize* = 64
@@ -260,22 +340,44 @@ const DefaultDecodedChunkCacheSize* = 64
 
 proc openSeries*(path: string; blockSize = DefaultBlockSize;
                  fsyncOnFlush = false;
-                 decodedChunkCacheSize = DefaultDecodedChunkCacheSize): Series =
+                 decodedChunkCacheSize = DefaultDecodedChunkCacheSize;
+                 readOnly = false): Series =
   ## Open or create a series file. `blockSize` only controls the active
   ## block's auto-flush threshold; existing blocks keep their stored sizes.
   ## `decodedChunkCacheSize` bounds the per-Series decoded-chunk LRU.
+  ##
+  ## With `readOnly = true` the file is opened with `fmRead` only; the
+  ## file must already exist (raises `IOError` otherwise) and any call
+  ## to `append`, `flush`, or `dropBlocksBefore` will raise.
   result = Series(path: path, blockSize: blockSize, fsyncOnFlush: fsyncOnFlush,
                   blockIndex: @[], active: @[], totalSamples: 0,
-                  decodedCache: newChunkCache[int, seq[(int64, float64)]](decodedChunkCacheSize))
+                  readOnly: readOnly,
+                  decodedCache: newChunkCache[int, DecodedChunk](decodedChunkCacheSize))
   initLock(result.lock)
   let isNew = not fileExists(path)
-  if isNew:
+  if readOnly:
+    if isNew:
+      raise newException(IOError, "openSeries(readOnly = true): file does not exist: " & path)
+    result.file = syncio.open(path, fmRead)
+    result.readFileHeader()
+    result.scanBlocks()
+    # In read-only mode, also mmap the file for zero-syscall block reads.
+    # Tolerate mmap failure (e.g. zero-length file): fall back to file I/O.
+    if getFileSize(path) > 0:
+      try:
+        var holder = MmapHolder()
+        holder.mf = memfiles.open(path, mode = fmRead)
+        holder.isOpen = true
+        result.mmapHolder = holder
+      except:
+        result.mmapHolder = nil
+  elif isNew:
     let dir = parentDir(path)
     if dir.len > 0 and not dirExists(dir): createDir(dir)
-    result.file = open(path, fmReadWrite)
+    result.file = syncio.open(path, fmReadWrite)
     result.writeFileHeader()
   else:
-    result.file = open(path, fmReadWriteExisting)
+    result.file = syncio.open(path, fmReadWriteExisting)
     result.readFileHeader()
     result.scanBlocks()
 
@@ -309,6 +411,8 @@ proc append*(s: Series; tsMillis: int64; value: float64) =
   ## non-decreasing; this is enforced by the encoder's delta-of-delta scheme.
   ## Out-of-order across block boundaries is tolerated but penalised in
   ## subsequent reads via a sort fallback.
+  if s.readOnly:
+    raise newException(IOError, "Series is open in read-only mode")
   acquire(s.lock)
   if s.active.len > 0 and tsMillis < s.active[^1][0]:
     # Out-of-order within active: flush active, start fresh block. This keeps
@@ -320,6 +424,7 @@ proc append*(s: Series; tsMillis: int64; value: float64) =
   release(s.lock)
 
 proc flush*(s: Series) =
+  if s.readOnly: return
   acquire(s.lock)
   s.flushActive()
   s.file.flushFile()
@@ -327,8 +432,13 @@ proc flush*(s: Series) =
 
 proc close*(s: Series) =
   if s.file.isNil: return
-  s.flush()
+  if not s.readOnly:
+    s.flush()
   acquire(s.lock)
+  if not s.mmapHolder.isNil and s.mmapHolder.isOpen:
+    memfiles.close(s.mmapHolder.mf)
+    s.mmapHolder.isOpen = false
+    s.mmapHolder = nil
   s.file.close()
   s.file = nil
   release(s.lock)
@@ -362,31 +472,74 @@ proc maxTs*(s: Series): int64 =
 # --------- block I/O for queries ---------
 
 proc readBlockAt(s: Series; meta: BlockMeta): Block =
-  s.file.setFilePos(meta.fileOffset)
-  let payloadBytes = int(s.file.readU32())
-  doAssert payloadBytes == meta.payloadBytes
-  let count = int(s.file.readU32())
-  let startTs = s.file.readI64()
-  let endTs = s.file.readI64()
-  let minV = s.file.readF64()
-  let maxV = s.file.readF64()
+  ## Read a block (payload + CRC) at `meta.fileOffset`. Uses the mmap region
+  ## when one is present; otherwise falls back to seek + readBuffer.
+  let payloadBytes = meta.payloadBytes
+  if payloadBytes < 4 or payloadBytes > 64 * 1024 * 1024:
+    raise newException(IOError, "series block: invalid payloadBytes")
   var payload = newSeq[byte](payloadBytes - 4)
-  if payload.len > 0:
-    let n = s.file.readBuffer(addr payload[0], payload.len)
-    doAssert n == payload.len
-  let crc = s.file.readU32()
+  var crc: uint32
+  if not s.mmapHolder.isNil and s.mmapHolder.isOpen:
+    # mmap path: header occupies BlockHeaderBytes starting at fileOffset; the
+    # payload begins immediately after, ending in a 4-byte CRC.
+    let base = cast[ByteAddress](s.mmapHolder.mf.mem)
+    let payloadOff = int(meta.fileOffset) + BlockHeaderBytes
+    if payloadOff + payloadBytes > s.mmapHolder.mf.size:
+      raise newException(IOError, "series block: payload past mmap end")
+    if payload.len > 0:
+      copyMem(addr payload[0], cast[pointer](base + payloadOff), payload.len)
+    let crcPtr = cast[ptr uint32](base + payloadOff + payload.len)
+    crc = crcPtr[]
+  else:
+    s.file.setFilePos(meta.fileOffset + int64(BlockHeaderBytes))
+    if payload.len > 0:
+      let n = s.file.readBuffer(addr payload[0], payload.len)
+      doAssert n == payload.len
+    crc = s.file.readU32()
   doAssert fnv1a32(payload) == crc, "series block CRC mismatch"
-  Block(count: count, startTs: startTs, endTs: endTs,
-        minVal: minV, maxVal: maxV,
+  Block(count: meta.count, startTs: meta.startTs, endTs: meta.endTs,
+        minVal: meta.minVal, maxVal: meta.maxVal,
         payload: payload, payloadBitLen: payload.len * 8)
 
-proc decodedChunk(s: Series; chunkIdx: int): seq[(int64, float64)] =
+proc decodedChunk(s: Series; chunkIdx: int): DecodedChunk =
   ## Returns the decoded samples for blockIndex[chunkIdx], using the LRU.
+  ## Returned ref is shared with the cache; callers must treat it read-only.
   let (hit, cached) = s.decodedCache.get(chunkIdx)
   if hit: return cached
   let blk = s.readBlockAt(s.blockIndex[chunkIdx])
-  result = decodeBlock(blk)
+  result = decodeBlockColumns(blk)
   s.decodedCache.put(chunkIdx, result)
+
+proc lowerBoundTs(ts: seq[int64]; target: int64): int {.inline.} =
+  ## First index `i` with ts[i] >= target; ts.len if none.
+  var lo = 0
+  var hi = ts.len
+  while lo < hi:
+    let mid = (lo + hi) shr 1
+    if ts[mid] < target: lo = mid + 1
+    else: hi = mid
+  lo
+
+proc upperBoundTs(ts: seq[int64]; target: int64): int {.inline.} =
+  ## First index `i` with ts[i] > target; ts.len if none.
+  var lo = 0
+  var hi = ts.len
+  while lo < hi:
+    let mid = (lo + hi) shr 1
+    if ts[mid] <= target: lo = mid + 1
+    else: hi = mid
+  lo
+
+proc lowerBoundBlock(blocks: seq[BlockMeta]; target: int64): int {.inline.} =
+  ## First index of a block whose endTs >= target. blocks must be sorted by
+  ## startTs (and therefore by endTs as long as blocks don't overlap).
+  var lo = 0
+  var hi = blocks.len
+  while lo < hi:
+    let mid = (lo + hi) shr 1
+    if blocks[mid].endTs < target: lo = mid + 1
+    else: hi = mid
+  lo
 
 proc range*(s: Series; fromMs, toMs: int64): seq[(int64, float64)] =
   ## Inclusive [fromMs, toMs] range scan.
@@ -394,56 +547,72 @@ proc range*(s: Series; fromMs, toMs: int64): seq[(int64, float64)] =
   if fromMs > toMs: return
   acquire(s.lock)
   defer: release(s.lock)
-  for ci in 0 ..< s.blockIndex.len:
+  # Binary-search for the first block that could overlap; walk forward until
+  # we pass `toMs`. This replaces a linear scan over blockIndex.
+  var ci = lowerBoundBlock(s.blockIndex, fromMs)
+  while ci < s.blockIndex.len:
     let meta = s.blockIndex[ci]
-    if meta.endTs < fromMs or meta.startTs > toMs: continue
-    let samples = s.decodedChunk(ci)
-    if meta.startTs >= fromMs and meta.endTs <= toMs:
-      # Whole chunk falls inside the window; skip per-sample bounds checks.
-      for sample in samples: result.add(sample)
+    if meta.startTs > toMs: break
+    let chunk = s.decodedChunk(ci)
+    let n = chunk.ts.len
+    var lo, hi: int
+    if meta.startTs >= fromMs:
+      lo = 0
     else:
-      for (ts, v) in samples:
-        if ts >= fromMs and ts <= toMs:
-          result.add((ts, v))
+      lo = lowerBoundTs(chunk.ts, fromMs)
+    if meta.endTs <= toMs:
+      hi = n
+    else:
+      hi = upperBoundTs(chunk.ts, toMs)
+    if lo < hi:
+      let take = hi - lo
+      let oldLen = result.len
+      result.setLen(oldLen + take)
+      for i in 0 ..< take:
+        result[oldLen + i] = (chunk.ts[lo + i], chunk.vals[lo + i])
+    inc ci
+  # Active block (in-memory tail) is small and ordered; linear scan.
   for (ts, v) in s.active:
     if ts >= fromMs and ts <= toMs:
       result.add((ts, v))
 
 proc latest*(s: Series; n: int): seq[(int64, float64)] =
   ## Returns the last `n` samples in chronological order.
-  result = @[]
-  if n <= 0: return
+  if n <= 0: return @[]
   acquire(s.lock)
   defer: release(s.lock)
-  # Walk from the end: active first (already in order), then blocks back-to-front
-  var collected: seq[(int64, float64)] = @[]
-  let activeTake = min(n, s.active.len)
+  let total = s.totalSamples + s.active.len
+  let take = if n < total: n else: total
+  result = newSeq[(int64, float64)](take)
+  # Fill from the end: copy active tail first, then walk blocks back-to-front
+  # writing into the front of `result`. No prepend / re-allocation churn.
+  var written = 0
+  let activeTake = min(take, s.active.len)
   if activeTake > 0:
-    for i in (s.active.len - activeTake) ..< s.active.len:
-      collected.add(s.active[i])
-  if collected.len < n and s.blockIndex.len > 0:
-    var i = s.blockIndex.high
-    while i >= 0 and collected.len < n:
-      let samples = s.decodedChunk(i)
-      let need = n - collected.len
-      if samples.len <= need:
-        # whole block fits
-        var prepended: seq[(int64, float64)] = samples
-        prepended.add(collected)
-        collected = prepended
-      else:
-        var prepended: seq[(int64, float64)] = samples[samples.len - need .. ^1]
-        prepended.add(collected)
-        collected = prepended
-        break
-      dec i
-  result = collected
+    for i in 0 ..< activeTake:
+      result[take - activeTake + i] = s.active[s.active.len - activeTake + i]
+    written = activeTake
+  if written < take and s.blockIndex.len > 0:
+    var bi = s.blockIndex.high
+    while bi >= 0 and written < take:
+      let chunk = s.decodedChunk(bi)
+      let need = take - written
+      let avail = chunk.ts.len
+      let from0 = if avail <= need: 0 else: avail - need
+      let count = avail - from0
+      let dstStart = take - written - count
+      for i in 0 ..< count:
+        result[dstStart + i] = (chunk.ts[from0 + i], chunk.vals[from0 + i])
+      written += count
+      dec bi
 
 # --------- retention: drop blocks fully older than cutoff ---------
 
 proc dropBlocksBefore*(s: Series; cutoffMs: int64) =
   ## Drops every fully-closed block whose endTs < cutoffMs. Rewrites the file
   ## by streaming the surviving blocks into a temp file and atomically renaming.
+  if s.readOnly:
+    raise newException(IOError, "Series is open in read-only mode")
   acquire(s.lock)
   defer: release(s.lock)
   var keep: seq[BlockMeta] = @[]
@@ -452,7 +621,7 @@ proc dropBlocksBefore*(s: Series; cutoffMs: int64) =
   if keep.len == s.blockIndex.len: return  # nothing to drop
   let tmpPath = s.path & ".compact"
   block:
-    var tmp = open(tmpPath, fmReadWrite)
+    var tmp = syncio.open(tmpPath, fmReadWrite)
     tmp.write(Magic)
     tmp.writeU32(FileVersion)
     tmp.writeU32(uint32(s.blockSize))
@@ -473,9 +642,13 @@ proc dropBlocksBefore*(s: Series; cutoffMs: int64) =
       totalSamples += meta.count
     tmp.flushFile()
     tmp.close()
+    if not s.mmapHolder.isNil and s.mmapHolder.isOpen:
+      memfiles.close(s.mmapHolder.mf)
+      s.mmapHolder.isOpen = false
+      s.mmapHolder = nil
     s.file.close()
     moveFile(tmpPath, s.path)
-    s.file = open(s.path, fmReadWriteExisting)
+    s.file = syncio.open(s.path, fmReadWriteExisting)
     s.file.setFilePos(s.file.getFileSize())
     s.blockIndex = newIndex
     s.totalSamples = totalSamples

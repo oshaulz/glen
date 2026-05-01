@@ -40,8 +40,9 @@ import glen/timeseries
 import glen/tilestack
 import glen/geomesh
 import glen/vectorindex
+import glen/sharded
 
-export timeseries, tilestack
+export timeseries, tilestack, sharded
 # Re-export GeoMesh + BBox + Polygon + GeoMetric so users importing
 # `glen/dsl` don't need extra imports for the proxy procs below.
 export geo.bbox, geo.Polygon, geo.GeoMetric
@@ -67,15 +68,34 @@ proc tilesPath*(db: glendb.GlenDB; name: string): string {.inline.} =
 
 proc series*(db: glendb.GlenDB; name: string;
              blockSize = DefaultBlockSize;
-             fsyncOnFlush = false): Series =
+             fsyncOnFlush = false;
+             decodedChunkCacheSize = DefaultDecodedChunkCacheSize): Series =
   ## Open or create the named series under `<db.dir>/series/<name>.gts`.
   ## Caller owns the returned handle and must call `.close()` (or use
   ## `withSeries`). Opening the same name twice concurrently is unsafe —
   ## reuse the same handle across the program.
+  ##
+  ## Inherits the parent DB's read-only flag: if `db` was opened with
+  ## `readOnly = true`, the series is opened with `fmRead` and any
+  ## append/flush call raises.
+  ##
+  ## `decodedChunkCacheSize` bounds the per-Series LRU of decoded
+  ## chunks. Default keeps repeat-window queries hot in memory at the
+  ## cost of ~4 MB per actively-queried series; pass `1` for the
+  ## smallest-possible cache (still keeps the most-recent chunk hot,
+  ## but evicts on every new chunk — good for one-pass scans or
+  ## many-cold-series workloads). Must be ≥ 1.
   let path = seriesPath(db, name)
+  if db.readOnly:
+    return openSeries(path, blockSize = blockSize,
+                      fsyncOnFlush = fsyncOnFlush,
+                      decodedChunkCacheSize = decodedChunkCacheSize,
+                      readOnly = true)
   let dir = parentDir(path)
   if dir.len > 0 and not dirExists(dir): createDir(dir)
-  openSeries(path, blockSize = blockSize, fsyncOnFlush = fsyncOnFlush)
+  openSeries(path, blockSize = blockSize,
+             fsyncOnFlush = fsyncOnFlush,
+             decodedChunkCacheSize = decodedChunkCacheSize)
 
 proc seriesExists*(db: glendb.GlenDB; name: string): bool {.inline.} =
   fileExists(seriesPath(db, name))
@@ -86,6 +106,41 @@ template withSeries*(db: glendb.GlenDB; name: string;
   ## flush + close on the way out (even on exception).
   block:
     let s {.inject.} = series(db, name)
+    try:
+      body
+    finally:
+      s.close()
+
+# ---- ShardedSeries -------------------------------------------------------
+
+proc shardedSeries*(db: glendb.GlenDB; name: string;
+                    policy: ShardingPolicy;
+                    blockSize = DefaultBlockSize;
+                    fsyncOnFlush = false;
+                    decodedChunkCacheSize = DefaultDecodedChunkCacheSize;
+                    maxOpenShards = DefaultMaxOpenShards): ShardedSeries =
+  ## Open or create a sharded series at `<db.dir>/series/<name>/`. Each
+  ## shard inside is a regular `.gts` file routed by `policy` (time bucket
+  ## and/or geohash). Inherits the parent DB's read-only flag.
+  ##
+  ## Use this instead of `db.series` when you want O(1) retention
+  ## (`dropBefore` removes whole files) or geo-bbox-restricted scans
+  ## (`rangeIn`). Single-series workloads should keep using `db.series`.
+  let dir = db.dir / SeriesSubdir / name
+  if not db.readOnly:
+    if not dirExists(dir): createDir(dir)
+  openShardedSeries(dir, policy,
+                    blockSize = blockSize,
+                    fsyncOnFlush = fsyncOnFlush,
+                    decodedChunkCacheSize = decodedChunkCacheSize,
+                    readOnly = db.readOnly,
+                    maxOpenShards = maxOpenShards)
+
+template withShardedSeries*(db: glendb.GlenDB; name: string;
+                            policy: ShardingPolicy;
+                            body: untyped): untyped =
+  block:
+    let s {.inject.} = shardedSeries(db, name, policy)
     try:
       body
     finally:
@@ -102,6 +157,13 @@ proc tiles*(db: glendb.GlenDB; name: string;
   ## If a manifest already exists it must match the provided dimensions;
   ## otherwise a new manifest is written. To attach to an existing stack
   ## without specifying dimensions, use `openTiles`.
+  ##
+  ## Raises `IOError` if `db` is read-only and the tile-stack doesn't
+  ## already exist (no manifest can be written). For attaching to an
+  ## existing stack on a read-only DB, use `openTiles`.
+  if db.readOnly:
+    raise newException(IOError,
+      "tiles(): cannot create a tile-stack on a read-only db; use openTiles to attach")
   let dir = tilesPath(db, name)
   let parent = parentDir(dir)
   if parent.len > 0 and not dirExists(parent): createDir(parent)
@@ -110,8 +172,9 @@ proc tiles*(db: glendb.GlenDB; name: string;
 
 proc openTiles*(db: glendb.GlenDB; name: string): TileStack =
   ## Attach to an existing tile-stack. Raises `IOError` if no manifest is
-  ## present at `<db.dir>/tiles/<name>/`.
-  openTileStack(tilesPath(db, name))
+  ## present at `<db.dir>/tiles/<name>/`. Inherits the parent DB's
+  ## read-only flag.
+  openTileStack(tilesPath(db, name), readOnly = db.readOnly)
 
 proc tilesExists*(db: glendb.GlenDB; name: string): bool {.inline.} =
   fileExists(tilesPath(db, name) / "manifest.tsm")

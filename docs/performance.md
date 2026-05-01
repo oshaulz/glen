@@ -117,22 +117,58 @@ Gorilla scalar TSDB, 1M samples per series:
 
 | Value pattern | Append rate | Bits/sample on disk |
 |---|---|---|
-| Constant | **77M samples/s** | 2.11 |
-| Regular cadence | **29.4M samples/s** | 14.13 |
-| Smooth (sin) | 4.63M samples/s | 59.60 |
-| Noisy | 4.72M samples/s | 59.28 |
+| Constant | **83M samples/s** | 2.11 |
+| Regular cadence | **43M samples/s** | 14.13 |
+| Smooth (sin) | **23M samples/s** | 59.60 |
+| Noisy | **23M samples/s** | 59.28 |
+
+The 4–5× lift on smooth/noisy data comes from a register-aware
+`writeBitsU64` that packs whole bytes per call instead of looping bit-by-bit
+through `writeBit`.
 
 ```
-open (scan all chunk headers):  10 ms for 1M-sample file
-range (random window):          7.9k q/s    (avg 550 samples returned)  ← was 1.3k pre-bitpack
-latest n=100:                   833k q/s
-latest n=1000:                  107k q/s
+open  (1M-sample file, 1.7 MB):   <1 ms
+open  (10M-sample file, 17 MB):    2 ms
+range (random window):           ~10k q/s   (avg 550 samples returned)
+range (warm, RW default cache):  >995k q/s  (100-sample windows, RO/RW bench)
+range (warm, RO + mmap):         >1.0M q/s
+latest n=100:                     ~5.6M q/s
+latest n=1000:                    ~877k q/s
 ```
 
-The **6.3× boost on `range`** vs the pre-bitpack baseline comes from the
-batched 64-bit `BitReader` + hardware `clz`/`ctz` (`__builtin_clzll` /
-`__builtin_ctzll`) replacing scalar bit-shift loops. See
-[storage.md](storage.md#bit-decode-hot-path).
+The headline range-query lift comes from three changes that landed
+together:
+
+* `scanBlocks` walks just the 40-byte block headers instead of CRC-ing
+  every payload — a 10 GB series opens in seconds (the rest of the per-
+  block work moves to read time in `readBlockAt`).
+* The decoded-chunk LRU stores `ref DecodedChunk` (parallel
+  `seq[int64]` / `seq[float64]`) — a hit is a refcount bump rather than
+  a 64 KB deep copy. Within-chunk lookups binary-search the timestamp
+  column.
+* Read-only series additionally `mmap` the file; per-block reads are
+  `copyMem` from the mapped region, no syscalls.
+
+Sharded time-series (`glen/sharded`, time-bucketed by day):
+
+```
+append (100 samples/day × 365 days, daily shards):  ~580k samples/s
+                                                    (365 shards on disk)
+dropBefore (60 days × 1000/day, drop 59 days):      ~3 ms total
+                                                    (constant-time per shard:
+                                                     close handle + removeFile)
+```
+
+Sharded retention scales with **shard count**, not file size. The
+equivalent monolithic `dropBlocksBefore` is bounded by the surviving
+data volume — fast on small files, painful at 10 GB. The append rate is
+lower than monolithic because each shard takes a separate file flush;
+batches that stay within one shard see throughput closer to the
+monolithic numbers.
+
+`rangeIn(bbox, t0, t1)` only opens shards whose geohash cell intersects
+the bbox **and** whose time bucket overlaps `[t0, t1]`, so query cost
+scales with the queried slice, not the archive.
 
 Tile time-stack — append, warm-cache reads (default `fillRadarFrame`):
 
@@ -204,6 +240,7 @@ Layout details, threshold knobs, and back-compat in
 |---|---|
 | Heterogeneous documents | `glen/db` (core) |
 | Single-stream metric / sensor / float values | `glen/timeseries` (Gorilla) |
+| Multi-billion-sample stream with retention or bbox filters | `glen/sharded` (time + geo partitioning) |
 | Dense raster pinned to a bbox | `glen/geomesh` (in a doc) |
 | Raster that evolves through time (radar / weather) | `glen/tilestack` |
 | Embeddings (per-doc field) | `glen/linalg` (Vector inside a doc) |
@@ -241,6 +278,13 @@ and `tests/test_snapshot_v4.nim`, both part of `nimble test`.
 - **TSDB block format extension to use Simple-8b for timestamps** — the
   codec exists and is wired into `tilestack`; TSDB blocks still use the
   legacy interleaved DoD-and-XOR layout, which would need restructuring.
+- **Persistent block-index sidecar for `glen/timeseries`** — `scanBlocks`
+  now walks only headers (cheap), but a `<name>.gtx` index dumped on
+  flush would skip even that on open. Useful for billion-sample series
+  that are reopened often.
+- **Sharded `latest(n)` / iteration helpers** — `glen/sharded` exposes
+  `range` / `rangeIn` / `dropBefore` but not `latest` or `items`; today
+  callers fan out manually via `shardKeysOnDisk()`.
 
 None of these are blockers for current workloads; they're constant-factor
 improvements where you'd notice.

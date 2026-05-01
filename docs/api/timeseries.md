@@ -1,14 +1,19 @@
-# Time-series API — `glen/timeseries`, `glen/tilestack`
+# Time-series API — `glen/timeseries`, `glen/sharded`, `glen/tilestack`
 
-Two standalone storage engines optimized for very different workloads:
+Three storage engines optimized for different workloads:
 
 - **`glen/timeseries`** — **single scalar stream** per file. Write a flood of
   `(timestamp, float64)` per second; query by time window. Gorilla-encoded.
+- **`glen/sharded`** — a logical series **partitioned across many files** by
+  time bucket (hour / day / month / …) and/or geohash prefix. Same per-shard
+  format as `glen/timeseries`; adds O(1) retention and bbox-restricted
+  scans. Use this once a single series gets big enough that whole-file
+  rewrites or a giant block index start to hurt.
 - **`glen/tilestack`** — **2-D raster that evolves through time**. Write a
   full mesh per frame; query by frame, by time window, or by single cell
   history. Gorilla-encoded per cell.
 
-Both share the bit-packing primitives in `glen/bitpack` (delta-of-delta
+All three share the bit-packing primitives in `glen/bitpack` (delta-of-delta
 timestamps, XOR float encoding) and use a decoded-chunk LRU
 (`glen/chunkcache`) on the read path.
 
@@ -102,9 +107,140 @@ bits/sample is typical.
 
 ### Reopen / torn tail
 
-`openSeries` scans block headers, validates each chunk's CRC, and stops at
-the first invalid one. Trailing torn data (mid-flush crash) is silently
-truncated; new appends replace it.
+`openSeries` walks just the 40-byte block headers — payloads are not read,
+not CRC-checked. The final block's CRC is verified to detect a torn tail
+(mid-flush crash); if it fails, that block is dropped from the index and
+the file truncated to the prior boundary. Per-block CRC validation is
+deferred to read time in `readBlockAt`. As a result open is bounded by
+`(num_blocks × 40 B)` of header I/O — a 10 GB series opens in seconds, not
+minutes.
+
+## Sharded series — `glen/sharded`
+
+Use case: a logical series that grows past what a single file should hold.
+Two pain points:
+
+1. **Retention at scale.** `dropBlocksBefore` on a 10 GB monolithic series
+   rewrites the whole file. With a daily time shard, dropping yesterday is
+   one `removeFile` — O(1) instead of O(file size).
+2. **Open / RAM cost on huge series.** A nine-billion-sample monolithic
+   series carries a ~130 MB block index in process memory. Daily shards
+   keep each in-memory index small; a bounded LRU of open shard handles
+   means cold shards stay closed.
+
+Optional **geographic sharding** (geohash prefix or a custom `(lon, lat)
+→ key` function) further restricts query fan-out — a bbox-bounded `range`
+only opens shards whose geohash cell intersects the box.
+
+### Open
+
+```nim
+import glen/sharded
+# Time-only: one file per day.
+let p = tbDayPolicy()
+# Geo + time: one file per (geohash-prefix-4, day) — ~20 km cells × daily.
+let pg = geoTimePolicy(tbDay, geohashPrecision = 4)
+
+let s = openShardedSeries(rootDir, pg,
+                          blockSize = 4096,
+                          fsyncOnFlush = false,
+                          decodedChunkCacheSize = 64,
+                          maxOpenShards = 64)
+```
+
+Or via the DB proxy:
+
+```nim
+import glen/dsl
+let s = db.shardedSeries("temps", geoTimePolicy(tbDay, geohashPrecision = 4))
+```
+
+### Append
+
+```nim
+# Time-only policy:
+s.append(tsMillis, value)
+
+# Policies with a geo dimension require coords:
+s.appendAt(tsMillis, lon, lat, value)
+```
+
+Appending the wrong flavour for the policy raises `ValueError`.
+
+### Query
+
+```nim
+# All samples in a time window, fanned out across overlapping shards.
+for (ts, v) in s.range(fromMs, toMs): use(ts, v)
+
+# Bbox-restricted: only shards whose geo cell intersects `bbox` are opened.
+for (ts, v) in s.rangeIn(bbox(-74.1, 40.6, -73.8, 40.9), fromMs, toMs):
+  use(ts, v)
+
+# Inspect:
+let keys = s.shardKeysOnDisk()    # ["2026-04-15__9q5b", ...]
+echo s.len                        # total samples across all shards
+```
+
+Results from `range` / `rangeIn` are sorted by timestamp even when they
+come from many shards.
+
+### Retention
+
+```nim
+let removed = s.dropBefore(nowMillis() - 30 * 86_400_000)
+```
+
+Closes any open handle and `removeFile`s every shard whose time bucket
+ends strictly before the cutoff. Constant-time per shard regardless of
+file size. Time-less policies (`tbNone`) return 0 — fall back to per-shard
+`dropBlocksBefore` if you need that.
+
+### Sharding policies
+
+| Time bucket | Key example |
+|---|---|
+| `tbNone` | `""` (no time dimension) |
+| `tbHour` | `2026-04-15-13` |
+| `tbDay` | `2026-04-15` |
+| `tbWeek` | `w0002912` (weeks since unix epoch) |
+| `tbMonth` | `2026-04` |
+| `tbYear` | `2026` |
+| `tbCustomMs` | `c0000000000000060000` (1-minute buckets) |
+
+| Geo bucket | Key example |
+|---|---|
+| `gbNone` | `""` (no geo dimension) |
+| `gbGeohash`, precision 4 | `9q5b` |
+| `gbCustom` | caller-supplied `(lon, lat) → string` |
+
+At least one dimension must be active. Combined keys are written as
+`<timeKey>__<geoKey>` to flat files under `<rootDir>/`.
+
+For `gbCustom` to work with `rangeIn`, supply
+`policy.customGeoCellsInBBox(b: BBox) → seq[string]` so the shard manager
+can enumerate candidate cells without reading every file.
+
+### Disk layout
+
+```
+<rootDir>/
+├── 2026-04-15__9q5b.gts
+├── 2026-04-15__dr5r.gts
+├── 2026-04-16__9q5b.gts
+└── …
+```
+
+Each `.gts` file is a regular `glen/timeseries` file — same format,
+same primitives. The sharded layer is a thin router on top.
+
+### Tuning
+
+| Param | Default | Notes |
+|---|---|---|
+| `maxOpenShards` | 64 | Bounded LRU of open `Series` handles. Bump for high-fan-out queries; cut to keep file-descriptor pressure low |
+| `decodedChunkCacheSize` | 64 | Passed through to each opened shard |
+| `geohashPrecision` | — | 4 ≈ 20 km, 5 ≈ 5 km, 6 ≈ 1.2 km. Higher precision = more shard files; choose proportional to query selectivity |
 
 ## Tile time-stacks
 
@@ -233,19 +369,28 @@ that pairs with both patterns.
 
 ## Caching
 
-Both engines back their reads with a decoded-chunk LRU (`glen/chunkcache`).
-Repeated queries that hit the same chunks reuse the decoded form instead of
-re-running the bit-unpacking loop:
+All three engines back their reads with a decoded-chunk LRU
+(`glen/chunkcache`). Repeated queries that hit the same chunks reuse the
+decoded form instead of re-running the bit-unpacking loop. For
+`glen/timeseries`, the cache stores `ref DecodedChunk` (parallel
+`seq[int64]` / `seq[float64]`) so a hit is a refcount bump, not a deep
+copy of the chunk; within-chunk lookups binary-search the timestamp
+column.
 
 | Workload | Speedup vs no cache |
 |---|---|
-| `series.latest n=100` | ~60× |
-| `series.latest n=1000` | ~115× |
+| `series.range` (warm, 100-sample window) | **~110×** |
+| `series.latest n=100` | ~5M q/s sustained |
+| `series.latest n=1000` | ~880k q/s sustained |
 | `tilestack.readPointHistory` (200×200) | ~5× |
 | `tilestack.readFrame` (200×200) | ~4× |
 
-Tunable via `decodedChunkCacheSize` (timeseries) and `cacheSize` arg to
-`openTileFile` (tilestack — exposed indirectly via the default).
+For sharded series the same cache is configured per opened shard and
+shared via the bounded shard-handle LRU (`maxOpenShards`).
+
+Tunable via `decodedChunkCacheSize` (timeseries / sharded) and the
+`cacheSize` arg to `openTileFile` (tilestack — exposed indirectly via the
+default).
 
 ## See also
 

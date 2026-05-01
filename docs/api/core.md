@@ -27,12 +27,13 @@ proc newGlenDB*(dir: string;
                 maxDirtyDocs = 0;
                 compactWalBytes = 0;
                 compactIntervalMs = 0;
-                compactDirtyCount = 0): GlenDB
+                compactDirtyCount = 0;
+                readOnly = false): GlenDB
 ```
 
 | Arg | Default | Notes |
 |---|---|---|
-| `dir` | — | directory; created if absent |
+| `dir` | — | directory; created if absent (read-only mode does not create) |
 | `cacheCapacity` | 64 MiB | total LRU byte budget |
 | `cacheShards` | 16 | LRU shard count (per-shard locks) |
 | `walSync` | `wsmInterval` | `wsmAlways` / `wsmInterval` / `wsmNone` |
@@ -44,6 +45,57 @@ proc newGlenDB*(dir: string;
 | `compactWalBytes` | 0 | auto-compact when WAL total ≥ N bytes (`0` = off) |
 | `compactIntervalMs` | 0 | auto-compact when ≥ N ms since last compact (`0` = off) |
 | `compactDirtyCount` | 0 | auto-compact when summed `cs.dirty.len` ≥ N (`0` = off; spill-mode only) |
+| `readOnly` | `false` | open in no-write mode — see [Read-only mode](#read-only-mode) below |
+
+### Read-only mode
+
+Pass `readOnly = true` to open a Glen directory without taking a writable
+WAL handle, without writing any files (no `node.id`, no `peers.state`),
+and with every mutating entry point gated to raise `IOError`.
+
+```nim
+let db = newGlenDB("/data/snapshot", readOnly = true)
+echo db.get("users", "u1")          # works
+discard db.put(...)                 # raises IOError
+db.close()
+```
+
+What's gated to `IOError`:
+
+- `put`, `delete`, `putMany`, `deleteMany`
+- `commit`, `applyChanges`
+- `createIndex` / `dropIndex` and the geo / polygon / vector variants
+- `snapshotAll`, `compact`, `setWalSync`
+- `setPeerCursor`, `gcReplLog`, `ensureCollection`
+
+What still works:
+
+- All reads, queries, and the streaming iterators (including
+  `getBorrowedAllStream`, `findInBBox`, `findNearestVector`, etc.)
+- All DSL constructs that don't mutate (`query:`, `select:`, `count:`,
+  geo / vector proxies, `liveQuery` against existing data)
+- Subscriptions can be registered (no events fire because no writes
+  happen, but they don't crash)
+- `isReadOnly(db)` returns the flag for runtime checks
+
+Use cases:
+
+- **Multiple processes attaching to the same dataset.** A read-write
+  Glen takes an append handle on the WAL; opening a second read-write
+  handle on the same dir would interleave WAL writes. Read-only opens
+  take no exclusive resources and can be opened arbitrarily many times
+  in parallel.
+- **Compute-platform-style sandboxes.** Mount a shared dataset
+  read-only, run user code against it, results go elsewhere. The
+  read-only flag guarantees user code can't accidentally corrupt the
+  shared state.
+- **Defensive opens.** When you know a piece of code shouldn't be
+  writing, the read-only flag turns "shouldn't" into a runtime check.
+
+Performance: open time and scan throughput are roughly equivalent to
+read-write. Random `get` is consistently faster on read-only handles
+because the read path skips per-call WAL/lock bookkeeping. See
+`tests/test_bench_readonly.nim` (`nimble bench_readonly`).
 
 ### Auto-compaction triggers
 

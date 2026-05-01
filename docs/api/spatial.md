@@ -237,9 +237,43 @@ vectorAt(m, lon, lat): Vector
 cellVector(m, row, col): Vector
 channelIndex(m, label: string): int     # -1 if not labelled
 
+# Interpolation
+sampleAt(m, lon, lat, channel = 0, kind = imBilinear): float64
+# `imNearest` (= valueAt) or `imBilinear` (4-cell weighted average).
+# Use bilinear for continuous fields — temperature, pressure, wind,
+# precipitation. Returns NaN out of bounds.
+
+# Polygon aggregation
+aggregateInPolygon(m, polygon, agg, channel = 0, metric = gmPlanar): float64
+# `agg ∈ {akMean, akMin, akMax, akSum, akCount}`. Cells whose centre
+# is inside `polygon` contribute. With `metric = gmGeographic`, edges
+# are great-circle arcs.
+aggregateInPolygonStats(m, polygon, channel = 0, metric = gmPlanar): AggregateResult
+# Bundle of (count, sum, minValue, maxValue, mean) — one pass over
+# the cells, all stats in one shot.
+
 toValue(m): Value
 readGeoMesh(v: Value): (bool, GeoMesh)
 ```
+
+#### TileStack point-and-region queries
+
+The same `sampleAt` / `aggregateInPolygon` shapes work on a
+`TileStack`, scoped to a specific frame timestamp:
+
+```nim
+sampleAt(stack, tsMillis, lon, lat, channel = 0, kind = imBilinear): float64
+aggregateInPolygon(stack, tsMillis, polygon, agg, channel = 0, metric = gmPlanar): float64
+aggregateInPolygonStats(stack, tsMillis, polygon, channel = 0, metric = gmPlanar): AggregateResult
+
+# Time series of polygon aggregates — one (ts, scalar) per frame in [t0, t1].
+aggregateInPolygonRange(stack, fromMs, toMs, polygon, agg, channel = 0, metric = gmPlanar): seq[(int64, float64)]
+```
+
+These decode the relevant frame and delegate to the GeoMesh procs, so
+they have the same bilinear / great-circle behaviour. For a series of
+*point* values over time, `readPointHistory` is more efficient — it
+only decodes the single tile owning the query point.
 
 ## Index persistence
 
@@ -288,7 +322,7 @@ interior (right-hand rule with the normal pointing out of the sphere).
 - **No native geographic projections** beyond the haversine path metric.
   Coords are interpreted as `(lon, lat)` degrees in WGS84-ish.
 - **No 3D / N-D**. Strictly 2D.
-- **No bilinear interpolation** in `GeoMesh.sampleAt` — nearest cell only.
+- **No bicubic interpolation** in `GeoMesh.sampleAt` — only nearest and bilinear.
 - **No polygon-polygon intersection**. `findPolygonsIntersecting` is bbox-level.
 - **No vector index** (HNSW / IVF). Use linear scan + cosine for now (see
   [api/numeric.md](numeric.md)).

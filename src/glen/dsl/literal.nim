@@ -51,6 +51,13 @@ proc buildValueExpr(node: NimNode): NimNode =
   ## Falls back to `toValue(expr)` for anything we don't recognise as a
   ## structural literal.
   case node.kind
+  of nnkCurly:
+    # `{}` is an empty curly that Nim parses as a set literal — for the
+    # `%*` shape it just means "empty object". A non-empty curly with
+    # `{k: v}` parses as nnkTableConstr instead, handled below.
+    if node.len > 0:
+      error("%*: non-empty `{...}` must use `key: value` pairs", node)
+    result = newCall(bindSym"VObject")
   of nnkTableConstr:
     # {"k": v, ...} → VObject() with assignments
     let objSym = genSym(nskVar, "vobj")

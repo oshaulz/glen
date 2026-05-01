@@ -87,6 +87,77 @@ proc valueAt*(m: GeoMesh; lon, lat: float64; channel = 0): float64 =
   if not ok: return NaN
   m.data[(row * m.cols + col) * m.channels + channel]
 
+# --------- Interpolation ---------
+
+type
+  InterpolationKind* = enum
+    imNearest    ## Pick the cell containing (lon, lat). Cheapest, but
+                 ## piecewise-constant — wrong for continuous fields.
+    imBilinear   ## 4-cell weighted average. Standard for continuous
+                 ## quantities (temperature, pressure, wind speed).
+
+proc cellAtFractional(m: GeoMesh; lon, lat: float64): (bool, float64, float64) =
+  ## Returns (inBounds, fracRow, fracCol) where the integer parts are
+  ## the cell indices and fractional parts are the offset *within* the
+  ## cell from its top-left corner. Used by bilinear sampling.
+  if m.rows == 0 or m.cols == 0: return (false, 0.0, 0.0)
+  if lon < m.bbox.minX or lon > m.bbox.maxX or
+     lat < m.bbox.minY or lat > m.bbox.maxY: return (false, 0.0, 0.0)
+  let widthX = m.bbox.maxX - m.bbox.minX
+  let widthY = m.bbox.maxY - m.bbox.minY
+  if widthX <= 0.0 or widthY <= 0.0: return (false, 0.0, 0.0)
+  let fx = (lon - m.bbox.minX) / widthX            # [0..1]
+  let fy = (m.bbox.maxY - lat) / widthY            # [0..1]; row 0 == top
+  (true, fy * float64(m.rows), fx * float64(m.cols))
+
+proc sampleAt*(m: GeoMesh; lon, lat: float64;
+               channel = 0;
+               kind: InterpolationKind = imBilinear): float64 =
+  ## Sample the mesh at a precise (lon, lat). With `imNearest` this is
+  ## equivalent to `valueAt`. With `imBilinear` (the default) it returns
+  ## the bilinear weighted average of the 4 surrounding cell centres —
+  ## the right thing for continuous fields like temperature, pressure,
+  ## wind, or precipitation.
+  ##
+  ## Returns NaN if (lon, lat) is outside the mesh's bbox.
+  if channel < 0 or channel >= m.channels:
+    raise newException(ValueError, "sampleAt: channel out of range")
+  case kind
+  of imNearest:
+    return m.valueAt(lon, lat, channel)
+  of imBilinear:
+    let (ok, fr, fc) = m.cellAtFractional(lon, lat)
+    if not ok: return NaN
+    # Cells are addressed by their top-left corner. To weight by *cell
+    # centres*, shift by 0.5 — a query at exactly the centre of cell (r, c)
+    # is just that cell's value, not a 4-way average.
+    let r = fr - 0.5
+    let c = fc - 0.5
+    var r0 = int(r); var c0 = int(c)
+    if r < 0.0: r0 = -1   # int() truncates toward zero, not floor
+    if c < 0.0: c0 = -1
+    let r1 = r0 + 1
+    let c1 = c0 + 1
+    let dr = r - float64(r0)
+    let dc = c - float64(c0)
+    # Clamp at edges: query points in the half-cell border just outside
+    # cell centres degenerate to the edge cell value.
+    proc cellVal(m: GeoMesh; row, col, ch: int): float64 =
+      var rr = row
+      var cc = col
+      if rr < 0: rr = 0
+      if cc < 0: cc = 0
+      if rr >= m.rows: rr = m.rows - 1
+      if cc >= m.cols: cc = m.cols - 1
+      m.data[(rr * m.cols + cc) * m.channels + ch]
+    let v00 = cellVal(m, r0, c0, channel)
+    let v01 = cellVal(m, r0, c1, channel)
+    let v10 = cellVal(m, r1, c0, channel)
+    let v11 = cellVal(m, r1, c1, channel)
+    let top    = v00 * (1.0 - dc) + v01 * dc
+    let bottom = v10 * (1.0 - dc) + v11 * dc
+    return top * (1.0 - dr) + bottom * dr
+
 proc vectorAt*(m: GeoMesh; lon, lat: float64): Vector =
   ## Returns the full channel-vector at the cell containing (lon, lat).
   ## Empty seq if out of bounds.
@@ -123,6 +194,101 @@ proc channelIndex*(m: GeoMesh; label: string): int =
   for i, l in m.labels:
     if l == label: return i
   -1
+
+# --------- Polygon aggregation ---------
+#
+# Reduce all cells whose centre lies inside a polygon to a single
+# scalar (mean / min / max / sum) — the canonical "average rainfall
+# over this watershed" / "max wind speed in this county" pattern.
+#
+# Cells are treated atomically: a cell is either fully inside or fully
+# outside (decided by its centre). For polygon boundaries that cut
+# across cells, this is a fine approximation when cells are small
+# relative to the polygon. For sub-cell precision, oversample the mesh
+# beforehand.
+
+type
+  AggregationKind* = enum
+    akMean, akMin, akMax, akSum, akCount
+
+  AggregateResult* = object
+    count*: int
+    sum*: float64
+    minValue*: float64
+    maxValue*: float64
+    mean*: float64
+
+proc aggregateInPolygonStats*(m: GeoMesh; polygon: Polygon;
+                              channel = 0;
+                              metric = gmPlanar): AggregateResult =
+  ## Reduce mesh cells whose centres lie inside `polygon` to a stats
+  ## bundle (count + sum + min + max + mean). With `metric = gmPlanar`
+  ## (default) edges are straight in lon/lat space; with `gmGeographic`
+  ## edges are great-circle arcs. Cells outside the polygon's MBR are
+  ## skipped without the more expensive containment test.
+  if channel < 0 or channel >= m.channels:
+    raise newException(ValueError, "aggregateInPolygon: channel out of range")
+  result = AggregateResult(count: 0, sum: 0.0,
+                           minValue: Inf, maxValue: NegInf, mean: NaN)
+  if m.rows == 0 or m.cols == 0: return
+  let pbb = polygonBBox(polygon)
+  # Convert MBR back to (row, col) bounds, expanding by one cell to be
+  # safe against clamping in cellAt.
+  let widthX = m.bbox.maxX - m.bbox.minX
+  let widthY = m.bbox.maxY - m.bbox.minY
+  if widthX <= 0.0 or widthY <= 0.0: return
+  proc clampRow(r: int): int =
+    if r < 0: 0
+    elif r >= m.rows: m.rows - 1
+    else: r
+  proc clampCol(c: int): int =
+    if c < 0: 0
+    elif c >= m.cols: m.cols - 1
+    else: c
+  # The polygon's MBR may extend outside the mesh; clamp.
+  let lonLo = max(pbb.minX, m.bbox.minX)
+  let lonHi = min(pbb.maxX, m.bbox.maxX)
+  let latLo = max(pbb.minY, m.bbox.minY)
+  let latHi = min(pbb.maxY, m.bbox.maxY)
+  if lonLo > lonHi or latLo > latHi: return
+  # Note: row 0 is top (maxLat). So latHi → small row, latLo → big row.
+  let rowMin = clampRow(int((m.bbox.maxY - latHi) / widthY * float64(m.rows)) - 1)
+  let rowMax = clampRow(int((m.bbox.maxY - latLo) / widthY * float64(m.rows)) + 1)
+  let colMin = clampCol(int((lonLo - m.bbox.minX) / widthX * float64(m.cols)) - 1)
+  let colMax = clampCol(int((lonHi - m.bbox.minX) / widthX * float64(m.cols)) + 1)
+  for row in rowMin .. rowMax:
+    for col in colMin .. colMax:
+      let (cLon, cLat) = m.cellCenter(row, col)
+      let inside =
+        case metric
+        of gmPlanar:     pointInPolygon(polygon, cLon, cLat)
+        of gmGeographic: pointInPolygonSpherical(polygon, cLon, cLat)
+      if not inside: continue
+      let v = m.data[(row * m.cols + col) * m.channels + channel]
+      inc result.count
+      result.sum += v
+      if v < result.minValue: result.minValue = v
+      if v > result.maxValue: result.maxValue = v
+  if result.count > 0:
+    result.mean = result.sum / float64(result.count)
+  else:
+    result.minValue = NaN
+    result.maxValue = NaN
+
+proc aggregateInPolygon*(m: GeoMesh; polygon: Polygon;
+                        agg: AggregationKind;
+                        channel = 0;
+                        metric = gmPlanar): float64 =
+  ## Convenience: returns a single scalar from `aggregateInPolygonStats`.
+  ## Returns NaN if no cell centres lie inside the polygon (or, for
+  ## `akCount`, returns 0).
+  let s = aggregateInPolygonStats(m, polygon, channel, metric)
+  case agg
+  of akMean:  s.mean
+  of akMin:   s.minValue
+  of akMax:   s.maxValue
+  of akSum:   s.sum
+  of akCount: float64(s.count)
 
 # --------- Value (de)serialization ---------
 #

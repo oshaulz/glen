@@ -43,7 +43,14 @@ proc compareValues*(a, b: Value): int =
   else:        cmp($a, $b)
 
 proc valuesEqual*(a, b: Value): bool =
-  if a.isNil or b.isNil: return a.isNil and b.isNil
+  ## Equality with "nullish" coalescing: a missing field (nil ref) and
+  ## an explicit `VNull()` are considered equal, so `where: x == nil`
+  ## matches both "field absent" and "field set to null". This is the
+  ## intuitive behaviour for soft-delete tombstones, optional fields,
+  ## and other "is this empty?" predicates.
+  let aNullish = a.isNil or a.kind == vkNull
+  let bNullish = b.isNil or b.kind == vkNull
+  if aNullish or bNullish: return aNullish and bNullish
   a == b
 
 proc evalPredicate*(p: QueryPredicate; doc: Value): bool =

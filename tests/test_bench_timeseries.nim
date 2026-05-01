@@ -11,6 +11,7 @@
 import std/[os, times, strformat, math, random, strutils]
 import glen/timeseries
 import glen/geo, glen/geomesh, glen/tilestack
+import glen/sharded
 
 proc msSince(t0: float): int64 = int64((epochTime() - t0) * 1000.0)
 proc rate(n: int; dtMs: int64): float =
@@ -216,6 +217,92 @@ proc benchTileStackColdPointHistory(label, dir: string; queries: int) =
 # Main
 # ============================================================================
 
+# ============================================================================
+# Sharded series benchmarks (time-bucketed)
+# ============================================================================
+
+proc benchShardedAppend(label, dir: string; samplesPerDay, days: int) =
+  if dirExists(dir): removeDir(dir)
+  createDir(dir)
+  let s = openShardedSeries(dir, tbDayPolicy())
+  let dayMs = 86_400_000'i64
+  let t0 = epochTime()
+  for d in 0 ..< days:
+    let dayStart = int64(d) * dayMs
+    let stride = dayMs div int64(samplesPerDay)
+    for i in 0 ..< samplesPerDay:
+      s.append(dayStart + int64(i) * stride,
+               sin(float64(d * samplesPerDay + i) * 0.001))
+  s.flush()
+  let dt = msSince(t0)
+  let total = samplesPerDay * days
+  let shards = s.shardKeysOnDisk().len
+  s.close()
+  echo &"BENCH sharded append ({label}): {total:>9} samples in {dt:>5} ms => {rate(total, dt):>10.0f} samples/s  ({shards} shards)"
+
+proc benchShardedDropOldVsRewrite(dir: string;
+                                  samplesPerDay, days: int) =
+  ## Compare retention via `dropBefore` (removeFile per shard) on a sharded
+  ## series vs `dropBlocksBefore` (full file rewrite) on the equivalent
+  ## monolithic series. Same data either way.
+  let shardedDir = dir & "_sharded"
+  let monoPath   = dir & "_mono.gts"
+  if dirExists(shardedDir): removeDir(shardedDir)
+  if fileExists(monoPath): removeFile(monoPath)
+  createDir(shardedDir)
+  let dayMs = 86_400_000'i64
+
+  # Seed both with identical data.
+  let s1 = openShardedSeries(shardedDir, tbDayPolicy())
+  let s2 = openSeries(monoPath, blockSize = 4096)
+  for d in 0 ..< days:
+    let dayStart = int64(d) * dayMs
+    let stride = dayMs div int64(samplesPerDay)
+    for i in 0 ..< samplesPerDay:
+      let ts = dayStart + int64(i) * stride
+      let v  = sin(float64(d * samplesPerDay + i) * 0.001)
+      s1.append(ts, v)
+      s2.append(ts, v)
+  s1.flush()
+  s2.flush()
+
+  # Drop everything before the last day on each.
+  let cutoff = int64(days - 1) * dayMs
+
+  let t1 = epochTime()
+  discard s1.dropBefore(cutoff)
+  let dt1 = msSince(t1)
+
+  let t2 = epochTime()
+  s2.dropBlocksBefore(cutoff)
+  let dt2 = msSince(t2)
+
+  s1.close(); s2.close()
+  removeDir(shardedDir)
+  removeFile(monoPath)
+  let speedup = if dt1 == 0: 9999.0 else: float(dt2) / float(dt1)
+  echo &"BENCH retention ({days} days × {samplesPerDay}/day): sharded dropBefore = {dt1:>5} ms, monolithic dropBlocksBefore = {dt2:>5} ms  ({speedup:>5.1f}× faster on sharded)"
+
+# ============================================================================
+# Open-time benchmark (header-walk vs payload-walk on a big series)
+# ============================================================================
+
+proc benchSeriesOpenScale(label, path: string; samples: int) =
+  if fileExists(path): removeFile(path)
+  let s = openSeries(path, blockSize = 4096)
+  for i in 0 ..< samples:
+    s.append(int64(i) * 1000, float64(i) * 0.5)
+  s.flush()
+  s.close()
+  let bytes = getFileSize(path)
+  # Reopen and time.
+  let t0 = epochTime()
+  let s2 = openSeries(path)
+  let dt = msSince(t0)
+  let total = s2.len
+  s2.close()
+  echo &"BENCH series open ({label}, {bytes} B): {total:>9} samples in {dt:>5} ms"
+
 when isMainModule:
   echo "------- glen/timeseries (Gorilla scalar TSDB) -------"
   let path = getTempDir() / "glen_bench_ts.gts"
@@ -240,6 +327,19 @@ when isMainModule:
   benchSeriesLatestN(path, 100_000, 100)
   benchSeriesLatestN(path,  50_000, 1000)
   removeFile(path)
+
+  echo "\n------- glen/timeseries: open-time scale -------"
+  let pathBig = getTempDir() / "glen_bench_ts_big.gts"
+  benchSeriesOpenScale("1M",   pathBig,   1_000_000)
+  benchSeriesOpenScale("10M",  pathBig,  10_000_000)
+  removeFile(pathBig)
+
+  echo "\n------- glen/sharded (time-bucketed) -------"
+  let shardedDir = getTempDir() / "glen_bench_sharded"
+  benchShardedAppend("100/day × 365 days", shardedDir, 100, 365)
+  benchShardedDropOldVsRewrite(getTempDir() / "glen_bench_drop",
+                               samplesPerDay = 1000, days = 60)
+  if dirExists(shardedDir): removeDir(shardedDir)
 
   echo "\n------- glen/tilestack (Gorilla raster-over-time) -------"
 

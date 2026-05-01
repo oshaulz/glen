@@ -54,7 +54,9 @@ The verbose procedural API (`VObject() / v["k"] = VString(..)`,
 - **You're storing a lot of numbers that change over time** — sensor
   readings, metric streams, financial ticks. Glen's time-series engine
   packs them down to a few bits per sample when values are smooth or
-  repeat.
+  repeat, and scales to multi-billion-sample archives via configurable
+  time + geographic sharding (drop a year of data with one `removeFile`,
+  not a full-file rewrite).
 - **You're working with geographic data** — points, polygons, "what's
   near here," "which zone is this in." Spatial indexes are built in,
   with both flat-plane and real-Earth (great-circle) distance.
@@ -83,7 +85,7 @@ geography, and vectors.
 | **Documents** | Schema-flexible document model — store any nested JSON-ish value. Crash-safe writes, transactions, change subscriptions, optional schema validation |
 | **Queries** | Chainable filter API — `where` / `orderBy` / `limit` / cursor-based pagination. Indexes used automatically when available |
 | **Indexes** | Equality and range lookups, spatial (points + polygons), and approximate vector / nearest-neighbour search |
-| **Time-series** | Compact storage for streams of (timestamp, value) and for grids that evolve over time. Range queries, point-in-time history, last-N reads |
+| **Time-series** | Compact storage for streams of (timestamp, value) and for grids that evolve over time. Range queries, point-in-time history, last-N reads. Optional **sharded series** partitions a logical stream by time bucket and/or geohash for O(1) retention and bbox-restricted scans |
 | **Math** | Vectors, matrices, basic linear algebra; raster meshes pinned to a geographic bounding box |
 | **Sync** | Multi-master replication with conflict resolution. Each device has a stable identity; cursors track per-peer progress |
 | **Scale** | Datasets larger than RAM via memory-mapped storage. Streaming iterators for bulk reads that don't blow up memory |

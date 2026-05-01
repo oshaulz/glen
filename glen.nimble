@@ -51,7 +51,13 @@ const testFiles = @[
   "tests/test_codec_valuedict.nim",
   "tests/test_snapshot_v4.nim",
   "tests/test_dsl.nim",
-  "tests/test_geo_curvature.nim"
+  "tests/test_dsl_edges.nim",
+  "tests/test_dsl_integration.nim",
+  "tests/test_dsl_stress.nim",
+  "tests/test_geo_curvature.nim",
+  "tests/test_geomesh_aggregate.nim",
+  "tests/test_readonly.nim",
+  "tests/test_sharded.nim"
 ]
 
 task test, "Run test suite":
@@ -73,6 +79,9 @@ task bench_timeseries, "Time-series + tilestack benchmarks (release, ORC, O3)":
 
 task bench_bitpack, "Bit-decode microbenchmark (release, ORC, O3)":
   exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench_bitpack.nim"
+
+task bench_readonly, "Read-only vs read-write benchmark (release, ORC, O3)":
+  exec "nim c -r -d:release --mm:orc --passC:-O3 --threads:on --path:src tests/test_bench_readonly.nim"
 
 task bench_concurrent, "Run multi-threaded contention benchmark (release, atomicArc, O3)":
   # atomicArc gives thread-safe refcounting (Glen's Value graph is acyclic so
